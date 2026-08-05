@@ -23,6 +23,7 @@ interface BatchRow {
   submitter_email: string;
   state: BatchState;
   validation_json: string | null;
+  warning_ack_request_sha256: string | null;
   plan_json: string | null;
   base_commit: string | null;
   local_diff_json: string | null;
@@ -60,6 +61,8 @@ function parseJson(value: string | null): unknown | null {
 }
 
 function toBatch(row: BatchRow): StoredBatch {
+  const validation = parseJson(row.validation_json);
+  const requestSha256 = validationRequestSha256(validation);
   return {
     id: row.id,
     title: row.title,
@@ -67,7 +70,8 @@ function toBatch(row: BatchRow): StoredBatch {
     designUrl: row.design_url,
     submitter: { name: row.submitter_name, email: row.submitter_email },
     state: row.state,
-    validation: parseJson(row.validation_json),
+    validation,
+    warningsAcknowledged: requestSha256 !== null && row.warning_ack_request_sha256 === requestSha256,
     plan: parseJson(row.plan_json),
     baseCommit: row.base_commit,
     localDiff: parseJson(row.local_diff_json),
@@ -75,6 +79,18 @@ function toBatch(row: BatchRow): StoredBatch {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validationRequestSha256(validation: unknown): string | null {
+  return isObject(validation) && typeof validation.requestSha256 === 'string' ? validation.requestSha256 : null;
+}
+
+function validationHasWarnings(validation: unknown): boolean {
+  return isObject(validation) && Array.isArray(validation.warnings) && validation.warnings.length > 0;
 }
 
 function toItem(row: ItemRow): StoredItem {
@@ -159,7 +175,7 @@ export class BatchDatabase {
         sourceFile,
         timestamp,
       );
-      this.db.prepare('UPDATE batches SET updated_at = ? WHERE id = ?').run(timestamp, batchId);
+      this.clearValidationAfterItemChange(batchId, timestamp);
       const row = this.db.prepare('SELECT * FROM items WHERE id = ?').get(id) as ItemRow;
       return toItem(row);
     });
@@ -218,7 +234,7 @@ export class BatchDatabase {
         itemId,
         batchId,
       );
-      this.db.prepare('UPDATE batches SET updated_at = ? WHERE id = ?').run(timestamp, batchId);
+      this.clearValidationAfterItemChange(batchId, timestamp);
       return this.getItem(batchId, itemId);
     });
     return update();
@@ -231,7 +247,7 @@ export class BatchDatabase {
       if (result.changes !== 1) {
         throw new AppError('ITEM_NOT_FOUND', `Unknown item ${itemId} in batch ${batchId}.`, 404);
       }
-      this.db.prepare('UPDATE batches SET updated_at = ? WHERE id = ?').run(now(), batchId);
+      this.clearValidationAfterItemChange(batchId, now());
     });
     remove();
   }
@@ -247,7 +263,8 @@ export class BatchDatabase {
       }
       const result = this.db.prepare(`
         UPDATE batches
-        SET state = 'VALIDATING', validation_json = NULL, base_commit = NULL,
+        SET state = 'VALIDATING', validation_json = NULL, warning_ack_request_sha256 = NULL,
+            plan_json = NULL, base_commit = NULL, local_diff_json = NULL,
             error_code = NULL, error_message = NULL, updated_at = ?
         WHERE id = ? AND state = 'DRAFT'
       `).run(now(), batchId);
@@ -262,7 +279,8 @@ export class BatchDatabase {
     const state: BatchState = valid ? 'READY' : 'DRAFT';
     const result = this.db.prepare(`
       UPDATE batches
-      SET state = ?, validation_json = ?, base_commit = ?, error_code = NULL, error_message = NULL, updated_at = ?
+      SET state = ?, validation_json = ?, warning_ack_request_sha256 = NULL,
+          base_commit = ?, error_code = NULL, error_message = NULL, updated_at = ?
       WHERE id = ? AND state = 'VALIDATING'
     `).run(state, JSON.stringify(validation), baseCommit, now(), batchId);
     if (result.changes !== 1) {
@@ -276,6 +294,28 @@ export class BatchDatabase {
       SET state = 'DRAFT', error_code = NULL, error_message = NULL, updated_at = ?
       WHERE id = ? AND state = 'VALIDATING'
     `).run(now(), batchId);
+  }
+
+  acknowledgeWarnings(batchId: string): void {
+    const acknowledge = this.db.transaction(() => {
+      const batch = this.getBatch(batchId);
+      if (batch.state !== 'READY' || !isObject(batch.validation) || batch.validation.valid !== true) {
+        throw new AppError('BATCH_NOT_READY', 'A successful READY validation is required before acknowledging warnings.', 409);
+      }
+      const requestSha256 = validationRequestSha256(batch.validation);
+      if (!requestSha256 || !validationHasWarnings(batch.validation)) {
+        throw new AppError('BATCH_WARNING_ACK_NOT_REQUIRED', 'This validation has no warnings to acknowledge.', 409);
+      }
+      const result = this.db.prepare(`
+        UPDATE batches
+        SET warning_ack_request_sha256 = ?, updated_at = ?
+        WHERE id = ? AND state = 'READY'
+      `).run(requestSha256, now(), batchId);
+      if (result.changes !== 1) {
+        throw new AppError('BATCH_WARNING_ACK_STATE_CONFLICT', `Batch ${batchId} state changed before warnings were acknowledged.`, 409);
+      }
+    });
+    acknowledge();
   }
 
   queueJob(batchId: string): StoredJob {
@@ -378,6 +418,16 @@ export class BatchDatabase {
     this.db.prepare('UPDATE batches SET state = ?, updated_at = ? WHERE id = ?').run(state, now(), batchId);
   }
 
+  private clearValidationAfterItemChange(batchId: string, timestamp: string): void {
+    this.db.prepare(`
+      UPDATE batches
+      SET validation_json = NULL, warning_ack_request_sha256 = NULL,
+          plan_json = NULL, base_commit = NULL, local_diff_json = NULL,
+          error_code = NULL, error_message = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(timestamp, batchId);
+  }
+
   private requireDraftBatch(batchId: string): void {
     const batch = this.db.prepare('SELECT state FROM batches WHERE id = ?').get(batchId) as Pick<BatchRow, 'state'> | undefined;
     if (!batch) {
@@ -399,6 +449,7 @@ export class BatchDatabase {
         submitter_email TEXT NOT NULL,
         state TEXT NOT NULL,
         validation_json TEXT,
+        warning_ack_request_sha256 TEXT,
         plan_json TEXT,
         base_commit TEXT,
         local_diff_json TEXT,
@@ -429,5 +480,9 @@ export class BatchDatabase {
         updated_at TEXT NOT NULL
       );
     `);
+    const batchColumns = this.db.prepare('PRAGMA table_info(batches)').all() as Array<{ name: string }>;
+    if (!batchColumns.some((column) => column.name === 'warning_ack_request_sha256')) {
+      this.db.exec('ALTER TABLE batches ADD COLUMN warning_ack_request_sha256 TEXT');
+    }
   }
 }

@@ -45,8 +45,21 @@ export interface BatchDetails extends BatchInput {
   state: 'DRAFT' | 'VALIDATING' | 'READY' | 'QUEUED' | 'RUNNING' | 'LOCAL_DIFF_READY' | 'FAILED';
   items: ApiItem[];
   validation: ValidationResult | null;
+  warningsAcknowledged: boolean;
   localDiff: { changedFiles: string[]; patch: string } | null;
   error: { code: string; message: string } | null;
+}
+
+export interface NamePreview {
+  schemaVersion: 1;
+  baseCommit: string;
+  input: string;
+  normalizedName: string;
+  valid: boolean;
+  collision: {
+    primaryName: string;
+    aliases: string[];
+  } | null;
 }
 
 export interface CatalogPageIcon {
@@ -112,6 +125,7 @@ export const api = {
     if (query.pageSize) parameters.set('pageSize', String(query.pageSize));
     return request<CatalogPage>(`/api/catalog/page?${parameters.toString()}`);
   },
+  previewName: (name: string) => request<NamePreview>(`/api/names/preview?${new URLSearchParams({ name }).toString()}`),
   createBatch: (input: BatchInput) => request<BatchDetails>('/api/batches', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -125,6 +139,7 @@ export const api = {
   deleteItem: (batchId: string, itemId: string) => request<void>(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}`, { method: 'DELETE' }),
   validateBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/validate`, { method: 'POST' }),
   submitBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/submit`, { method: 'POST' }),
+  acknowledgeWarnings: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/warnings/acknowledge`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
 };

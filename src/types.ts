@@ -36,6 +36,7 @@ export interface StoredBatch extends CreateBatchInput {
   id: string;
   state: BatchState;
   validation: unknown | null;
+  warningsAcknowledged: boolean;
   plan: unknown | null;
   baseCommit: string | null;
   localDiff: unknown | null;
@@ -103,4 +104,16 @@ export interface CatalogPage {
   pageSize: number;
   total: number;
   icons: CatalogPageIcon[];
+}
+
+export interface IconNamePreview {
+  schemaVersion: 1;
+  baseCommit: string;
+  input: string;
+  normalizedName: string;
+  valid: boolean;
+  collision: {
+    primaryName: string;
+    aliases: string[];
+  } | null;
 }

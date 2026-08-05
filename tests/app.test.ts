@@ -109,6 +109,35 @@ test('DRAFT items can be updated and deleted', async (t) => {
   assert.deepEqual((batch.json() as { items: unknown[] }).items, []);
 });
 
+test('delete replacement must select a different existing catalog icon', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Delete replacement',
+      description: 'Rejects same-icon replacement.',
+      designUrl: 'https://design.example.invalid/delete',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  const batchId = (created.json() as { id: string }).id;
+  const response = await app.inject({
+    method: 'POST',
+    url: `/api/batches/${batchId}/items`,
+    payload: {
+      action: 'delete',
+      targetName: 'existing',
+      replacementName: 'existing-alias',
+      reason: 'Must use a different icon.',
+    },
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal((response.json() as { error: { code: string } }).error.code, 'ITEM_INVALID');
+});
+
 test('catalog page returns canonical icons with SVG thumbnails and normalizes aliases', async (t) => {
   const environment = await createTestEnvironment(t);
   const app = await buildApp({ batches: environment.batches });
@@ -160,6 +189,81 @@ test('catalog page returns canonical icons with SVG thumbnails and normalizes al
   });
   assert.equal(item.statusCode, 201);
   assert.equal((item.json() as { targetName: string }).targetName, 'existing');
+});
+
+test('name preview delegates normalization and catalog collision checks to icon-batch', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+
+  const preview = await app.inject({ method: 'GET', url: '/api/names/preview?name=ExistingAlias' });
+  assert.equal(preview.statusCode, 200);
+  assert.deepEqual(preview.json(), {
+    schemaVersion: 1,
+    baseCommit: preview.json().baseCommit,
+    input: 'ExistingAlias',
+    normalizedName: 'existing-alias',
+    valid: true,
+    collision: { primaryName: 'existing', aliases: ['existing-alias'] },
+  });
+
+  const missing = await app.inject({ method: 'GET', url: '/api/names/preview' });
+  assert.equal(missing.statusCode, 400);
+  assert.equal((missing.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
+
+  const invalid = await app.inject({ method: 'GET', url: '/api/names/preview?name=---' });
+  assert.equal(invalid.statusCode, 200);
+  assert.deepEqual(invalid.json(), {
+    schemaVersion: 1,
+    baseCommit: invalid.json().baseCommit,
+    input: '---',
+    normalizedName: '',
+    valid: false,
+    collision: null,
+  });
+});
+
+test('warning acknowledgement is persisted for exactly one validation result before submission', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Warning acknowledgement',
+      description: 'Ensures warnings are acknowledged.',
+      designUrl: 'https://design.example.invalid/warnings',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  const batchId = (created.json() as { id: string }).id;
+  const item = await app.inject({
+    method: 'POST',
+    url: `/api/batches/${batchId}/items`,
+    payload: {
+      action: 'add',
+      designName: 'warning-icon',
+      description: 'Triggers a test warning.',
+      svgBase64: Buffer.from(environment.validSvg).toString('base64'),
+    },
+  });
+  assert.equal(item.statusCode, 201);
+  const validated = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/validate` });
+  assert.equal(validated.statusCode, 200);
+  assert.equal((validated.json() as { warningsAcknowledged: boolean }).warningsAcknowledged, false);
+
+  const blocked = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/submit` });
+  assert.equal(blocked.statusCode, 409);
+  assert.equal((blocked.json() as { error: { code: string } }).error.code, 'BATCH_WARNINGS_UNACKNOWLEDGED');
+
+  const acknowledged = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/warnings/acknowledge` });
+  assert.equal(acknowledged.statusCode, 200);
+  assert.equal((acknowledged.json() as { warningsAcknowledged: boolean }).warningsAcknowledged, true);
+
+  const queued = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/submit` });
+  assert.equal(queued.statusCode, 200);
+  assert.equal((queued.json() as { state: string }).state, 'QUEUED');
 });
 
 test('catalog pages reuse a snapshot until upstream/main changes', async (t) => {

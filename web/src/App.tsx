@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, ApiError, type ApiItem, type BatchDetails, type CatalogGroup, type CatalogPageIcon, type Diagnostic, type ItemAction, type ItemInput, type Submitter } from './api';
+import { api, ApiError, type ApiItem, type BatchDetails, type CatalogGroup, type CatalogPageIcon, type Diagnostic, type ItemAction, type ItemInput, type NamePreview, type Submitter } from './api';
 
 interface DesignerProfile extends Submitter {
   version: 1;
@@ -10,6 +10,8 @@ interface SvgDraft {
   id: string;
   file: File;
   previewUrl: string | undefined;
+  content: string;
+  warning?: string;
 }
 
 interface DraftChange {
@@ -20,14 +22,28 @@ interface DraftChange {
   target?: CatalogPageIcon;
   description?: string;
   reason?: string;
-  replacementName?: string;
+  replacement?: CatalogPageIcon;
   svg?: SvgDraft;
+}
+
+interface TargetUse {
+  action: 'replace' | 'delete';
+  itemNumber: number;
 }
 
 type FieldErrors = Record<string, string>;
 
 const identityStorageKey = 'pink-icon-submit.designer-profile.v1';
 const pageSize = 24;
+const defaultUploadLimit = 1024 * 1024;
+const limits = {
+  batchTitle: 200,
+  batchDescription: 5_000,
+  itemText: 1_000,
+  email: 320,
+  name: 100,
+  profileName: 100,
+};
 let nextClientId = 1;
 
 const stateLabel: Record<BatchDetails['state'], string> = {
@@ -81,7 +97,7 @@ function svgPreviewUrl(svg: string): string {
 
 function createSvgDraft(file: File): SvgDraft {
   const previewUrl = typeof URL.createObjectURL === 'function' ? URL.createObjectURL(file) : undefined;
-  return { id: uniqueId('svg'), file, previewUrl };
+  return { id: uniqueId('svg'), file, previewUrl, content: '' };
 }
 
 function revokePreview(svg: SvgDraft | undefined): void {
@@ -101,12 +117,80 @@ function toItemInput(change: DraftChange): ItemInput {
     action: 'delete',
     targetName: change.target?.primaryName,
     reason: change.reason,
-    ...(change.replacementName ? { replacementName: change.replacementName } : {}),
+    ...(change.replacement ? { replacementName: change.replacement.primaryName } : {}),
+  };
+}
+
+function localNameIssue(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return '请填写图标建议名称。';
+  if (trimmed.length > limits.name) return `图标名称不能超过 ${limits.name} 个字符。`;
+  if (/\s/.test(value) || /[\\/]/.test(value)) return '图标名称不能包含空白或路径分隔符。';
+  return undefined;
+}
+
+function fieldLengthIssue(value: string, field: string, maximumLength: number): string | undefined {
+  return value.length > maximumLength ? `${field}不能超过 ${maximumLength} 个字符。` : undefined;
+}
+
+async function readFileText(file: File): Promise<string> {
+  if (typeof file.text === 'function') {
+    return file.text();
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error('Unable to read file.'));
+    reader.onload = () => resolve(String(reader.result));
+    reader.readAsText(file);
+  });
+}
+
+function validViewBox(value: string | null): boolean {
+  if (!value) return false;
+  const values = value.trim().split(/[\s,]+/).map(Number);
+  return values.length === 4 && values.every(Number.isFinite) && values[2] > 0 && values[3] > 0;
+}
+
+async function inspectSvg(file: File): Promise<{ content?: string; error?: string; warning?: string }> {
+  if (!file.name.toLowerCase().endsWith('.svg')) {
+    return { error: '请选择扩展名为 .svg 的文件。' };
+  }
+  if (file.size === 0) {
+    return { error: 'SVG 文件不能为空。' };
+  }
+  let content: string;
+  try {
+    content = await readFileText(file);
+  } catch {
+    return { error: '无法读取这个 SVG 文件。' };
+  }
+  const document = new DOMParser().parseFromString(content, 'image/svg+xml');
+  const root = document.documentElement;
+  if (root.localName === 'parsererror' || document.querySelector('parsererror')) {
+    return { error: '浏览器无法解析这个 SVG 文件。' };
+  }
+  if (root.localName.toLowerCase() !== 'svg') {
+    return { error: '文件根节点必须是 <svg>。' };
+  }
+  if (!validViewBox(root.getAttribute('viewBox'))) {
+    return { error: 'SVG 必须包含四个数值且宽高为正数的 viewBox。' };
+  }
+  return {
+    content,
+    ...(file.size > defaultUploadLimit ? { warning: '文件大于当前默认 1 MB 限制，上传接口可能拒绝它。' } : {}),
   };
 }
 
 function diagnosticLabel(diagnostic: Diagnostic): string {
   return diagnostic.itemId ? `${diagnostic.code}（${diagnostic.itemId}）` : diagnostic.code;
+}
+
+function actionLabel(action: ItemAction): string {
+  return { add: '新增', replace: '替换', delete: '删除' }[action];
+}
+
+function targetUseLabel(use: TargetUse): string {
+  return `已用于第 ${use.itemNumber} 项${actionLabel(use.action)}`;
 }
 
 function RequiredMark() {
@@ -117,6 +201,10 @@ function FieldError({ message }: { message?: string }) {
   return message ? <p className="field-error" role="alert">{message}</p> : null;
 }
 
+function FieldCounter({ value, maximum }: { value: string; maximum: number }) {
+  return <small className={`field-counter ${value.length > maximum ? 'over' : ''}`}>{value.length} / {maximum}</small>;
+}
+
 function IdentityDialog({ profile, onSave, onClose }: { profile?: DesignerProfile; onSave: (profile: DesignerProfile) => void; onClose?: () => void }) {
   const [name, setName] = useState(profile?.name ?? '');
   const [email, setEmail] = useState(profile?.email ?? '');
@@ -125,7 +213,9 @@ function IdentityDialog({ profile, onSave, onClose }: { profile?: DesignerProfil
   const submit = () => {
     const nextErrors: FieldErrors = {};
     if (!name.trim()) nextErrors.name = '请填写姓名。';
+    else if (fieldLengthIssue(name, '姓名', limits.profileName)) nextErrors.name = fieldLengthIssue(name, '姓名', limits.profileName)!;
     if (!isEmail(email.trim())) nextErrors.email = '请填写有效的公司邮箱。';
+    else if (fieldLengthIssue(email, '公司邮箱', limits.email)) nextErrors.email = fieldLengthIssue(email, '公司邮箱', limits.email)!;
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length === 0) {
       onSave({ version: 1, name: name.trim(), email: email.trim() });
@@ -140,12 +230,14 @@ function IdentityDialog({ profile, onSave, onClose }: { profile?: DesignerProfil
         <p>这不是登录。填写一次设计师信息，后续提交会自动带入；你可以在右上角随时修改。</p>
         <div className="form-field">
           <label htmlFor="identity-name">姓名<RequiredMark /></label>
-          <input id="identity-name" autoComplete="name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：李思思" />
+          <input id="identity-name" autoComplete="name" maxLength={limits.profileName} value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：李思思" />
+          <FieldCounter value={name} maximum={limits.profileName} />
           <FieldError message={errors.name} />
         </div>
         <div className="form-field">
           <label htmlFor="identity-email">公司邮箱<RequiredMark /></label>
-          <input id="identity-email" type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@company.com" />
+          <input id="identity-email" type="email" autoComplete="email" maxLength={limits.email} value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@company.com" />
+          <FieldCounter value={email} maximum={limits.email} />
           <FieldError message={errors.email} />
         </div>
         <p className="identity-note">仅保存在当前浏览器，用于预填提交人；不建立账号、不做认证，也不会发送给 GitHub。</p>
@@ -172,7 +264,9 @@ function CatalogBrowser({
   query,
   group,
   selected,
+  unavailableTargets,
   disabled,
+  selectionCopy,
   onQueryChange,
   onGroupChange,
   onPageChange,
@@ -184,7 +278,9 @@ function CatalogBrowser({
   query: string;
   group: CatalogGroup;
   selected?: CatalogPageIcon;
+  unavailableTargets: ReadonlyMap<string, TargetUse>;
   disabled: boolean;
+  selectionCopy: string;
   onQueryChange: (value: string) => void;
   onGroupChange: (value: CatalogGroup) => void;
   onPageChange: (page: number) => void;
@@ -207,7 +303,7 @@ function CatalogBrowser({
         </div>
         <span>{catalog ? `${catalog.total} 个结果` : '加载中…'}</span>
       </div>
-      <p className="catalog-copy">名称与 alias 都能搜索。点击选择，或把图标拖到下方目标区域。</p>
+      <p className="catalog-copy">{selectionCopy} 名称与 alias 都能搜索。点击选择，或把图标拖到下方目标区域。</p>
       <label className="sr-only" htmlFor="catalog-search">搜索名称或别名</label>
       <input id="catalog-search" type="search" value={query} disabled={disabled} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索名称或别名，例如 pink、preview、logo" />
       <div className="filter-row" aria-label="图标分类">
@@ -217,22 +313,27 @@ function CatalogBrowser({
       <div className="catalog-grid" aria-busy={loading}>
         {loading && <p className="catalog-empty">正在读取最新图标目录…</p>}
         {!loading && catalog?.icons.length === 0 && <p className="catalog-empty">没有匹配的图标。试试其他搜索词或分类。</p>}
-        {!loading && catalog?.icons.map((icon) => (
-          <button
-            key={icon.primaryName}
-            className={`catalog-card ${selected?.primaryName === icon.primaryName ? 'selected' : ''}`}
-            type="button"
-            draggable={!disabled}
-            disabled={disabled}
-            onClick={() => onSelect(icon)}
-            onDragStart={(event) => event.dataTransfer.setData('application/x-pink-icon', icon.primaryName)}
-            aria-label={`选择 ${icon.primaryName}`}
-          >
-            <img src={svgPreviewUrl(icon.svg)} alt="" />
-            <strong>{icon.primaryName}</strong>
-            <span>{icon.aliases.length ? icon.aliases.join(' · ') : icon.group}</span>
-          </button>
-        ))}
+        {!loading && catalog?.icons.map((icon) => {
+          const targetUse = unavailableTargets.get(icon.primaryName);
+          const unavailable = targetUse !== undefined && selected?.primaryName !== icon.primaryName;
+          return (
+            <button
+              key={icon.primaryName}
+              className={`catalog-card ${selected?.primaryName === icon.primaryName ? 'selected' : ''} ${unavailable ? 'used' : ''}`}
+              type="button"
+              draggable={!disabled && !unavailable}
+              disabled={disabled || unavailable}
+              onClick={() => onSelect(icon)}
+              onDragStart={(event) => event.dataTransfer.setData('application/x-pink-icon', icon.primaryName)}
+              aria-label={unavailable ? `${icon.primaryName} ${targetUseLabel(targetUse)}` : `选择 ${icon.primaryName}`}
+              title={unavailable ? `${icon.primaryName}${targetUseLabel(targetUse)}，不能在同一批次重复修改。` : undefined}
+            >
+              <img src={svgPreviewUrl(icon.svg)} alt="" />
+              <strong>{icon.primaryName}</strong>
+              <span>{targetUse ? targetUseLabel(targetUse) : icon.aliases.length ? icon.aliases.join(' · ') : icon.group}</span>
+            </button>
+          );
+        })}
       </div>
       {catalog && totalPages > 1 && (
         <div className="catalog-pagination">
@@ -299,7 +400,7 @@ function SvgQueue({ pending, activeSvgId, disabled, error, onQueue, onActivate, 
         <strong>拖入一个或多个 SVG 到这里</strong>
         <span>或点击选择文件（可一次选择多个 .svg）</span>
       </label>
-      {active && <div className="active-svg-preview"><SvgPreview svg={active} alt={`${active.file.name} 预览`} /><span><strong>{active.file.name}</strong><small>当前待处理 SVG</small></span></div>}
+      {active && <div className="active-svg-preview"><SvgPreview svg={active} alt={`${active.file.name} 预览`} /><span><strong>{active.file.name}</strong><small>当前待处理 SVG</small>{active.warning && <small className="svg-warning">{active.warning}</small>}</span></div>}
       {pending.length > 0 && (
         <div className="pending-svg">
           <div className="pending-heading"><strong>待处理 SVG</strong><span>{pending.length} 个</span></div>
@@ -317,7 +418,7 @@ function SvgQueue({ pending, activeSvgId, disabled, error, onQueue, onActivate, 
           </div>
         </div>
       )}
-      <p className="field-hint">每个 SVG 会保留独立预览。替换时，先选择待处理 SVG，再从目录选择它要替换的旧图标。</p>
+      <p className="field-hint">每个 SVG 会保留独立预览。这里只做浏览器可见的文件、XML 和 viewBox 快速检查；颜色、字体轮廓和仓库兼容性仍由后续 Stage 1 校验。</p>
       <FieldError message={error} />
     </div>
   );
@@ -370,8 +471,8 @@ function ReviewDrawer({
       <section className="review-drawer" role="dialog" aria-modal="true" aria-labelledby="review-title">
         <div className="drawer-heading"><div><p className="eyebrow">提交前确认</p><h2 id="review-title">让开发准确理解这次设计</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div>
         <p className="review-note">提交人会自动使用 <strong>{profile.name}</strong>（{profile.email}）。这里不会展示 codepoint 或 mapping；它们由图标仓库规则生成并由开发审核。</p>
-        <div className="form-field"><label htmlFor="batch-title">本次变更标题<RequiredMark /></label><input id="batch-title" value={form.title} onChange={(event) => onChange({ title: event.target.value })} placeholder="例如：模型页图标视觉更新" /><FieldError message={errors.title} /></div>
-        <div className="form-field"><label htmlFor="batch-description">整体需求说明<RequiredMark /></label><textarea id="batch-description" value={form.description} onChange={(event) => onChange({ description: event.target.value })} placeholder="说明设计变更的背景、目的和影响范围。" /><FieldError message={errors.description} /></div>
+        <div className="form-field"><label htmlFor="batch-title">本次变更标题<RequiredMark /></label><input id="batch-title" maxLength={limits.batchTitle} value={form.title} onChange={(event) => onChange({ title: event.target.value })} placeholder="例如：模型页图标视觉更新" /><FieldCounter value={form.title} maximum={limits.batchTitle} /><FieldError message={errors.title} /></div>
+        <div className="form-field"><label htmlFor="batch-description">整体需求说明<RequiredMark /></label><textarea id="batch-description" maxLength={limits.batchDescription} value={form.description} onChange={(event) => onChange({ description: event.target.value })} placeholder="说明设计变更的背景、目的和影响范围。" /><FieldCounter value={form.description} maximum={limits.batchDescription} /><FieldError message={errors.description} /></div>
         <div className="form-field"><label htmlFor="design-url">设计稿链接<RequiredMark /></label><input id="design-url" type="url" value={form.designUrl} onChange={(event) => onChange({ designUrl: event.target.value })} placeholder="https://figma.com/..." /><FieldError message={errors.designUrl} /></div>
         <section className="review-list" aria-label="本次变更清单"><h3>本次变更清单</h3>{changes.map((change) => <div key={change.clientId}><strong>{({ add: '新增', replace: '替换', delete: '删除' })[change.action]}</strong><span>{change.action === 'add' ? change.designName : change.target?.primaryName}{change.svg ? ` · ${change.svg.file.name}` : ''}</span></div>)}</section>
         <label className="confirm-check"><input type="checkbox" checked={confirmed} onChange={(event) => onConfirmedChange(event.target.checked)} /><span>我确认以上设计意图和 SVG 文件正确，并同意交由后续自动校验和开发审核。</span></label>
@@ -394,7 +495,8 @@ export function App() {
   const [addDescription, setAddDescription] = useState('');
   const [replaceDescription, setReplaceDescription] = useState('');
   const [deleteReason, setDeleteReason] = useState('');
-  const [replacementName, setReplacementName] = useState('');
+  const [replacement, setReplacement] = useState<CatalogPageIcon>();
+  const [deleteImpactAcknowledged, setDeleteImpactAcknowledged] = useState(false);
   const [changeErrors, setChangeErrors] = useState<FieldErrors>({});
   const [catalogQuery, setCatalogQuery] = useState('');
   const [catalogGroup, setCatalogGroup] = useState<CatalogGroup>('all');
@@ -402,6 +504,10 @@ export function App() {
   const [catalog, setCatalog] = useState<Awaited<ReturnType<typeof api.getCatalogPage>>>();
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState<string>();
+  const [catalogSelection, setCatalogSelection] = useState<'target' | 'replacement'>('target');
+  const [namePreview, setNamePreview] = useState<NamePreview>();
+  const [namePreviewPending, setNamePreviewPending] = useState(false);
+  const [namePreviewError, setNamePreviewError] = useState<string>();
   const [batch, setBatch] = useState<BatchDetails>();
   const [batchForm, setBatchForm] = useState({ title: '', description: '', designUrl: '' });
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -414,6 +520,27 @@ export function App() {
   const editable = !batch || batch.state === 'DRAFT';
   const needsCatalog = editable && (action === 'replace' || action === 'delete');
   const activeSvg = useMemo(() => pendingSvgs.find((svg) => svg.id === activeSvgId), [activeSvgId, pendingSvgs]);
+  const usedTargets = useMemo(() => {
+    const result = new Map<string, TargetUse>();
+    changes.forEach((change, index) => {
+      if ((change.action === 'replace' || change.action === 'delete') && change.target) {
+        result.set(change.target.primaryName, { action: change.action, itemNumber: index + 1 });
+      }
+    });
+    return result;
+  }, [changes]);
+  const replacementUnavailableTargets = useMemo(() => {
+    const result = new Map<string, TargetUse>();
+    changes.forEach((change, index) => {
+      if (change.action === 'delete' && change.target) {
+        result.set(change.target.primaryName, { action: 'delete', itemNumber: index + 1 });
+      }
+    });
+    if (target && action === 'delete') {
+      result.set(target.primaryName, { action: 'delete', itemNumber: changes.length + 1 });
+    }
+    return result;
+  }, [action, changes, target]);
 
   useEffect(() => () => {
     liveSvgDrafts.current.forEach(revokePreview);
@@ -435,6 +562,26 @@ export function App() {
   }, [catalogGroup, catalogPage, catalogQuery, needsCatalog]);
 
   useEffect(() => {
+    const localIssue = localNameIssue(addName);
+    if (action !== 'add' || !editable || localIssue) {
+      setNamePreview(undefined);
+      setNamePreviewError(undefined);
+      setNamePreviewPending(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setNamePreviewPending(true);
+    setNamePreviewError(undefined);
+    const timer = window.setTimeout(() => {
+      void api.previewName(addName.trim())
+        .then((response) => { if (!cancelled) setNamePreview(response); })
+        .catch((error: unknown) => { if (!cancelled) setNamePreviewError(error instanceof Error ? error.message : '无法检查图标名称。'); })
+        .finally(() => { if (!cancelled) setNamePreviewPending(false); });
+    }, 220);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [action, addName, editable]);
+
+  useEffect(() => {
     if (!batch || !['QUEUED', 'RUNNING'].includes(batch.state)) return undefined;
     const timer = window.setInterval(() => {
       void api.getBatch(batch.id).then(setBatch).catch((error: unknown) => setNotice(error instanceof Error ? error.message : '无法刷新批次状态。'));
@@ -445,20 +592,45 @@ export function App() {
   const selectAction = (nextAction: ItemAction) => {
     setAction(nextAction);
     setTarget(undefined);
+    setReplacement(undefined);
+    setDeleteImpactAcknowledged(false);
+    setCatalogSelection('target');
     setChangeErrors({});
   };
 
   const queueSvgs = (files: FileList | File[]) => {
-    const incoming = Array.from(files);
-    const accepted = incoming.filter((file) => file.name.toLowerCase().endsWith('.svg')).map(createSvgDraft);
-    if (accepted.length === 0) {
-      setNotice('请选择 SVG 文件。');
-      return;
-    }
-    accepted.forEach((svg) => liveSvgDrafts.current.set(svg.id, svg));
-    setPendingSvgs((current) => [...current, ...accepted]);
-    setActiveSvgId(accepted[0].id);
-    setChangeErrors((current) => ({ ...current, svg: '' }));
+    void (async () => {
+      const inspected = await Promise.all(Array.from(files).map(async (file) => ({ file, ...(await inspectSvg(file)) })));
+      const rejected = inspected.filter((result) => result.error);
+      const accepted: SvgDraft[] = [];
+      const knownContent = new Set([
+        ...pendingSvgs.map((svg) => svg.content),
+        ...changes.flatMap((change) => change.svg ? [change.svg.content] : []),
+      ].filter(Boolean));
+      for (const result of inspected) {
+        if (!result.content) continue;
+        const duplicate = knownContent.has(result.content);
+        knownContent.add(result.content);
+        accepted.push({
+          ...createSvgDraft(result.file),
+          content: result.content,
+          ...(duplicate ? { warning: '这个 SVG 与本批次已上传的文件内容完全相同，请确认不是误传。' } : result.warning ? { warning: result.warning } : {}),
+        });
+      }
+      if (accepted.length > 0) {
+        accepted.forEach((svg) => liveSvgDrafts.current.set(svg.id, svg));
+        setPendingSvgs((current) => [...current, ...accepted]);
+        setActiveSvgId(accepted[0].id);
+        setChangeErrors((current) => ({ ...current, svg: '' }));
+      }
+      if (rejected.length > 0) {
+        const message = rejected.map((result) => `${result.file.name}：${result.error}`).join('；');
+        setChangeErrors((current) => ({ ...current, svg: message }));
+        setNotice('有文件未加入待处理队列，请修正后再次拖入。');
+      } else if (accepted.length === 0) {
+        setNotice('请选择可解析的 SVG 文件。');
+      }
+    })();
   };
 
   const removePendingSvg = (id: string, keepPreview = false) => {
@@ -475,26 +647,72 @@ export function App() {
   };
 
   const selectTarget = (icon: CatalogPageIcon) => {
+    const targetUse = usedTargets.get(icon.primaryName);
+    if (targetUse) {
+      setChangeErrors((current) => ({ ...current, target: `${icon.primaryName}${targetUseLabel(targetUse)}，不能在同一批次重复修改。` }));
+      return;
+    }
     setTarget(icon);
+    if (replacement?.primaryName === icon.primaryName) {
+      setReplacement(undefined);
+    }
+    setDeleteImpactAcknowledged(false);
     setChangeErrors((current) => ({ ...current, target: '' }));
+  };
+
+  const selectReplacement = (icon: CatalogPageIcon) => {
+    const unavailable = replacementUnavailableTargets.get(icon.primaryName);
+    if (unavailable) {
+      setChangeErrors((current) => ({ ...current, replacement: `${icon.primaryName}${targetUseLabel(unavailable)}，不能作为删除后的替代图标。` }));
+      return;
+    }
+    setReplacement(icon);
+    setCatalogSelection('target');
+    setChangeErrors((current) => ({ ...current, replacement: '' }));
   };
 
   const resolveDroppedTarget = (name: string) => {
     const icon = catalog?.icons.find((candidate) => candidate.primaryName === name);
-    if (icon) selectTarget(icon);
+    if (icon) {
+      if (catalogSelection === 'replacement') selectReplacement(icon);
+      else selectTarget(icon);
+    }
+  };
+
+  const clearStaleValidation = (): boolean => {
+    if (!batch?.validation) return false;
+    setBatch((current) => current ? { ...current, validation: null, warningsAcknowledged: false } : current);
+    return true;
   };
 
   const addChange = () => {
     const errors: FieldErrors = {};
     if (action !== 'delete' && !activeSvg) errors.svg = '请先拖入或选择 SVG 文件。';
     if (action === 'add') {
-      if (!addName.trim()) errors.designName = '请填写图标建议名称。';
+      const nameIssue = localNameIssue(addName);
+      if (nameIssue) errors.designName = nameIssue;
+      else if (namePreviewPending) errors.designName = '正在根据图标仓库规则生成最终名称。';
+      else if (namePreviewError) errors.designName = `无法检查图标名称：${namePreviewError}`;
+      else if (!namePreview) errors.designName = '请等待名称规则检查完成。';
+      else if (!namePreview.valid) errors.designName = '该名称规范化后不符合图标仓库规则。';
+      else if (namePreview.collision) errors.designName = `最终名称 ${namePreview.normalizedName} 已被 ${namePreview.collision.primaryName}（含 alias）使用。`;
       if (!addDescription.trim()) errors.description = '请填写用途说明。';
+      else if (fieldLengthIssue(addDescription, '用途说明', limits.itemText)) errors.description = fieldLengthIssue(addDescription, '用途说明', limits.itemText)!;
     }
-    if (action === 'replace' && !target) errors.target = '请选择一个需要替换的现有图标。';
+    if (action === 'replace') {
+      if (!target) errors.target = '请选择一个需要替换的现有图标。';
+      else if (fieldLengthIssue(replaceDescription, '替换说明', limits.itemText)) errors.description = fieldLengthIssue(replaceDescription, '替换说明', limits.itemText)!;
+    }
     if (action === 'delete') {
       if (!target) errors.target = '请选择一个需要删除的现有图标。';
       if (!deleteReason.trim()) errors.reason = '请填写删除原因。';
+      else if (fieldLengthIssue(deleteReason, '删除原因', limits.itemText)) errors.reason = fieldLengthIssue(deleteReason, '删除原因', limits.itemText)!;
+      if (!deleteImpactAcknowledged) errors.deleteImpact = '请确认已考虑删除对现有调用方的影响。';
+      if (replacement && replacementUnavailableTargets.has(replacement.primaryName)) errors.replacement = '替代图标不能是正在删除的图标。';
+    }
+    if (target && (action === 'replace' || action === 'delete')) {
+      const targetUse = usedTargets.get(target.primaryName);
+      if (targetUse) errors.target = `${target.primaryName}${targetUseLabel(targetUse)}，不能在同一批次重复修改。`;
     }
     setChangeErrors(errors);
     if (Object.keys(errors).length > 0) return;
@@ -503,15 +721,16 @@ export function App() {
       action,
       ...(action === 'add' ? { designName: addName.trim(), description: addDescription.trim() } : {}),
       ...(action === 'replace' ? { target, description: replaceDescription.trim() || undefined, svg: activeSvg } : {}),
-      ...(action === 'delete' ? { target, reason: deleteReason.trim(), replacementName: replacementName.trim() || undefined } : {}),
+      ...(action === 'delete' ? { target, reason: deleteReason.trim(), replacement } : {}),
       ...(action === 'add' ? { svg: activeSvg } : {}),
     };
     setChanges((current) => [...current, change]);
+    const stale = clearStaleValidation();
     if (activeSvg) removePendingSvg(activeSvg.id, true);
     setTarget(undefined);
-    setAddName(''); setAddDescription(''); setReplaceDescription(''); setDeleteReason(''); setReplacementName('');
+    setAddName(''); setAddDescription(''); setReplaceDescription(''); setDeleteReason(''); setReplacement(undefined); setDeleteImpactAcknowledged(false);
     setChangeErrors({});
-    setNotice('已加入本次变更。其余 SVG 会继续保留在待处理队列。');
+    setNotice(stale ? '变更已修改，需要重新校验。' : '已加入本次变更。其余 SVG 会继续保留在待处理队列。');
   };
 
   const removeChange = async (change: DraftChange) => {
@@ -529,12 +748,17 @@ export function App() {
     revokePreview(change.svg);
     if (change.svg) liveSvgDrafts.current.delete(change.svg.id);
     setChanges((current) => current.filter((candidate) => candidate.clientId !== change.clientId));
+    if (clearStaleValidation()) {
+      setNotice('变更已修改，需要重新校验。');
+    }
   };
 
   const validateReview = (): boolean => {
     const errors: FieldErrors = {};
     if (!batchForm.title.trim()) errors.title = '请填写本次变更标题。';
+    else if (fieldLengthIssue(batchForm.title, '本次变更标题', limits.batchTitle)) errors.title = fieldLengthIssue(batchForm.title, '本次变更标题', limits.batchTitle)!;
     if (!batchForm.description.trim()) errors.description = '请填写整体需求说明。';
+    else if (fieldLengthIssue(batchForm.description, '整体需求说明', limits.batchDescription)) errors.description = fieldLengthIssue(batchForm.description, '整体需求说明', limits.batchDescription)!;
     if (!isHttpUrl(batchForm.designUrl.trim())) errors.designUrl = '请填写有效的 HTTP(S) 设计稿链接。';
     if (!confirmed) errors.confirmed = '请确认本次变更内容。';
     setReviewErrors(errors);
@@ -589,6 +813,19 @@ export function App() {
     }
   };
 
+  const acknowledgeWarnings = async () => {
+    if (!batch) return;
+    setBusy(true);
+    try {
+      setBatch(await api.acknowledgeWarnings(batch.id));
+      setNotice('已确认本次校验中的全部提醒。');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '无法确认校验提醒。');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const retry = async () => {
     if (!batch) return;
     setBusy(true);
@@ -629,15 +866,34 @@ export function App() {
             {(['add', 'replace', 'delete'] as ItemAction[]).map((option) => <button key={option} className={action === option ? 'active' : ''} type="button" role="tab" aria-selected={action === option} disabled={!editable || busy} onClick={() => selectAction(option)}>{({ add: '新增图标', replace: '替换图标', delete: '删除图标' })[option]}</button>)}
           </div>
 
-          {needsCatalog && <CatalogBrowser catalog={catalog} loading={catalogLoading} error={catalogError} query={catalogQuery} group={catalogGroup} selected={target} disabled={!editable || busy} onQueryChange={(value) => { setCatalogQuery(value); setCatalogPage(1); }} onGroupChange={(value) => { setCatalogGroup(value); setCatalogPage(1); }} onPageChange={setCatalogPage} onSelect={selectTarget} />}
+          {needsCatalog && <CatalogBrowser
+            catalog={catalog}
+            loading={catalogLoading}
+            error={catalogError}
+            query={catalogQuery}
+            group={catalogGroup}
+            selected={catalogSelection === 'replacement' ? replacement : target}
+            unavailableTargets={catalogSelection === 'replacement' ? replacementUnavailableTargets : usedTargets}
+            disabled={!editable || busy}
+            selectionCopy={catalogSelection === 'replacement' ? '正在选择删除后的替代图标；正在删除的图标不可选。' : '正在选择本次操作的目标图标。'}
+            onQueryChange={(value) => { setCatalogQuery(value); setCatalogPage(1); }}
+            onGroupChange={(value) => { setCatalogGroup(value); setCatalogPage(1); }}
+            onPageChange={setCatalogPage}
+            onSelect={(icon) => { if (catalogSelection === 'replacement') selectReplacement(icon); else selectTarget(icon); }}
+          />}
 
-          {action !== 'add' && <TargetZone action={action} target={target} error={changeErrors.target} disabled={!editable || busy} onDrop={resolveDroppedTarget} onClear={() => setTarget(undefined)} />}
+          {action !== 'add' && <TargetZone action={action} target={target} error={changeErrors.target} disabled={!editable || busy} onDrop={resolveDroppedTarget} onClear={() => { setTarget(undefined); setReplacement(undefined); setDeleteImpactAcknowledged(false); setCatalogSelection('target'); }} />}
 
-          {action === 'add' && <div className="form-field"><label htmlFor="add-name">图标建议名称<RequiredMark /></label><input id="add-name" value={addName} disabled={!editable || busy} onChange={(event) => setAddName(event.target.value)} placeholder="例如：pink-model-preview" /><FieldError message={changeErrors.designName} /></div>}
-          {action === 'add' && <div className="form-field"><label htmlFor="add-description">用途说明<RequiredMark /></label><textarea id="add-description" value={addDescription} disabled={!editable || busy} onChange={(event) => setAddDescription(event.target.value)} placeholder="说明图标表达的对象或操作。" /><FieldError message={changeErrors.description} /></div>}
-          {action === 'replace' && <div className="form-field"><label htmlFor="replace-description">本次替换说明 <em>（可选）</em></label><textarea id="replace-description" value={replaceDescription} disabled={!editable || busy} onChange={(event) => setReplaceDescription(event.target.value)} placeholder="例如：与新的模型资产视觉语言保持一致。" /></div>}
-          {action === 'delete' && <><div className="form-field"><label htmlFor="delete-reason">删除原因<RequiredMark /></label><textarea id="delete-reason" value={deleteReason} disabled={!editable || busy} onChange={(event) => setDeleteReason(event.target.value)} placeholder="例如：图标已废弃且无替代用途。" /><FieldError message={changeErrors.reason} /></div><div className="form-field"><label htmlFor="replacement-name">建议使用的替代图标 <em>（可选）</em></label><input id="replacement-name" value={replacementName} disabled={!editable || busy} onChange={(event) => setReplacementName(event.target.value)} placeholder="例如：pink-logo" /></div></>}
+          {action === 'add' && <div className="form-field"><label htmlFor="add-name">图标建议名称<RequiredMark /></label><input id="add-name" maxLength={limits.name} value={addName} disabled={!editable || busy} onChange={(event) => setAddName(event.target.value)} placeholder="例如：pink-model-preview" /><FieldCounter value={addName} maximum={limits.name} />{namePreviewPending && <p className="field-hint">正在按图标仓库规则生成最终名称…</p>}{namePreview && <p className={`name-preview ${namePreview.collision ? 'collision' : ''}`}>建议名称：<strong>{namePreview.input}</strong> → 最终名称：<strong>{namePreview.normalizedName || '无效'}</strong>{namePreview.collision && <span> 已与 {namePreview.collision.primaryName}（{namePreview.collision.aliases.join('、')}）冲突。</span>}</p>}{namePreviewError && <p className="field-error">名称预览失败：{namePreviewError}</p>}<FieldError message={changeErrors.designName} /></div>}
+          {action === 'add' && <div className="form-field"><label htmlFor="add-description">用途说明<RequiredMark /></label><textarea id="add-description" maxLength={limits.itemText} value={addDescription} disabled={!editable || busy} onChange={(event) => setAddDescription(event.target.value)} placeholder="说明图标表达的对象或操作。" /><FieldCounter value={addDescription} maximum={limits.itemText} /><FieldError message={changeErrors.description} /></div>}
+          {action === 'replace' && <div className="form-field"><label htmlFor="replace-description">本次替换说明 <em>（可选）</em></label><textarea id="replace-description" maxLength={limits.itemText} value={replaceDescription} disabled={!editable || busy} onChange={(event) => setReplaceDescription(event.target.value)} placeholder="例如：与新的模型资产视觉语言保持一致。" /><FieldCounter value={replaceDescription} maximum={limits.itemText} /><FieldError message={changeErrors.description} /></div>}
+          {action === 'delete' && <>
+            <div className="form-field"><label htmlFor="delete-reason">删除原因<RequiredMark /></label><textarea id="delete-reason" maxLength={limits.itemText} value={deleteReason} disabled={!editable || busy} onChange={(event) => setDeleteReason(event.target.value)} placeholder="例如：图标已废弃且无替代用途。" /><FieldCounter value={deleteReason} maximum={limits.itemText} /><FieldError message={changeErrors.reason} /></div>
+            <div className="form-field"><span className="field-label">建议使用的替代图标 <em>（可选）</em></span>{replacement ? <div className="replacement-choice"><img src={svgPreviewUrl(replacement.svg)} alt={`${replacement.primaryName} 替代图标`} /><span><strong>{replacement.primaryName}</strong><small>现有 primary 图标</small></span><button type="button" disabled={!editable || busy} onClick={() => { setReplacement(undefined); setCatalogSelection('replacement'); }}>重新选择</button></div> : <button className="button secondary" type="button" disabled={!editable || busy || !target} onClick={() => setCatalogSelection('replacement')}>从图标目录选择替代图标</button>}<FieldError message={changeErrors.replacement} /></div>
+            <label className="confirm-check delete-impact-check"><input type="checkbox" checked={deleteImpactAcknowledged} disabled={!editable || busy} onChange={(event) => setDeleteImpactAcknowledged(event.target.checked)} /><span>我已确认删除可能影响现有调用方，并会在后续人工审核中处理兼容性。{target?.aliases.length ? ` 当前图标还包含 alias：${target.aliases.join('、')}。` : ''}</span></label><FieldError message={changeErrors.deleteImpact} />
+          </>}
           {action !== 'delete' && <SvgQueue pending={pendingSvgs} activeSvgId={activeSvgId} disabled={!editable || busy} error={changeErrors.svg} onQueue={queueSvgs} onActivate={setActiveSvgId} onRemove={removePendingSvg} />}
+          {action === 'replace' && target && activeSvg?.content === target.svg && <p className="inline-warning">新 SVG 与当前仓库文件内容完全一致；这次替换可能不会产生实际改动。</p>}
           <div className="composer-actions"><span>操作先保留在当前浏览器草稿；尚未提交到图标仓库。</span><button className="button primary" type="button" disabled={!editable || busy} onClick={addChange}>加入{({ add: '新增', replace: '替换', delete: '删除' })[action]}队列</button></div>
         </section>
 
@@ -645,9 +901,11 @@ export function App() {
 
         <DiagnosticList title="需要修正的问题" diagnostics={batch?.validation?.errors ?? []} tone="error" />
         <DiagnosticList title="需要开发确认的提醒" diagnostics={batch?.validation?.warnings ?? []} tone="warning" />
+        {batch?.state === 'READY' && (batch.validation?.warnings.length ?? 0) > 0 && !batch.warningsAcknowledged && <section className="warning-acknowledgement"><strong>这些提醒需要人工判断。</strong><span>确认后才可以生成本地修改；任何变更或重新校验都会使本次确认失效。</span><button className="button secondary" type="button" disabled={busy} onClick={() => void acknowledgeWarnings()}>我已阅读并确认全部提醒</button></section>}
+        {batch?.state === 'READY' && (batch.validation?.warnings.length ?? 0) > 0 && batch.warningsAcknowledged && <p className="state-notice state-ready">已确认当前校验结果中的全部提醒。</p>}
         {batch?.error && <section className="diagnostics error"><h2>处理失败</h2><p><strong>{batch.error.code}</strong> {batch.error.message}</p></section>}
         {batch?.localDiff && <section className="result-card"><p className="eyebrow">本地修改已就绪</p><h2>等待阶段 3 创建 Draft PR</h2><p>当前阶段只生成并保存可审阅的本地 diff，不会创建 GitHub 分支或 Pull Request。</p><details><summary>查看技术详情</summary><ul>{batch.localDiff.changedFiles.map((file) => <li key={file}>{file}</li>)}</ul></details></section>}
-        <section className="post-validation-actions">{batch?.state === 'READY' && <button className="button primary" type="button" disabled={busy} onClick={() => void submit()}>生成本地修改</button>}{batch?.state === 'FAILED' && <button className="button primary" type="button" disabled={busy} onClick={() => void retry()}>重试</button>}</section>
+        <section className="post-validation-actions">{batch?.state === 'READY' && <button className="button primary" type="button" disabled={busy || ((batch.validation?.warnings.length ?? 0) > 0 && !batch.warningsAcknowledged)} onClick={() => void submit()}>生成本地修改</button>}{batch?.state === 'FAILED' && <button className="button primary" type="button" disabled={busy || ((batch.validation?.warnings.length ?? 0) > 0 && !batch.warningsAcknowledged)} onClick={() => void retry()}>重试</button>}</section>
       </main>
       {identityOpen && <IdentityDialog profile={profile} onSave={saveProfile} onClose={profile ? () => setIdentityOpen(false) : undefined} />}
       {reviewOpen && profile && <ReviewDrawer changes={changes} form={batchForm} profile={profile} errors={reviewErrors} confirmed={confirmed} busy={busy} onChange={(patch) => setBatchForm((current) => ({ ...current, ...patch }))} onConfirmedChange={setConfirmed} onClose={() => setReviewOpen(false)} onSubmit={() => void startValidation()} />}

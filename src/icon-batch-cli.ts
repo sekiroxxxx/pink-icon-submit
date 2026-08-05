@@ -15,6 +15,10 @@ export class IconBatchCli {
     return this.run(['catalog', '--repo', repositoryPath], repositoryPath, [0]);
   }
 
+  namePreview(repositoryPath: string, name: string): Promise<IconBatchResult> {
+    return this.run(['name-preview', name, '--repo', repositoryPath], repositoryPath, [0], false);
+  }
+
   validate(repositoryPath: string, requestPath: string): Promise<IconBatchResult> {
     return this.run(['validate', requestPath, '--repo', repositoryPath], repositoryPath, [0, 2]);
   }
@@ -27,8 +31,10 @@ export class IconBatchCli {
     return this.run(['apply', planPath, '--repo', repositoryPath], repositoryPath, [0]);
   }
 
-  private async run(args: string[], cwd: string, acceptedExitCodes: number[]): Promise<IconBatchResult> {
-    await this.ensureDependencies(cwd);
+  private async run(args: string[], cwd: string, acceptedExitCodes: number[], needsDependencies = true): Promise<IconBatchResult> {
+    if (needsDependencies) {
+      await this.ensureDependencies(cwd);
+    }
     const result = await this.execute(this.nodeExecutable, [join(cwd, 'scripts', 'icon-batch.mjs'), ...args], cwd);
 
     let payload: Record<string, unknown>;

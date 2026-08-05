@@ -127,3 +127,32 @@ test('interrupted VALIDATING batches return to DRAFT on startup recovery', async
   }, undefined);
   assert.equal((await environment.batches.validateBatch(batchId)).state, 'READY');
 });
+
+test('editing a DRAFT batch clears an obsolete validation result and acknowledgement', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const batchId = createBatch(environment.batches);
+  await environment.batches.addItem(batchId, {
+    action: 'add',
+    designName: 'obsolete-validation-icon',
+    description: 'Used to create an obsolete validation result.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.beginValidation(batchId);
+  environment.database.completeValidation(batchId, {
+    valid: false,
+    requestSha256: 'c'.repeat(64),
+    errors: [{ code: 'TEST_ERROR', message: 'Needs another edit.' }],
+    warnings: [],
+  }, 'b'.repeat(40), false);
+  assert.equal(environment.batches.getBatch(batchId).validation !== null, true);
+
+  await environment.batches.addItem(batchId, {
+    action: 'delete',
+    targetName: 'existing',
+    reason: 'Editing must invalidate the old result.',
+  }, undefined);
+  const updated = environment.batches.getBatch(batchId);
+  assert.equal(updated.state, 'DRAFT');
+  assert.equal(updated.validation, null);
+  assert.equal(updated.warningsAcknowledged, false);
+  assert.equal(updated.baseCommit, null);
+});

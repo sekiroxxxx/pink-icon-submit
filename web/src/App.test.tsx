@@ -23,6 +23,27 @@ function catalogResponse() {
   };
 }
 
+function namePreviewResponse(name: string) {
+  return {
+    schemaVersion: 1,
+    baseCommit: 'a'.repeat(40),
+    input: name,
+    normalizedName: name === 'pink-new-icon' ? 'pink-new-icon' : name === 'pink-one' ? 'pink-one' : name,
+    valid: true,
+    collision: null,
+  };
+}
+
+function mockNamePreview(): ReturnType<typeof vi.fn> {
+  return vi.fn((path: string) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/names/preview') {
+      return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
+    }
+    return Promise.resolve(jsonResponse({}));
+  });
+}
+
 function saveProfile(): void {
   window.localStorage.setItem('pink-icon-submit.designer-profile.v1', JSON.stringify({
     version: 1,
@@ -40,6 +61,7 @@ async function addOneSvgChange(user: ReturnType<typeof userEvent.setup>): Promis
   await user.upload(fileInput, svgFile('new-icon.svg'));
   await user.type(screen.getByLabelText(/^图标建议名称/), 'pink-new-icon');
   await user.type(screen.getByLabelText(/^用途说明/), '用于测试新增图标的设计稿。');
+  await screen.findByText(/最终名称：/);
   await user.click(screen.getByRole('button', { name: '加入新增队列' }));
 }
 
@@ -84,9 +106,27 @@ test('replace requests the catalog only after its action is selected and chooses
   expect(screen.getByText('待替换图标 · existing-alias')).toBeTruthy();
 });
 
+test('a replace target becomes unavailable after it is added to the same batch', async () => {
+  saveProfile();
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(catalogResponse())));
+  const user = userEvent.setup();
+
+  render(<App />);
+  await user.click(screen.getByRole('tab', { name: '替换图标' }));
+  await screen.findByText('existing');
+  await user.click(screen.getByRole('button', { name: '选择 existing' }));
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('replacement.svg'));
+  await user.click(screen.getByRole('button', { name: '加入替换队列' }));
+
+  const usedTarget = screen.getByRole('button', { name: 'existing 已用于第 1 项替换' });
+  expect((usedTarget as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText('已用于第 1 项替换')).toBeTruthy();
+});
+
 test('multiple SVG files stay in the pending queue until each is paired with a change', async () => {
   saveProfile();
-  vi.stubGlobal('fetch', vi.fn());
+  vi.stubGlobal('fetch', mockNamePreview());
   const user = userEvent.setup();
 
   render(<App />);
@@ -97,6 +137,7 @@ test('multiple SVG files stay in the pending queue until each is paired with a c
   expect(screen.getByRole('button', { name: '选择 two.svg' })).toBeTruthy();
   await user.type(screen.getByLabelText(/^图标建议名称/), 'pink-one');
   await user.type(screen.getByLabelText(/^用途说明/), '第一个图标。');
+  await screen.findByText(/最终名称：/);
   await user.click(screen.getByRole('button', { name: '加入新增队列' }));
 
   expect(screen.getByText('本次变更 1 项')).toBeTruthy();
@@ -104,9 +145,52 @@ test('multiple SVG files stay in the pending queue until each is paired with a c
   expect(screen.getByRole('img', { name: 'one.svg 预览' })).toBeTruthy();
 });
 
+test('an add name collision returned by Stage 1 cannot be added to the batch', async () => {
+  saveProfile();
+  vi.stubGlobal('fetch', vi.fn((path: string) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/names/preview') {
+      return Promise.resolve(jsonResponse({
+        ...namePreviewResponse(url.searchParams.get('name') ?? ''),
+        normalizedName: 'existing',
+        collision: { primaryName: 'existing', aliases: ['existing-alias'] },
+      }));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  }));
+  const user = userEvent.setup();
+  render(<App />);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('collision.svg'));
+  await user.type(screen.getByLabelText(/^图标建议名称/), 'Existing');
+  await user.type(screen.getByLabelText(/^用途说明/), '验证名称冲突。');
+  await screen.findByText(/已与 existing/);
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+
+  expect(screen.getByText(/最终名称 existing 已被 existing/)).toBeTruthy();
+  expect(screen.getByText('本次变更 0 项')).toBeTruthy();
+});
+
+test('delete requires an explicit call-site impact acknowledgement before it enters the queue', async () => {
+  saveProfile();
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(catalogResponse())));
+  const user = userEvent.setup();
+  render(<App />);
+  await user.click(screen.getByRole('tab', { name: '删除图标' }));
+  await screen.findByText('existing');
+  await user.click(screen.getByRole('button', { name: '选择 existing' }));
+  await user.type(screen.getByLabelText(/^删除原因/), '旧图标已废弃。');
+  await user.click(screen.getByRole('button', { name: '加入删除队列' }));
+
+  expect(screen.getByText('请确认已考虑删除对现有调用方的影响。')).toBeTruthy();
+  await user.click(screen.getByRole('checkbox'));
+  await user.click(screen.getByRole('button', { name: '加入删除队列' }));
+  expect(screen.getByText('本次变更 1 项')).toBeTruthy();
+});
+
 test('review drawer blocks incomplete batch details before any batch is created', async () => {
   saveProfile();
-  const fetchMock = vi.fn();
+  const fetchMock = mockNamePreview();
   vi.stubGlobal('fetch', fetchMock);
   const user = userEvent.setup();
 
@@ -120,22 +204,36 @@ test('review drawer blocks incomplete batch details before any batch is created'
   expect(screen.getByText('请填写整体需求说明。')).toBeTruthy();
   expect(screen.getByText('请填写有效的 HTTP(S) 设计稿链接。')).toBeTruthy();
   expect(screen.getByText('请确认本次变更内容。')).toBeTruthy();
-  expect(fetchMock).not.toHaveBeenCalled();
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/names/preview?name=pink-new-icon');
 });
 
 test('a confirmed change creates a batch, uploads its SVG, and starts validation', async () => {
   saveProfile();
-  const fetchMock = vi.fn()
-    .mockResolvedValueOnce(jsonResponse({ id: 'ICON-TEST', state: 'DRAFT', items: [], validation: null, localDiff: null, error: null }))
-    .mockResolvedValueOnce(jsonResponse({ id: 'item-1', batchId: 'ICON-TEST', action: 'add', sourceFile: 'items/item-1.svg' }))
-    .mockResolvedValueOnce(jsonResponse({
-      id: 'ICON-TEST',
-      state: 'READY',
-      items: [],
-      validation: { valid: true, errors: [], warnings: [] },
-      localDiff: null,
-      error: null,
-    }));
+  const fetchMock = vi.fn((path: string) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/names/preview') {
+      return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
+    }
+    if (url.pathname === '/api/batches') {
+      return Promise.resolve(jsonResponse({ id: 'ICON-TEST', state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, error: null }));
+    }
+    if (url.pathname === '/api/batches/ICON-TEST/items') {
+      return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-TEST', action: 'add', sourceFile: 'items/item-1.svg' }));
+    }
+    if (url.pathname === '/api/batches/ICON-TEST/validate') {
+      return Promise.resolve(jsonResponse({
+        id: 'ICON-TEST',
+        state: 'READY',
+        items: [],
+        validation: { valid: true, errors: [], warnings: [] },
+        warningsAcknowledged: false,
+        localDiff: null,
+        error: null,
+      }));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
   vi.stubGlobal('fetch', fetchMock);
   const user = userEvent.setup();
 
@@ -148,9 +246,9 @@ test('a confirmed change creates a batch, uploads its SVG, and starts validation
   await user.click(screen.getByRole('checkbox'));
   await user.click(screen.getByRole('button', { name: '进入校验' }));
 
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-  expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/batches');
-  expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/batches/ICON-TEST/items');
-  expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/batches/ICON-TEST/validate');
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+  expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/batches');
+  expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/batches/ICON-TEST/items');
+  expect(fetchMock.mock.calls[3]?.[0]).toBe('/api/batches/ICON-TEST/validate');
   expect(screen.getByText('校验通过，可以生成本地修改。')).toBeTruthy();
 });

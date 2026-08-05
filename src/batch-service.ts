@@ -6,7 +6,7 @@ import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
-import type { BatchDetails, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, StoredItem } from './types.js';
+import type { BatchDetails, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, StoredItem } from './types.js';
 
 const maximumBatchItems = 100;
 
@@ -59,6 +59,10 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function validationIsValid(value: unknown): boolean {
   return isObject(value) && value.valid === true;
+}
+
+function validationHasWarnings(value: unknown): boolean {
+  return isObject(value) && Array.isArray(value.warnings) && value.warnings.length > 0;
 }
 
 function baseCommitFrom(value: unknown): string | null {
@@ -117,7 +121,7 @@ export class BatchService {
       if (this.database.countItems(batchId) >= maximumBatchItems) {
         throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
       }
-      const normalized = await this.normalizeItemInput(input, svg);
+      const normalized = await this.normalizeItemInput(batchId, input, svg);
       const itemId = createItemId();
       const sourceFile = svg ? await this.saveSvg(batchId, itemId, svg) : null;
       return this.database.insertItem(batchId, itemId, normalized, sourceFile);
@@ -129,7 +133,7 @@ export class BatchService {
     return this.withBatchLock(batchId, async () => {
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
       const existing = this.database.getItem(batchId, itemId);
-      const normalized = await this.normalizeItemInput(input, svg, existing.sourceFile);
+      const normalized = await this.normalizeItemInput(batchId, input, svg, existing.sourceFile, itemId);
       const sourceFile = normalized.action === 'delete'
         ? null
         : svg
@@ -177,6 +181,10 @@ export class BatchService {
     return this.catalog.page(input);
   }
 
+  previewName(input: string): Promise<IconNamePreview> {
+    return this.catalog.previewName(requiredIconName(input, 'name'));
+  }
+
   async getCatalogIconSvg(name: string): Promise<Buffer> {
     return this.catalog.svg(requiredIconName(name, 'icon name'));
   }
@@ -188,6 +196,9 @@ export class BatchService {
     }
     if (!['READY', 'FAILED'].includes(batch.state)) {
       throw new AppError('BATCH_NOT_SUBMITTABLE', `Batch ${batchId} is ${batch.state}.`, 409);
+    }
+    if (validationHasWarnings(batch.validation) && !batch.warningsAcknowledged) {
+      throw new AppError('BATCH_WARNINGS_UNACKNOWLEDGED', 'Acknowledge all validation warnings before submission.', 409);
     }
     this.database.queueJob(batchId);
     this.catalog.invalidate();
@@ -202,11 +213,19 @@ export class BatchService {
     if (!validationIsValid(batch.validation)) {
       throw new AppError('BATCH_NOT_READY', 'The batch requires a successful validation before retry.', 409);
     }
+    if (validationHasWarnings(batch.validation) && !batch.warningsAcknowledged) {
+      throw new AppError('BATCH_WARNINGS_UNACKNOWLEDGED', 'Acknowledge all validation warnings before retrying.', 409);
+    }
     this.database.queueJob(batchId);
     return this.database.getDetails(batchId);
   }
 
   getBatch(batchId: string): BatchDetails {
+    return this.database.getDetails(batchId);
+  }
+
+  acknowledgeWarnings(batchId: string): BatchDetails {
+    this.database.acknowledgeWarnings(batchId);
     return this.database.getDetails(batchId);
   }
 
@@ -257,7 +276,7 @@ export class BatchService {
     }
   }
 
-  private async normalizeItemInput(input: CreateItemInput, svg: Buffer | undefined, existingSourceFile?: string | null): Promise<CreateItemInput> {
+  private async normalizeItemInput(batchId: string, input: CreateItemInput, svg: Buffer | undefined, existingSourceFile?: string | null, itemId?: string): Promise<CreateItemInput> {
     if (!isObject(input)) {
       throw new AppError('ITEM_INVALID', 'item must be an object.');
     }
@@ -284,7 +303,14 @@ export class BatchService {
     }
     const targetName = await this.catalog.canonicalName(requiredIconName(submitted.targetName, 'targetName'));
     const reason = requiredText(submitted.reason, 'reason', 1_000);
-    const replacementName = optionalIconName(submitted.replacementName, 'replacementName');
+    const requestedReplacement = optionalIconName(submitted.replacementName, 'replacementName');
+    const replacementName = requestedReplacement ? await this.catalog.canonicalName(requestedReplacement) : undefined;
+    if (replacementName === targetName) {
+      throw new AppError('ITEM_INVALID', 'replacementName must be a different existing icon from targetName.');
+    }
+    if (replacementName && this.database.getItems(batchId).some((item) => item.id !== itemId && item.action === 'delete' && item.targetName === replacementName)) {
+      throw new AppError('ITEM_INVALID', 'replacementName cannot be another icon being deleted in this batch.');
+    }
     if (svg) {
       throw new AppError('UPLOAD_NOT_ALLOWED', 'delete must not include an SVG upload.');
     }

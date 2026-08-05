@@ -4,7 +4,7 @@ import { isAbsolute, relative, resolve } from 'node:path';
 import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
-import type { CatalogGroup, CatalogPage, CatalogPageIcon, CatalogPageInput } from './types.js';
+import type { CatalogGroup, CatalogPage, CatalogPageIcon, CatalogPageInput, IconNamePreview } from './types.js';
 
 interface CatalogIconSnapshot extends CatalogPageIcon {
   sourceName: string;
@@ -33,6 +33,36 @@ function readAliases(value: unknown): string[] {
   return value;
 }
 
+function namePreview(payload: Record<string, unknown>, baseCommit: string, input: string): IconNamePreview {
+  if (payload.schemaVersion !== 1 || payload.baseCommit !== baseCommit || payload.input !== input) {
+    throw new AppError('NAME_PREVIEW_INVALID', 'Name preview does not match the requested repository state.', 502);
+  }
+  if (typeof payload.normalizedName !== 'string') {
+    throw new AppError('NAME_PREVIEW_INVALID', 'Name preview normalizedName is invalid.', 502);
+  }
+  const normalizedName = payload.normalizedName;
+  if (typeof payload.valid !== 'boolean') {
+    throw new AppError('NAME_PREVIEW_INVALID', 'Name preview valid flag is invalid.', 502);
+  }
+  if (payload.collision === null) {
+    return { schemaVersion: 1, baseCommit, input, normalizedName, valid: payload.valid, collision: null };
+  }
+  if (!isObject(payload.collision)) {
+    throw new AppError('NAME_PREVIEW_INVALID', 'Name preview collision is invalid.', 502);
+  }
+  return {
+    schemaVersion: 1,
+    baseCommit,
+    input,
+    normalizedName,
+    valid: payload.valid,
+    collision: {
+      primaryName: requiredString(payload.collision.primaryName, 'collision.primaryName'),
+      aliases: readAliases(payload.collision.aliases),
+    },
+  };
+}
+
 function iconGroup(primaryName: string): Exclude<CatalogGroup, 'all'> {
   if (primaryName.startsWith('pink-')) {
     return 'pink';
@@ -59,6 +89,7 @@ function safeIconPath(worktreePath: string, sourceFile: string): string {
 export class CatalogSnapshotCache {
   private snapshot: CatalogSnapshot | undefined;
   private inFlight: Promise<CatalogSnapshot> | undefined;
+  private readonly namePreviews = new Map<string, IconNamePreview>();
 
   constructor(
     private readonly repository: GitRepository,
@@ -67,6 +98,7 @@ export class CatalogSnapshotCache {
 
   invalidate(): void {
     this.snapshot = undefined;
+    this.namePreviews.clear();
   }
 
   async page(input: CatalogPageInput): Promise<CatalogPage> {
@@ -103,6 +135,21 @@ export class CatalogSnapshotCache {
       throw new AppError('CATALOG_ICON_NOT_FOUND', `Unknown catalog icon: ${name}`, 404);
     }
     return icon.primaryName;
+  }
+
+  async previewName(input: string): Promise<IconNamePreview> {
+    const snapshot = await this.latestSnapshot();
+    const cacheKey = `${snapshot.baseCommit}\u0000${input}`;
+    const cached = this.namePreviews.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const preview = await this.repository.withWorktreeAt(snapshot.baseCommit, async (worktreePath) => {
+      const result = await this.iconBatch.namePreview(worktreePath, input);
+      return namePreview(result.payload, snapshot.baseCommit, input);
+    });
+    this.namePreviews.set(cacheKey, preview);
+    return preview;
   }
 
   async svg(name: string): Promise<Buffer> {
