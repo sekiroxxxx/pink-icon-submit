@@ -80,6 +80,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.get('/api/catalog', async () => dependencies.batches.getCatalog());
 
+  app.get('/api/catalog/icons/:name/svg', async (request, reply) => {
+    const { name } = request.params as { name: string };
+    const svg = await dependencies.batches.getCatalogIconSvg(name);
+    return reply.type('image/svg+xml; charset=utf-8').send(svg);
+  });
+
   app.post('/api/batches', async (request, reply) => {
     const batch = dependencies.batches.createBatch(request.body as CreateBatchInput);
     return reply.status(201).send(batch);
@@ -90,6 +96,18 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const { item, svg } = await readItemPayload(request);
     const created = await dependencies.batches.addItem(batchId, item, svg);
     return reply.status(201).send(created);
+  });
+
+  app.put('/api/batches/:batchId/items/:itemId', async (request) => {
+    const { batchId, itemId } = request.params as { batchId: string; itemId: string };
+    const { item, svg } = await readItemPayload(request);
+    return dependencies.batches.updateItem(batchId, itemId, item, svg);
+  });
+
+  app.delete('/api/batches/:batchId/items/:itemId', async (request, reply) => {
+    const { batchId, itemId } = request.params as { batchId: string; itemId: string };
+    await dependencies.batches.deleteItem(batchId, itemId);
+    return reply.status(204).send();
   });
 
   app.post('/api/batches/:batchId/validate', async (request) => {

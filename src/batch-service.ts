@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { isAbsolute, relative, resolve } from 'node:path';
 
 import { BatchDatabase } from './database.js';
 import { AppError } from './errors.js';
@@ -80,6 +82,29 @@ export class BatchService {
     });
   }
 
+  async updateItem(batchId: string, itemId: string, input: CreateItemInput, svg: Buffer | undefined): Promise<StoredItem> {
+    this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+    return this.withBatchLock(batchId, async () => {
+      this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+      const existing = this.database.getItem(batchId, itemId);
+      this.validateItemInput(input, svg, existing.sourceFile);
+      const sourceFile = input.action === 'delete'
+        ? null
+        : svg
+          ? await this.saveSvg(batchId, itemId, svg)
+          : existing.sourceFile;
+      return this.database.updateItem(batchId, itemId, input, sourceFile);
+    });
+  }
+
+  async deleteItem(batchId: string, itemId: string): Promise<void> {
+    this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+    return this.withBatchLock(batchId, async () => {
+      this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+      this.database.deleteItem(batchId, itemId);
+    });
+  }
+
   async validateBatch(batchId: string): Promise<BatchDetails> {
     this.assertDraft(batchId, 'BATCH_NOT_VALIDATABLE', 'validated');
     return this.withBatchLock(batchId, async () => {
@@ -103,6 +128,29 @@ export class BatchService {
     return this.repository.withLatestWorktree(async (worktreePath) => {
       const result = await this.iconBatch.catalog(worktreePath);
       return result.payload;
+    });
+  }
+
+  async getCatalogIconSvg(name: string): Promise<Buffer> {
+    const iconName = requiredText(name, 'icon name');
+    return this.repository.withLatestWorktree(async (worktreePath) => {
+      const catalog = (await this.iconBatch.catalog(worktreePath)).payload;
+      const icons = Array.isArray(catalog.icons) ? catalog.icons : [];
+      const icon = icons.find((entry) => isObject(entry)
+        && (entry.primaryName === iconName || (Array.isArray(entry.aliases) && entry.aliases.includes(iconName))));
+      if (!isObject(icon)) {
+        throw new AppError('CATALOG_ICON_NOT_FOUND', `Unknown catalog icon: ${iconName}`, 404);
+      }
+      if (typeof icon.sourceFile !== 'string' || !icon.sourceFile.startsWith('src/icons/') || !icon.sourceFile.endsWith('.svg')) {
+        throw new AppError('CATALOG_ICON_INVALID', `Catalog source path is invalid for ${iconName}.`, 502);
+      }
+      const root = resolve(worktreePath);
+      const sourcePath = resolve(root, icon.sourceFile);
+      const pathFromRoot = relative(root, sourcePath);
+      if (pathFromRoot.startsWith('..') || isAbsolute(pathFromRoot)) {
+        throw new AppError('CATALOG_ICON_INVALID', `Catalog source path escapes the worktree for ${iconName}.`, 502);
+      }
+      return readFile(sourcePath);
     });
   }
 
@@ -178,21 +226,21 @@ export class BatchService {
     }
   }
 
-  private validateItemInput(input: CreateItemInput, svg: Buffer | undefined): void {
+  private validateItemInput(input: CreateItemInput, svg: Buffer | undefined, existingSourceFile?: string | null): void {
     if (!['add', 'replace', 'delete'].includes(input.action)) {
       throw new AppError('ITEM_INVALID', 'action must be add, replace, or delete.');
     }
     if (input.action === 'add') {
       requiredText(input.designName, 'designName');
       requiredText(input.description, 'description');
-      if (!svg) {
+      if (!svg && !existingSourceFile) {
         throw new AppError('UPLOAD_REQUIRED', 'add requires an SVG upload.');
       }
       return;
     }
     if (input.action === 'replace') {
       requiredText(input.targetName, 'targetName');
-      if (!svg) {
+      if (!svg && !existingSourceFile) {
         throw new AppError('UPLOAD_REQUIRED', 'replace requires an SVG upload.');
       }
       return;

@@ -24,7 +24,7 @@ const repo = repoFlag >= 0 ? rest[repoFlag + 1] : process.cwd();
 const head = () => execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 const emit = (value, exitCode = 0) => { process.stdout.write(JSON.stringify(value)); process.exitCode = exitCode; };
 if (command === 'catalog') {
-  emit({ schemaVersion: 1, baseCommit: head(), icons: [], retiredCodepoints: [] });
+  emit({ schemaVersion: 1, baseCommit: head(), icons: [{ primaryName: 'existing', sourceName: 'existing', aliases: [], codepoint: 50000, sourceFile: 'src/icons/existing.svg', metadataPresent: false }], retiredCodepoints: [] });
 } else if (command === 'validate') {
   const request = JSON.parse(readFileSync(inputPath, 'utf8'));
   emit({ schemaVersion: 1, batchId: request.batchId, requestSha256: 'a'.repeat(64), baseCommit: head(), valid: true, summary: { errorCount: 0, warningCount: 0 }, errors: [], warnings: [] });

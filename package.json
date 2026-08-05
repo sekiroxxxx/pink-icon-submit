@@ -8,21 +8,35 @@
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
+    "web:dev": "vite --config web/vite.config.ts",
     "start": "node dist/server.js",
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc --noEmit -p tsconfig.json",
-    "test": "tsx --test tests/*.test.ts",
+    "build": "tsc -p tsconfig.json && npm run web:build",
+    "web:build": "vite build --config web/vite.config.ts",
+    "check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json",
+    "test": "npm run test:server && npm run web:test",
+    "test:server": "tsx --test tests/*.test.ts",
+    "web:test": "vitest run --config web/vite.config.ts",
     "test:integration": "tsx --test tests/real-icon-batch.integration.ts"
   },
   "dependencies": {
     "@fastify/multipart": "^9.2.1",
     "better-sqlite3": "^12.4.1",
-    "fastify": "^5.6.1"
+    "fastify": "^5.6.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.3",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.10.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "jsdom": "^30.0.1",
     "tsx": "^4.20.6",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10"
   }
 }

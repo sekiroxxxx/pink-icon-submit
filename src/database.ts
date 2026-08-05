@@ -185,6 +185,52 @@ export class BatchDatabase {
     return (this.db.prepare('SELECT * FROM items WHERE batch_id = ? ORDER BY created_at, id').all(batchId) as ItemRow[]).map(toItem);
   }
 
+  getItem(batchId: string, itemId: string): StoredItem {
+    const row = this.db.prepare('SELECT * FROM items WHERE id = ? AND batch_id = ?').get(itemId, batchId) as ItemRow | undefined;
+    if (!row) {
+      throw new AppError('ITEM_NOT_FOUND', `Unknown item ${itemId} in batch ${batchId}.`, 404);
+    }
+    return toItem(row);
+  }
+
+  updateItem(batchId: string, itemId: string, input: CreateItemInput, sourceFile: string | null): StoredItem {
+    const update = this.db.transaction(() => {
+      this.requireDraftBatch(batchId);
+      this.getItem(batchId, itemId);
+      const timestamp = now();
+      this.db.prepare(`
+        UPDATE items
+        SET action = ?, design_name = ?, target_name = ?, description = ?, reason = ?, replacement_name = ?, source_file = ?
+        WHERE id = ? AND batch_id = ?
+      `).run(
+        input.action,
+        input.designName ?? null,
+        input.targetName ?? null,
+        input.description ?? null,
+        input.reason ?? null,
+        input.replacementName ?? null,
+        sourceFile,
+        itemId,
+        batchId,
+      );
+      this.db.prepare('UPDATE batches SET updated_at = ? WHERE id = ?').run(timestamp, batchId);
+      return this.getItem(batchId, itemId);
+    });
+    return update();
+  }
+
+  deleteItem(batchId: string, itemId: string): void {
+    const remove = this.db.transaction(() => {
+      this.requireDraftBatch(batchId);
+      const result = this.db.prepare('DELETE FROM items WHERE id = ? AND batch_id = ?').run(itemId, batchId);
+      if (result.changes !== 1) {
+        throw new AppError('ITEM_NOT_FOUND', `Unknown item ${itemId} in batch ${batchId}.`, 404);
+      }
+      this.db.prepare('UPDATE batches SET updated_at = ? WHERE id = ?').run(now(), batchId);
+    });
+    remove();
+  }
+
   beginValidation(batchId: string): void {
     const begin = this.db.transaction(() => {
       const batch = this.db.prepare('SELECT state FROM batches WHERE id = ?').get(batchId) as Pick<BatchRow, 'state'> | undefined;
@@ -325,6 +371,16 @@ export class BatchDatabase {
 
   private touchBatch(batchId: string, state: BatchState): void {
     this.db.prepare('UPDATE batches SET state = ?, updated_at = ? WHERE id = ?').run(state, now(), batchId);
+  }
+
+  private requireDraftBatch(batchId: string): void {
+    const batch = this.db.prepare('SELECT state FROM batches WHERE id = ?').get(batchId) as Pick<BatchRow, 'state'> | undefined;
+    if (!batch) {
+      throw new AppError('BATCH_NOT_FOUND', `Unknown batch: ${batchId}`, 404);
+    }
+    if (batch.state !== 'DRAFT') {
+      throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} is ${batch.state} and cannot be edited.`, 409);
+    }
   }
 
   private migrate(): void {
