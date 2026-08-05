@@ -1,4 +1,5 @@
 export type ItemAction = 'add' | 'replace' | 'delete';
+export type CatalogGroup = 'all' | 'pink' | 'toolbar' | 'common';
 
 export interface Submitter {
   name: string;
@@ -48,15 +49,26 @@ export interface BatchDetails extends BatchInput {
   error: { code: string; message: string } | null;
 }
 
-export interface CatalogIcon {
+export interface CatalogPageIcon {
   primaryName: string;
-  sourceName: string;
   aliases: string[];
-  sourceFile: string;
+  group: Exclude<CatalogGroup, 'all'>;
+  svg: string;
 }
 
-export interface Catalog {
-  icons: CatalogIcon[];
+export interface CatalogPage {
+  baseCommit: string;
+  page: number;
+  pageSize: number;
+  total: number;
+  icons: CatalogPageIcon[];
+}
+
+export interface CatalogPageQuery {
+  query?: string;
+  group?: CatalogGroup;
+  page?: number;
+  pageSize?: number;
 }
 
 export class ApiError extends Error {
@@ -92,7 +104,14 @@ function itemRequest(item: ItemInput, svg?: File): RequestInit {
 }
 
 export const api = {
-  getCatalog: () => request<Catalog>('/api/catalog'),
+  getCatalogPage: (query: CatalogPageQuery) => {
+    const parameters = new URLSearchParams();
+    if (query.query) parameters.set('query', query.query);
+    if (query.group) parameters.set('group', query.group);
+    if (query.page) parameters.set('page', String(query.page));
+    if (query.pageSize) parameters.set('pageSize', String(query.pageSize));
+    return request<CatalogPage>(`/api/catalog/page?${parameters.toString()}`);
+  },
   createBatch: (input: BatchInput) => request<BatchDetails>('/api/batches', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -108,5 +127,4 @@ export const api = {
   submitBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/submit`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
-  iconPreviewUrl: (name: string) => `/api/catalog/icons/${encodeURIComponent(name)}/svg`,
 };

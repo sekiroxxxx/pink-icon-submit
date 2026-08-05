@@ -15,7 +15,7 @@ const validSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><p
 
 const fakeIconBatchScript = String.raw`
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const [command, inputPath, ...rest] = process.argv.slice(2);
@@ -24,7 +24,8 @@ const repo = repoFlag >= 0 ? rest[repoFlag + 1] : process.cwd();
 const head = () => execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 const emit = (value, exitCode = 0) => { process.stdout.write(JSON.stringify(value)); process.exitCode = exitCode; };
 if (command === 'catalog') {
-  emit({ schemaVersion: 1, baseCommit: head(), icons: [{ primaryName: 'existing', sourceName: 'existing', aliases: [], codepoint: 50000, sourceFile: 'src/icons/existing.svg', metadataPresent: false }], retiredCodepoints: [] });
+  if (process.env.PINK_ICON_BATCH_CATALOG_LOG) appendFileSync(process.env.PINK_ICON_BATCH_CATALOG_LOG, head() + '\n');
+  emit({ schemaVersion: 1, baseCommit: head(), icons: [{ primaryName: 'existing', sourceName: 'existing', aliases: ['existing-alias'], codepoint: 50000, sourceFile: 'src/icons/existing.svg', metadataPresent: false }], retiredCodepoints: [] });
 } else if (command === 'validate') {
   const request = JSON.parse(readFileSync(inputPath, 'utf8'));
   emit({ schemaVersion: 1, batchId: request.batchId, requestSha256: 'a'.repeat(64), baseCommit: head(), valid: true, summary: { errorCount: 0, warningCount: 0 }, errors: [], warnings: [] });
@@ -70,6 +71,8 @@ export interface TestEnvironment {
   database: BatchDatabase;
   batches: BatchService;
   validSvg: string;
+  upstreamPath: string;
+  catalogLogPath: string;
 }
 
 export async function createTestEnvironment(t: TestContext): Promise<TestEnvironment> {
@@ -131,5 +134,5 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     new IconBatchCli(),
     config.maxUploadBytes,
   );
-  return { config, database, batches, validSvg };
+  return { config, database, batches, validSvg, upstreamPath: upstream, catalogLogPath: join(root, 'catalog.log') };
 }

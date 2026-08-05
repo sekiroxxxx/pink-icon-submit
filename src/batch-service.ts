@@ -1,19 +1,47 @@
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { isAbsolute, relative, resolve } from 'node:path';
 
 import { BatchDatabase } from './database.js';
+import { CatalogSnapshotCache } from './catalog-snapshot.js';
 import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
-import type { BatchDetails, CreateBatchInput, CreateItemInput, StoredItem } from './types.js';
+import type { BatchDetails, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, StoredItem } from './types.js';
 
-function requiredText(value: unknown, field: string): string {
+const maximumBatchItems = 100;
+
+function requiredText(value: unknown, field: string, maximumLength: number): string {
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new AppError('REQUEST_INVALID', `${field} is required.`);
   }
-  return value.trim();
+  const normalized = value.trim();
+  if (normalized.length > maximumLength) {
+    throw new AppError('REQUEST_INVALID', `${field} must be at most ${maximumLength} characters.`);
+  }
+  return normalized;
+}
+
+function optionalText(value: unknown, field: string, maximumLength: number): string | undefined {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  return requiredText(value, field, maximumLength);
+}
+
+function requiredIconName(value: unknown, field: string): string {
+  const name = requiredText(value, field, 100);
+  if (!/^[^\s/\\]+$/.test(name)) {
+    throw new AppError('REQUEST_INVALID', `${field} must not contain whitespace or path separators.`);
+  }
+  return name;
+}
+
+function optionalIconName(value: unknown, field: string): string | undefined {
+  const name = optionalText(value, field, 100);
+  if (name && !/^[^\s/\\]+$/.test(name)) {
+    throw new AppError('REQUEST_INVALID', `${field} must not contain whitespace or path separators.`);
+  }
+  return name;
 }
 
 function createBatchId(): string {
@@ -39,6 +67,7 @@ function baseCommitFrom(value: unknown): string | null {
 
 export class BatchService {
   private readonly batchLocks = new Map<string, Promise<void>>();
+  private readonly catalog: CatalogSnapshotCache;
 
   constructor(
     readonly database: BatchDatabase,
@@ -46,26 +75,36 @@ export class BatchService {
     readonly repository: GitRepository,
     readonly iconBatch: IconBatchCli,
     private readonly maxUploadBytes: number,
-  ) {}
+  ) {
+    this.catalog = new CatalogSnapshotCache(repository, iconBatch);
+  }
 
   get uploadLimit(): number {
     return this.maxUploadBytes;
   }
 
   createBatch(input: CreateBatchInput): BatchDetails {
+    const submitted: Record<string, unknown> = isObject(input) ? input : {};
+    const submitter = isObject(submitted.submitter) ? submitted.submitter : {};
     const normalized: CreateBatchInput = {
-      title: requiredText(input.title, 'title'),
-      description: requiredText(input.description, 'description'),
-      designUrl: requiredText(input.designUrl, 'designUrl'),
+      title: requiredText(submitted.title, 'title', 200),
+      description: requiredText(submitted.description, 'description', 5_000),
+      designUrl: requiredText(submitted.designUrl, 'designUrl', 2_000),
       submitter: {
-        name: requiredText(input.submitter?.name, 'submitter.name'),
-        email: requiredText(input.submitter?.email, 'submitter.email'),
+        name: requiredText(submitter.name, 'submitter.name', 100),
+        email: requiredText(submitter.email, 'submitter.email', 320),
       },
     };
+    if (!/^\S+@\S+\.\S+$/.test(normalized.submitter.email)) {
+      throw new AppError('REQUEST_INVALID', 'submitter.email must be a valid email address.');
+    }
     try {
-      new URL(normalized.designUrl);
+      const designUrl = new URL(normalized.designUrl);
+      if (!['http:', 'https:'].includes(designUrl.protocol)) {
+        throw new Error('unsupported scheme');
+      }
     } catch {
-      throw new AppError('REQUEST_INVALID', 'designUrl must be an absolute URL.');
+      throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
     }
     const batch = this.database.createBatch(createBatchId(), normalized);
     return this.database.getDetails(batch.id);
@@ -75,10 +114,13 @@ export class BatchService {
     this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
     return this.withBatchLock(batchId, async () => {
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
-      this.validateItemInput(input, svg);
+      if (this.database.countItems(batchId) >= maximumBatchItems) {
+        throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
+      }
+      const normalized = await this.normalizeItemInput(input, svg);
       const itemId = createItemId();
       const sourceFile = svg ? await this.saveSvg(batchId, itemId, svg) : null;
-      return this.database.insertItem(batchId, itemId, input, sourceFile);
+      return this.database.insertItem(batchId, itemId, normalized, sourceFile);
     });
   }
 
@@ -87,13 +129,13 @@ export class BatchService {
     return this.withBatchLock(batchId, async () => {
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
       const existing = this.database.getItem(batchId, itemId);
-      this.validateItemInput(input, svg, existing.sourceFile);
-      const sourceFile = input.action === 'delete'
+      const normalized = await this.normalizeItemInput(input, svg, existing.sourceFile);
+      const sourceFile = normalized.action === 'delete'
         ? null
         : svg
           ? await this.saveSvg(batchId, itemId, svg)
           : existing.sourceFile;
-      return this.database.updateItem(batchId, itemId, input, sourceFile);
+      return this.database.updateItem(batchId, itemId, normalized, sourceFile);
     });
   }
 
@@ -131,27 +173,12 @@ export class BatchService {
     });
   }
 
+  getCatalogPage(input: CatalogPageInput): Promise<CatalogPage> {
+    return this.catalog.page(input);
+  }
+
   async getCatalogIconSvg(name: string): Promise<Buffer> {
-    const iconName = requiredText(name, 'icon name');
-    return this.repository.withLatestWorktree(async (worktreePath) => {
-      const catalog = (await this.iconBatch.catalog(worktreePath)).payload;
-      const icons = Array.isArray(catalog.icons) ? catalog.icons : [];
-      const icon = icons.find((entry) => isObject(entry)
-        && (entry.primaryName === iconName || (Array.isArray(entry.aliases) && entry.aliases.includes(iconName))));
-      if (!isObject(icon)) {
-        throw new AppError('CATALOG_ICON_NOT_FOUND', `Unknown catalog icon: ${iconName}`, 404);
-      }
-      if (typeof icon.sourceFile !== 'string' || !icon.sourceFile.startsWith('src/icons/') || !icon.sourceFile.endsWith('.svg')) {
-        throw new AppError('CATALOG_ICON_INVALID', `Catalog source path is invalid for ${iconName}.`, 502);
-      }
-      const root = resolve(worktreePath);
-      const sourcePath = resolve(root, icon.sourceFile);
-      const pathFromRoot = relative(root, sourcePath);
-      if (pathFromRoot.startsWith('..') || isAbsolute(pathFromRoot)) {
-        throw new AppError('CATALOG_ICON_INVALID', `Catalog source path escapes the worktree for ${iconName}.`, 502);
-      }
-      return readFile(sourcePath);
-    });
+    return this.catalog.svg(requiredIconName(name, 'icon name'));
   }
 
   submit(batchId: string): BatchDetails {
@@ -163,6 +190,7 @@ export class BatchService {
       throw new AppError('BATCH_NOT_SUBMITTABLE', `Batch ${batchId} is ${batch.state}.`, 409);
     }
     this.database.queueJob(batchId);
+    this.catalog.invalidate();
     return this.database.getDetails(batchId);
   }
 
@@ -186,6 +214,9 @@ export class BatchService {
     const details = this.database.getDetails(batchId);
     if (details.items.length === 0) {
       throw new AppError('BATCH_EMPTY', 'A batch needs at least one item before validation.', 409);
+    }
+    if (details.items.length > maximumBatchItems) {
+      throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
     }
     return this.storage.writeRequest(details, details.items);
   }
@@ -226,29 +257,37 @@ export class BatchService {
     }
   }
 
-  private validateItemInput(input: CreateItemInput, svg: Buffer | undefined, existingSourceFile?: string | null): void {
-    if (!['add', 'replace', 'delete'].includes(input.action)) {
+  private async normalizeItemInput(input: CreateItemInput, svg: Buffer | undefined, existingSourceFile?: string | null): Promise<CreateItemInput> {
+    if (!isObject(input)) {
+      throw new AppError('ITEM_INVALID', 'item must be an object.');
+    }
+    const submitted: Record<string, unknown> = input;
+    const action = submitted.action;
+    if (action !== 'add' && action !== 'replace' && action !== 'delete') {
       throw new AppError('ITEM_INVALID', 'action must be add, replace, or delete.');
     }
-    if (input.action === 'add') {
-      requiredText(input.designName, 'designName');
-      requiredText(input.description, 'description');
+    if (action === 'add') {
+      const designName = requiredIconName(submitted.designName, 'designName');
+      const description = requiredText(submitted.description, 'description', 1_000);
       if (!svg && !existingSourceFile) {
         throw new AppError('UPLOAD_REQUIRED', 'add requires an SVG upload.');
       }
-      return;
+      return { action: 'add', designName, description };
     }
-    if (input.action === 'replace') {
-      requiredText(input.targetName, 'targetName');
+    if (action === 'replace') {
+      const targetName = await this.catalog.canonicalName(requiredIconName(submitted.targetName, 'targetName'));
       if (!svg && !existingSourceFile) {
         throw new AppError('UPLOAD_REQUIRED', 'replace requires an SVG upload.');
       }
-      return;
+      const description = optionalText(submitted.description, 'description', 1_000);
+      return { action: 'replace', targetName, ...(description ? { description } : {}) };
     }
-    requiredText(input.targetName, 'targetName');
-    requiredText(input.reason, 'reason');
+    const targetName = await this.catalog.canonicalName(requiredIconName(submitted.targetName, 'targetName'));
+    const reason = requiredText(submitted.reason, 'reason', 1_000);
+    const replacementName = optionalIconName(submitted.replacementName, 'replacementName');
     if (svg) {
       throw new AppError('UPLOAD_NOT_ALLOWED', 'delete must not include an SVG upload.');
     }
+    return { action: 'delete', targetName, reason, ...(replacementName ? { replacementName } : {}) };
   }
 }

@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PinK 图标工作台 · 交互原型</title>
+  <style>
+    :root {
+      --ink: #1e293b;
+      --muted: #62748a;
+      --line: #d9e2ec;
+      --surface: #ffffff;
+      --canvas: #f3f7fb;
+      --brand: #0e7490;
+      --brand-strong: #075f73;
+      --brand-soft: #e4f7fa;
+      --danger: #b42318;
+      --danger-soft: #fff0ee;
+      --warning: #9a6700;
+      --shadow: 0 18px 50px rgba(32, 54, 80, .09);
+      font-family: Inter, "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+      color: var(--ink);
+    }
+
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--canvas); }
+    button, input, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .5; }
+
+    .app-shell { min-height: 100vh; }
+    .topbar {
+      height: 70px; padding: 0 max(24px, calc((100vw - 1320px) / 2)); background: rgba(255, 255, 255, .92);
+      border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between;
+      position: sticky; top: 0; z-index: 5; backdrop-filter: blur(10px);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; letter-spacing: -.03em; }
+    .brand-mark { width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; background: var(--brand); color: white; font-weight: 900; box-shadow: 0 5px 12px rgba(14, 116, 144, .25); }
+    .prototype-tag { margin-left: 8px; color: var(--warning); background: #fff8e6; border: 1px solid #f1d27a; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 600; }
+    .profile-button { display: flex; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px 5px 5px; background: white; color: var(--ink); }
+    .avatar { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: #d7f0f4; color: var(--brand-strong); font-size: 12px; font-weight: 800; }
+    .profile-text { text-align: left; line-height: 1.15; }
+    .profile-text strong, .profile-text span { display: block; }
+    .profile-text span { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+    .page { max-width: 1320px; margin: 0 auto; padding: 34px 24px 48px; }
+    .hero { display: flex; justify-content: space-between; align-items: end; gap: 24px; margin-bottom: 25px; }
+    .hero h1 { font-size: clamp(28px, 4vw, 38px); letter-spacing: -.06em; margin: 0 0 8px; }
+    .hero p { color: var(--muted); margin: 0; line-height: 1.65; max-width: 700px; }
+    .required-legend { background: white; border: 1px solid var(--line); border-radius: 10px; padding: 10px 13px; white-space: nowrap; font-size: 13px; color: var(--muted); }
+    .required { color: var(--danger); font-weight: 800; margin-left: 2px; }
+
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); background: white; border: 1px solid var(--line); border-radius: 14px; margin-bottom: 24px; overflow: hidden; }
+    .step { display: flex; align-items: center; gap: 10px; padding: 15px 18px; color: var(--muted); border-right: 1px solid var(--line); }
+    .step:last-child { border-right: 0; }
+    .step-number { border: 1px solid currentColor; border-radius: 50%; width: 24px; height: 24px; display: grid; place-items: center; font-size: 12px; font-weight: 800; }
+    .step.done { color: var(--brand-strong); background: #f5fdfe; }
+    .step.active { color: var(--ink); font-weight: 800; box-shadow: inset 0 -3px var(--brand); }
+
+    .workspace { max-width: 1000px; margin: 0 auto; }
+    .card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 4px 18px rgba(35, 58, 80, .04); }
+    .composer { padding: 22px; }
+    .eyebrow { font-size: 12px; color: var(--brand-strong); font-weight: 800; letter-spacing: .03em; margin: 0 0 5px; }
+    h2 { margin: 0; font-size: 19px; letter-spacing: -.025em; }
+    .section-copy { margin: 7px 0 20px; color: var(--muted); font-size: 13px; line-height: 1.55; }
+
+    .operation-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 18px 0 22px; }
+    .operation-tab { border: 1px solid var(--line); background: white; padding: 10px 7px; border-radius: 9px; color: var(--muted); font-weight: 700; }
+    .operation-tab.active { color: var(--brand-strong); background: var(--brand-soft); border-color: #8edce6; }
+    .field { margin-top: 15px; }
+    label { display: block; font-size: 13px; font-weight: 750; margin-bottom: 7px; }
+    input, textarea { width: 100%; border: 1px solid #bdcbd9; border-radius: 9px; padding: 10px 11px; outline: none; color: var(--ink); background: white; }
+    input:focus, textarea:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(14, 116, 144, .13); }
+    textarea { resize: vertical; min-height: 76px; }
+    .field-note { display: flex; gap: 6px; font-size: 12px; color: var(--muted); margin: 7px 0 0; line-height: 1.45; }
+    .field-error { color: var(--danger); font-size: 12px; margin: 6px 0 0; display: none; }
+    .field.invalid input, .field.invalid textarea { border-color: var(--danger); background: #fffafa; }
+    .field.invalid .field-error { display: block; }
+
+    .target-zone, .upload-zone { margin-top: 14px; border: 1.5px dashed #9fb1c3; border-radius: 12px; min-height: 108px; display: grid; place-items: center; text-align: center; padding: 16px; transition: .15s ease; background: #fbfdff; }
+    .target-zone { color: var(--muted); }
+    .target-zone.drag-over, .upload-zone.drag-over { border-color: var(--brand); background: var(--brand-soft); transform: translateY(-1px); }
+    .target-zone strong, .upload-zone strong { color: var(--ink); display: block; margin-bottom: 5px; }
+    .drop-hint { font-size: 12px; line-height: 1.5; }
+    .target-preview { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; }
+    .target-preview .glyph-box { width: 56px; height: 56px; flex: 0 0 auto; background: #fff; border: 1px solid #dce6ee; }
+    .target-preview strong { margin-bottom: 2px; }
+    .target-preview small { display: block; color: var(--muted); }
+    .clear-selection { margin-left: auto; background: transparent; color: var(--danger); border: none; text-decoration: underline; font-size: 12px; }
+    .upload-zone input { display: none; }
+    .upload-button { color: var(--brand-strong); border: none; background: none; text-decoration: underline; font-weight: 750; padding: 0; }
+    .upload-state { display: none; align-items: center; gap: 10px; width: 100%; text-align: left; }
+    .file-chip { display: inline-flex; align-items: center; gap: 5px; color: var(--brand-strong); background: white; border: 1px solid #90dce5; border-radius: 7px; padding: 5px 8px; font-size: 12px; font-weight: 700; }
+    .upload-state .mini-preview { width: 54px; height: 54px; color: var(--brand-strong); background: white; border: 1px solid #c5dce5; border-radius: 8px; object-fit: contain; padding: 7px; }
+    .pending-svg { margin-top: 13px; }
+    .pending-svg-header { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+    .pending-svg-header strong { font-size: 13px; }
+    .pending-svg-header span { font-size: 12px; color: var(--muted); }
+    .pending-svg-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 8px; margin-top: 9px; }
+    .pending-svg-card { position: relative; min-height: 112px; padding: 8px; border: 1px solid #d8e4ec; border-radius: 9px; background: white; color: var(--ink); text-align: left; }
+    .pending-svg-card:hover, .pending-svg-card.active { border-color: var(--brand); background: #f5feff; box-shadow: 0 4px 10px rgba(14, 116, 144, .1); }
+    .pending-svg-card img { display: block; width: 45px; height: 45px; object-fit: contain; padding: 5px; border-radius: 7px; background: #f0f8fb; border: 1px solid #dce8ef; margin-bottom: 7px; }
+    .pending-svg-card strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+    .pending-svg-card span { display: block; margin-top: 3px; font-size: 11px; color: var(--muted); }
+    .pending-svg-remove { position: absolute; top: 4px; right: 5px; padding: 0; border: 0; color: var(--muted); background: transparent; font-size: 16px; line-height: 1; }
+    .icon-hidden { display: none !important; }
+    .composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 22px; }
+    .save-note { font-size: 12px; color: var(--muted); max-width: 205px; line-height: 1.45; }
+    .button { border: none; background: #eaf0f5; color: var(--ink); font-weight: 800; border-radius: 9px; padding: 11px 14px; }
+    .button.primary { color: white; background: var(--brand); box-shadow: 0 4px 9px rgba(14, 116, 144, .2); }
+    .button.primary:hover { background: var(--brand-strong); }
+    .button.ghost { background: white; border: 1px solid var(--line); }
+
+    .library { overflow: hidden; margin: 0 0 22px; }
+    .library-top { padding: 22px 22px 15px; border-bottom: 1px solid var(--line); }
+    .library-top-row { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+    .library-top .section-copy { margin-bottom: 14px; }
+    .search-wrap { position: relative; }
+    .search-wrap::before { content: '⌕'; position: absolute; left: 12px; top: 7px; color: var(--muted); font-size: 21px; }
+    .search-wrap input { padding-left: 34px; }
+    .filter-row { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+    .filter { border: 1px solid var(--line); border-radius: 999px; background: white; padding: 6px 11px; font-size: 12px; color: var(--muted); font-weight: 700; }
+    .filter.active { color: var(--brand-strong); background: var(--brand-soft); border-color: #9adddf; }
+    .library-meta { color: var(--muted); font-size: 12px; white-space: nowrap; padding-top: 4px; }
+    .icon-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 16px 22px 14px; min-height: 355px; }
+    .icon-card { border: 1px solid #dbe4ec; background: white; text-align: left; border-radius: 10px; min-height: 130px; padding: 12px; transition: .15s ease; display: flex; flex-direction: column; }
+    .icon-card:hover, .icon-card:focus-visible { outline: none; border-color: #70cdd8; box-shadow: 0 7px 16px rgba(8, 102, 118, .11); transform: translateY(-2px); }
+    .icon-card.selected { border: 2px solid var(--brand); background: #f5feff; padding: 11px; }
+    .glyph-box { display: grid; place-items: center; color: #205e7a; height: 63px; border-radius: 8px; background: linear-gradient(135deg, #f1f8fb, #e7f1f7); }
+    .glyph-box svg { width: 37px; height: 37px; }
+    .icon-name { font-size: 12px; font-weight: 800; margin: 9px 0 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .alias { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .empty-grid { grid-column: 1 / -1; color: var(--muted); text-align: center; padding: 80px 0; }
+    .library-footer { padding: 12px 22px 16px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; color: var(--muted); font-size: 12px; }
+    .pager { display: flex; gap: 6px; }
+    .pager button { border: 1px solid var(--line); background: white; color: var(--ink); padding: 5px 8px; border-radius: 6px; }
+    .pager button.active { background: var(--brand); border-color: var(--brand); color: white; }
+
+    .batch-strip { margin-top: 22px; padding: 18px 20px; }
+    .batch-summary { flex: 1; }
+    .batch-summary h2 { margin-bottom: 4px; }
+    .batch-summary p { margin: 0; color: var(--muted); font-size: 13px; }
+    .batch-change-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; margin-top: 14px; }
+    .batch-change { position: relative; display: grid; grid-template-columns: 48px 21px 48px 1fr; align-items: center; gap: 8px; border: 1px solid #d8e4ec; background: #fbfdff; border-radius: 10px; padding: 10px; }
+    .batch-change.delete, .batch-change.add { grid-template-columns: 48px 1fr; }
+    .batch-change .glyph-box, .batch-change img { width: 48px; height: 48px; padding: 6px; object-fit: contain; background: white; border: 1px solid #dce8ef; border-radius: 7px; }
+    .batch-change .change-arrow { color: var(--brand-strong); font-weight: 900; text-align: center; }
+    .batch-change strong { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .batch-change span { display: block; font-size: 11px; color: var(--muted); margin-top: 3px; }
+    .batch-change-remove { position: absolute; top: 6px; right: 7px; border: 0; background: transparent; color: var(--muted); font-size: 16px; }
+    .batch-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
+    .batch-empty { color: var(--muted); font-size: 13px; }
+
+    .review-panel { position: fixed; inset: 0; z-index: 10; background: rgba(15, 23, 42, .45); display: none; align-items: stretch; justify-content: flex-end; }
+    .review-panel.open { display: flex; }
+    .review-drawer { width: min(610px, 100%); background: white; padding: 30px; overflow: auto; box-shadow: -20px 0 50px rgba(15,23,42,.2); }
+    .drawer-top { display: flex; justify-content: space-between; align-items: start; gap: 10px; }
+    .drawer-top button { border: 0; background: transparent; font-size: 25px; color: var(--muted); }
+    .review-hint { padding: 12px; margin: 18px 0; background: #fff8e6; border-left: 3px solid #e6b93e; border-radius: 3px; color: #765a00; font-size: 13px; line-height: 1.55; }
+    .review-list { margin: 15px 0 20px; padding: 0; list-style: none; }
+    .review-list li { border: 1px solid var(--line); border-radius: 9px; padding: 11px; margin-bottom: 8px; font-size: 13px; }
+    .review-list .op { color: var(--brand-strong); font-weight: 800; margin-right: 7px; }
+    .confirmation { display: flex; gap: 8px; margin: 19px 0; color: var(--muted); font-size: 13px; align-items: start; }
+    .confirmation input { width: auto; margin-top: 2px; }
+    .submit-row { display: flex; justify-content: flex-end; gap: 8px; }
+
+    .identity-overlay { position: fixed; inset: 0; background: linear-gradient(135deg, rgba(11, 54, 75, .62), rgba(7, 95, 115, .36)); z-index: 20; display: grid; place-items: center; padding: 24px; }
+    .identity-dialog { width: min(470px, 100%); background: white; border-radius: 18px; padding: 29px; box-shadow: var(--shadow); }
+    .identity-dialog .brand-mark { margin-bottom: 18px; }
+    .identity-dialog h1 { font-size: 28px; margin: 0 0 8px; letter-spacing: -.05em; }
+    .identity-dialog > p { color: var(--muted); font-size: 14px; line-height: 1.65; margin: 0 0 20px; }
+    .identity-note { background: #f4f9fb; color: var(--muted); padding: 10px 11px; border-radius: 8px; font-size: 12px; line-height: 1.5; margin: 17px 0; }
+    .identity-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 20px; }
+    .sample-link { background: none; border: none; color: var(--brand-strong); padding: 0; text-decoration: underline; font-size: 12px; }
+
+    .toast { position: fixed; z-index: 30; right: 24px; bottom: 24px; background: #123c49; color: white; border-radius: 10px; padding: 12px 15px; box-shadow: var(--shadow); font-size: 13px; display: none; }
+    .toast.show { display: block; animation: appear .2s ease; }
+    @keyframes appear { from { opacity: 0; transform: translateY(7px); } }
+
+    @media (max-width: 900px) {
+      .workspace { max-width: none; }
+      .hero { display: block; }
+      .required-legend { display: inline-block; margin-top: 15px; }
+      .icon-grid { grid-template-columns: repeat(3, 1fr); }
+    }
+    @media (max-width: 560px) {
+      .topbar { padding: 0 16px; }
+      .profile-text { display: none; }
+      .page { padding: 22px 14px 34px; }
+      .steps { display: block; }
+      .step { border-right: 0; border-bottom: 1px solid var(--line); }
+      .step:last-child { border-bottom: 0; }
+      .icon-grid { grid-template-columns: repeat(2, 1fr); padding: 14px; }
+      .library-top { padding: 18px 14px 12px; }
+      .library-footer { padding: 12px 14px; }
+      .batch-strip { display: block; }
+      .batch-strip .button { width: 100%; margin-top: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">P</span><span>PinK 图标工作台</span><span class="prototype-tag">交互原型</span></div>
+      <button class="profile-button" id="editProfile" type="button" aria-label="修改设计师身份">
+        <span class="avatar" id="avatar">设</span>
+        <span class="profile-text"><strong id="profileName">设计师身份</strong><span id="profileEmail">尚未设置</span></span>
+      </button>
+    </header>
+
+    <main class="page">
+      <section class="hero">
+        <div>
+          <h1>先完成设计，再交给代码</h1>
+          <p>在同一个工作台里选择现有图标、拖入新 SVG，并汇总成一次清晰的设计变更。图标命名、codepoint 与仓库规则由后续校验处理。</p>
+        </div>
+        <div class="required-legend"><span class="required">*</span> 为提交前必须补全的信息</div>
+      </section>
+
+      <nav class="steps" aria-label="提交流程">
+        <div class="step done"><span class="step-number">✓</span><span>设计师身份</span></div>
+        <div class="step active"><span class="step-number">2</span><span>编辑图标变更</span></div>
+        <div class="step"><span class="step-number">3</span><span>确认并校验</span></div>
+      </nav>
+
+      <section class="workspace" id="workspace">
+        <section class="card composer" aria-labelledby="composerTitle">
+          <p class="eyebrow">正在编辑一项变更</p>
+          <h2 id="composerTitle">替换已有图标</h2>
+          <p class="section-copy" id="composerCopy">从下方目录选择要替换的旧图标，再拖入新的 SVG。也可以直接点击图标选择。</p>
+
+          <div class="operation-tabs" role="tablist" aria-label="变更类型">
+            <button class="operation-tab" data-operation="add" role="tab" type="button">新增图标</button>
+            <button class="operation-tab active" data-operation="replace" role="tab" type="button">替换图标</button>
+            <button class="operation-tab" data-operation="delete" role="tab" type="button">删除图标</button>
+          </div>
+
+          <section class="card library" id="iconLibrary" aria-labelledby="libraryTitle">
+            <div class="library-top">
+              <div class="library-top-row"><div><p class="eyebrow">从当前图标仓库选择</p><h2 id="libraryTitle">图标目录</h2></div><span class="library-meta" id="libraryCount">12 个结果</span></div>
+              <p class="section-copy">名称与 alias 都能搜索。点击选择，或把图标拖到下方的目标区域。</p>
+              <div class="search-wrap"><input id="iconSearch" type="search" placeholder="搜索名称或别名，例如 pink、preview、logo" /></div>
+              <div class="filter-row" id="filters">
+                <button class="filter active" data-filter="all" type="button">全部</button>
+                <button class="filter" data-filter="pink" type="button">PinK</button>
+                <button class="filter" data-filter="toolbar" type="button">工具栏</button>
+                <button class="filter" data-filter="common" type="button">通用</button>
+              </div>
+            </div>
+            <div class="icon-grid" id="iconGrid" aria-live="polite"></div>
+            <div class="library-footer"><span>示例目录 · 实现时将由仓库目录 API 分页提供</span><div class="pager" id="pager"></div></div>
+          </section>
+
+          <div id="targetSection">
+            <label id="targetLabel">需要替换的图标<span class="required">*</span></label>
+            <div id="targetZone" class="target-zone" aria-label="替换目标图标投放区">
+              <div class="target-empty"><strong>从上方图标目录拖到这里</strong><span class="drop-hint">或点击任意图标卡片进行选择</span></div>
+              <div class="target-preview icon-hidden" id="targetPreview"></div>
+            </div>
+            <p class="field-error" id="targetError">请选择一个现有图标。</p>
+          </div>
+
+          <div id="addFields" class="icon-hidden">
+            <div class="field" id="newNameField">
+              <label for="newName">图标建议名称<span class="required">*</span></label>
+              <input id="newName" type="text" placeholder="例如：pink-model-preview" />
+              <p class="field-error">请填写建议名称。</p>
+            </div>
+            <div class="field" id="addDescriptionField">
+              <label for="addDescription">用途说明<span class="required">*</span></label>
+              <textarea id="addDescription" placeholder="说明图标表达的对象或操作。"></textarea>
+              <p class="field-error">请填写用途说明。</p>
+            </div>
+          </div>
+
+          <div class="field" id="replaceDescriptionField">
+            <label for="replaceDescription">本次替换说明 <span class="field-note" style="display:inline">（可选）</span></label>
+            <textarea id="replaceDescription" placeholder="例如：与新的模型资产视觉语言保持一致。"></textarea>
+          </div>
+
+          <div id="deleteFields" class="icon-hidden">
+            <div class="field" id="deleteReasonField">
+              <label for="deleteReason">删除原因<span class="required">*</span></label>
+              <textarea id="deleteReason" placeholder="例如：图标已废弃且无替代用途。"></textarea>
+              <p class="field-error">请填写删除原因。</p>
+            </div>
+            <div class="field">
+              <label for="replacementName">建议使用的替代图标 <span class="field-note" style="display:inline">（可选）</span></label>
+              <input id="replacementName" type="text" placeholder="例如：pink-logo" />
+            </div>
+          </div>
+
+          <div id="uploadSection" class="field">
+            <label>新的 SVG 文件<span class="required">*</span></label>
+            <div id="uploadZone" class="upload-zone">
+              <div class="upload-empty"><strong>拖入一个或多个 SVG 到这里</strong><span class="drop-hint">或 <label class="upload-button" for="svgFile">选择文件</label>（可一次选择多个 .svg）</span></div>
+              <div class="upload-state" id="uploadState"><img class="mini-preview" id="uploadedPreview" alt="当前 SVG 预览" /><div><strong id="fileName">新图标.svg</strong><span class="file-chip">✓ 当前待处理 SVG</span></div><button class="clear-selection" id="clearFile" type="button">移除</button></div>
+              <input id="svgFile" type="file" accept="image/svg+xml,.svg" multiple />
+            </div>
+            <div id="pendingSvg" class="pending-svg icon-hidden">
+              <div class="pending-svg-header"><strong>待处理 SVG</strong><span id="pendingSvgCount">0 个</span></div>
+              <div class="pending-svg-list" id="pendingSvgList"></div>
+            </div>
+            <p class="field-note">每个 SVG 会保留独立预览。替换时，先点选一个待处理 SVG，再从目录选择它要替换的旧图标。</p>
+            <p class="field-error" id="fileError">请拖入或选择至少一个 SVG 文件。</p>
+          </div>
+
+          <div class="composer-footer">
+            <span class="save-note">操作先保留在当前浏览器草稿；尚未提交到图标仓库。</span>
+            <button class="button primary" id="addToBatch" type="button">加入本次变更</button>
+          </div>
+        </section>
+      </section>
+
+      <section class="card batch-strip" aria-label="本次变更">
+        <div class="batch-summary"><h2>本次变更 <span id="batchCount">0</span> 项</h2><p id="batchEmpty" class="batch-empty">把一项操作加入队列后，会在这里同时显示所有待改动图标。</p><div class="batch-change-list" id="batchChanges"></div></div>
+        <div class="batch-actions"><button id="reviewButton" class="button primary" type="button" disabled>确认本次变更</button></div>
+      </section>
+    </main>
+  </div>
+
+  <section id="reviewPanel" class="review-panel" aria-label="确认本次变更" aria-hidden="true">
+    <div class="review-drawer" role="dialog" aria-modal="true" aria-labelledby="reviewTitle">
+      <div class="drawer-top"><div><p class="eyebrow">提交前确认</p><h2 id="reviewTitle">让开发准确理解这次设计</h2></div><button id="closeReview" type="button" aria-label="关闭">×</button></div>
+      <p class="review-hint">设计师身份已自动带入本批次。这里不会展示 codepoint 或 mapping；它们由图标仓库规则生成并由开发审核。</p>
+      <div class="field" id="batchTitleField"><label for="batchTitle">本次变更标题<span class="required">*</span></label><input id="batchTitle" placeholder="例如：模型页图标视觉更新" /><p class="field-error">请填写本次变更标题。</p></div>
+      <div class="field" id="batchDescriptionField"><label for="batchDescription">整体需求说明<span class="required">*</span></label><textarea id="batchDescription" placeholder="说明设计变更的背景、目的和影响范围。"></textarea><p class="field-error">请填写整体需求说明。</p></div>
+      <div class="field" id="designUrlField"><label for="designUrl">设计稿链接<span class="required">*</span></label><input id="designUrl" type="url" placeholder="https://figma.com/..." /><p class="field-error">请填写有效的设计稿链接。</p></div>
+      <div class="field"><label>本次变更清单</label><ul class="review-list" id="reviewList"></ul></div>
+      <label class="confirmation"><input id="confirmCheck" type="checkbox" /> <span>我确认以上设计意图和 SVG 文件正确，并同意交由后续自动校验和开发审核。</span></label>
+      <div class="submit-row"><button id="cancelReview" class="button ghost" type="button">继续编辑</button><button id="prototypeSubmit" class="button primary" type="button">进入校验</button></div>
+    </div>
+  </section>
+
+  <section id="identityOverlay" class="identity-overlay" aria-label="设计师身份">
+    <div class="identity-dialog" role="dialog" aria-modal="true" aria-labelledby="identityTitle">
+      <div class="brand-mark">P</div>
+      <h1 id="identityTitle">开始前，认识一下你</h1>
+      <p>这不是登录。填写一次设计师信息，后续提交会自动带入；你可以在右上角随时修改。</p>
+      <div class="field" id="identityNameField"><label for="identityName">姓名<span class="required">*</span></label><input id="identityName" autocomplete="name" placeholder="例如：李思思" /><p class="field-error">请填写姓名。</p></div>
+      <div class="field" id="identityEmailField"><label for="identityEmail">公司邮箱<span class="required">*</span></label><input id="identityEmail" type="email" autocomplete="email" placeholder="name@company.com" /><p class="field-error">请填写有效的公司邮箱。</p></div>
+      <div class="identity-note">仅保存在当前浏览器的本地记忆中，用于预填批次提交人；不建立账号、不做认证，也不会发送给 GitHub。</div>
+      <div class="identity-actions"><button id="useSample" class="sample-link" type="button">填入示例身份（仅原型）</button><button id="saveIdentity" class="button primary" type="button">开始编辑图标</button></div>
+    </div>
+  </section>
+
+  <div id="toast" class="toast" role="status"></div>
+
+  <script>
+    const catalog = [
+      { name: 'pink-logo', alias: 'PinK · logo', group: 'pink', glyph: 'diamond' },
+      { name: 'pink-package', alias: 'package · asset', group: 'pink', glyph: 'box' },
+      { name: 'pink-preview-play', alias: 'preview · play', group: 'pink', glyph: 'play' },
+      { name: 'pink-gi', alias: 'assistant · AI', group: 'pink', glyph: 'spark' },
+      { name: 'toolbar-assets', alias: 'asset · resources', group: 'toolbar', glyph: 'layers' },
+      { name: 'toolbar-animation', alias: 'motion · timeline', group: 'toolbar', glyph: 'wave' },
+      { name: 'toolbar-scene', alias: 'scene · hierarchy', group: 'toolbar', glyph: 'nodes' },
+      { name: 'toolbar-tester', alias: 'test · run', group: 'toolbar', glyph: 'flask' },
+      { name: 'add', alias: 'plus · new', group: 'common', glyph: 'plus' },
+      { name: 'search', alias: 'find · filter', group: 'common', glyph: 'search' },
+      { name: 'edit', alias: 'pencil · rename', group: 'common', glyph: 'pencil' },
+      { name: 'trash', alias: 'delete · remove', group: 'common', glyph: 'trash' },
+      { name: 'preview', alias: 'view · inspect', group: 'common', glyph: 'eye' },
+      { name: 'settings', alias: 'gear · configure', group: 'common', glyph: 'gear' },
+      { name: 'arrow-right', alias: 'next · forward', group: 'common', glyph: 'arrow' },
+      { name: 'person', alias: 'account · user', group: 'common', glyph: 'person' },
+    ];
+
+    const glyphs = {
+      diamond: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><path d="m24 5 16 11-6 22H14L8 16 24 5Z"/><path d="m8 16 16 22 16-22M16 38l8-22 8 22"/></svg>',
+      box: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><path d="m6 16 18-10 18 10-18 10L6 16Z"/><path d="M6 16v18l18 10 18-10V16M24 26v18"/></svg>',
+      play: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><circle cx="24" cy="24" r="18"/><path d="m20 16 13 8-13 8V16Z" fill="currentColor" stroke="none"/></svg>',
+      spark: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><path d="M25 5 29 18l13 4-13 4-4 14-4-14-13-4 13-4 4-13Z"/><path d="m38 31 1 4 4 1-4 1-1 4-1-4-4-1 4-1 1-4Z" fill="currentColor"/></svg>',
+      layers: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><path d="m24 7 17 9-17 9L7 16l17-9Z"/><path d="m7 24 17 9 17-9M7 32l17 9 17-9"/></svg>',
+      wave: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 31c7 0 7-14 14-14s7 14 14 14 7-14 10-14"/><path d="M5 39h38"/></svg>',
+      nodes: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><rect x="5" y="6" width="12" height="12" rx="2"/><rect x="31" y="6" width="12" height="12" rx="2"/><rect x="18" y="30" width="12" height="12" rx="2"/><path d="M17 12h14M24 18v12"/></svg>',
+      flask: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><path d="M19 5h10M22 5v14L10 38a4 4 0 0 0 4 5h20a4 4 0 0 0 4-5L26 19V5"/><path d="M15 33h18"/></svg>',
+      plus: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="4"><path d="M24 8v32M8 24h32"/></svg>',
+      search: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><circle cx="21" cy="21" r="12"/><path d="m30 30 12 12"/></svg>',
+      pencil: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><path d="m10 34-2 8 8-2 25-25-6-6L10 34ZM31 13l6 6"/></svg>',
+      trash: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><path d="M8 13h32M19 13V8h10v5M12 13l2 29h20l2-29M20 21v13M28 21v13"/></svg>',
+      eye: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><path d="M4 24s7-12 20-12 20 12 20 12-7 12-20 12S4 24 4 24Z"/><circle cx="24" cy="24" r="5"/></svg>',
+      gear: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><circle cx="24" cy="24" r="6"/><path d="m24 5 3 4 5-1 2 5 5 2-1 5 4 4-4 4 1 5-5 2-2 5-5-1-3 4-3-4-5 1-2-5-5-2 1-5-4-4 4-4-1-5 5-2 2-5 5 1 3-4Z"/></svg>',
+      arrow: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><path d="M6 24h32M27 12l12 12-12 12"/></svg>',
+      person: '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3"><circle cx="24" cy="16" r="8"/><path d="M8 43c1-10 7-15 16-15s15 5 16 15"/></svg>'
+    };
+
+    const state = { operation: 'replace', selected: null, pendingSvgs: [], activeSvgId: null, filter: 'all', search: '', page: 1, batch: [] };
+    const pageSize = 8;
+    const storeKey = 'pink-icon-prototype-profile-v1';
+    const $ = (selector) => document.querySelector(selector);
+    const $$ = (selector) => [...document.querySelectorAll(selector)];
+
+    function escapeHtml(value) { return value.replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]); }
+    function glyph(icon) { return glyphs[icon.glyph] || glyphs.spark; }
+    function toast(message) { const element = $('#toast'); element.textContent = message; element.classList.add('show'); setTimeout(() => element.classList.remove('show'), 2600); }
+
+    function loadProfile() {
+      try { return JSON.parse(localStorage.getItem(storeKey)); } catch { return null; }
+    }
+    function updateProfile(profile) {
+      $('#profileName').textContent = profile.name;
+      $('#profileEmail').textContent = profile.email;
+      $('#avatar').textContent = profile.name.slice(0, 1);
+    }
+    function openIdentity(profile = loadProfile()) {
+      $('#identityName').value = profile?.name || '';
+      $('#identityEmail').value = profile?.email || '';
+      $('#identityOverlay').style.display = 'grid';
+      setTimeout(() => $('#identityName').focus(), 0);
+    }
+    function closeIdentity() { $('#identityOverlay').style.display = 'none'; }
+    function markInvalid(fieldId, invalid) { $('#' + fieldId).classList.toggle('invalid', invalid); }
+    function saveIdentity() {
+      const name = $('#identityName').value.trim();
+      const email = $('#identityEmail').value.trim();
+      const validEmail = /^\S+@\S+\.\S+$/.test(email);
+      markInvalid('identityNameField', !name); markInvalid('identityEmailField', !validEmail);
+      if (!name || !validEmail) return;
+      const profile = { name, email };
+      localStorage.setItem(storeKey, JSON.stringify(profile)); updateProfile(profile); closeIdentity(); toast('设计师身份已保存在当前浏览器。');
+    }
+
+    function matchingIcons() {
+      const search = state.search.trim().toLowerCase();
+      return catalog.filter((icon) => (state.filter === 'all' || icon.group === state.filter) && (!search || `${icon.name} ${icon.alias}`.toLowerCase().includes(search)));
+    }
+    function activeSvg() { return state.pendingSvgs.find((item) => item.id === state.activeSvgId) || null; }
+    function renderLibrary() {
+      const matches = matchingIcons(); const pages = Math.max(1, Math.ceil(matches.length / pageSize));
+      if (state.page > pages) state.page = pages;
+      const visible = matches.slice((state.page - 1) * pageSize, state.page * pageSize);
+      $('#libraryCount').textContent = `${matches.length} 个结果`;
+      const grid = $('#iconGrid');
+      grid.innerHTML = visible.length ? visible.map((icon) => `<button type="button" draggable="true" class="icon-card ${state.selected?.name === icon.name ? 'selected' : ''}" data-icon="${icon.name}" aria-label="选择 ${icon.name}"><span class="glyph-box">${glyph(icon)}</span><span class="icon-name">${icon.name}</span><span class="alias">${icon.alias}</span></button>`).join('') : '<p class="empty-grid">没有匹配的图标。尝试修改搜索词或筛选条件。</p>';
+      $$('.icon-card').forEach((card) => {
+        const icon = catalog.find((candidate) => candidate.name === card.dataset.icon);
+        card.addEventListener('click', () => selectIcon(icon));
+        card.addEventListener('dragstart', (event) => { event.dataTransfer.setData('text/plain', icon.name); event.dataTransfer.effectAllowed = 'copy'; });
+      });
+      $('#pager').innerHTML = Array.from({ length: pages }, (_, index) => `<button type="button" class="${state.page === index + 1 ? 'active' : ''}" data-page="${index + 1}">${index + 1}</button>`).join('');
+      $$('#pager button').forEach((button) => button.addEventListener('click', () => { state.page = Number(button.dataset.page); renderLibrary(); }));
+    }
+    function selectIcon(icon) {
+      if (state.operation === 'add') { toast('新增图标不需要选择现有目标。'); return; }
+      state.selected = icon; renderTarget(); renderLibrary();
+    }
+    function renderTarget() {
+      const empty = $('#targetZone .target-empty'); const preview = $('#targetPreview');
+      if (!state.selected) { empty.classList.remove('icon-hidden'); preview.classList.add('icon-hidden'); return; }
+      const label = state.operation === 'delete' ? '待删除图标' : '待替换图标';
+      empty.classList.add('icon-hidden'); preview.classList.remove('icon-hidden');
+      preview.innerHTML = `<span class="glyph-box">${glyph(state.selected)}</span><span><strong>${escapeHtml(state.selected.name)}</strong><small>${label} · ${escapeHtml(state.selected.alias)}</small></span><button class="clear-selection" type="button" id="clearTarget">重新选择</button>`;
+      $('#clearTarget').addEventListener('click', () => { state.selected = null; renderTarget(); renderLibrary(); });
+      $('#targetError').style.display = 'none';
+    }
+    function renderOperation() {
+      const config = {
+        add: { title: '新增一个图标', copy: '拖入一个或多个 SVG。每个 SVG 会显示预览，并可依次加入新增队列。', target: false, add: true, replace: false, remove: false, upload: true, library: false, button: '加入新增队列' },
+        replace: { title: '替换已有图标', copy: '从下方目录选择要替换的旧图标，再从待处理 SVG 中选择对应的新图标。可重复完成多项替换。', target: true, add: false, replace: true, remove: false, upload: true, library: true, button: '加入替换队列' },
+        delete: { title: '删除已有图标', copy: '从下方目录选择要删除的图标，并说明为什么可以安全移除。删除不需要 SVG。', target: true, add: false, replace: false, remove: true, upload: false, library: true, button: '加入删除队列' },
+      }[state.operation];
+      $('#composerTitle').textContent = config.title; $('#composerCopy').textContent = config.copy;
+      $('#targetSection').classList.toggle('icon-hidden', !config.target); $('#addFields').classList.toggle('icon-hidden', !config.add); $('#replaceDescriptionField').classList.toggle('icon-hidden', !config.replace); $('#deleteFields').classList.toggle('icon-hidden', !config.remove); $('#uploadSection').classList.toggle('icon-hidden', !config.upload);
+      $('#iconLibrary').classList.toggle('icon-hidden', !config.library);
+      $('#targetLabel').innerHTML = `${state.operation === 'delete' ? '需要删除的图标' : '需要替换的图标'}<span class="required">*</span>`;
+      $('#addToBatch').textContent = config.button;
+      $$('.operation-tab').forEach((tab) => tab.classList.toggle('active', tab.dataset.operation === state.operation));
+      renderTarget(); renderPendingSvgs(); renderLibrary();
+    }
+    function enqueueSvgs(files) {
+      const svgFiles = [...files].filter((file) => file.name.toLowerCase().endsWith('.svg'));
+      const skipped = [...files].length - svgFiles.length;
+      if (skipped) toast(`已跳过 ${skipped} 个非 SVG 文件。`);
+      if (!svgFiles.length) return;
+      const additions = svgFiles.map((file) => ({ id: `svg-${Date.now()}-${Math.random().toString(16).slice(2)}`, file, url: URL.createObjectURL(file) }));
+      state.pendingSvgs.push(...additions);
+      state.activeSvgId = additions[0].id;
+      $('#svgFile').value = '';
+      $('#fileError').style.display = 'none';
+      renderPendingSvgs();
+      toast(`已添加 ${additions.length} 个 SVG。请逐个完成${state.operation === 'replace' ? '替换配对' : '变更信息'}。`);
+    }
+    function removePendingSvg(id, keepUrl = false) {
+      const item = state.pendingSvgs.find((candidate) => candidate.id === id);
+      if (item && !keepUrl) URL.revokeObjectURL(item.url);
+      state.pendingSvgs = state.pendingSvgs.filter((candidate) => candidate.id !== id);
+      if (state.activeSvgId === id) state.activeSvgId = state.pendingSvgs[0]?.id ?? null;
+      renderPendingSvgs();
+    }
+    function renderPendingSvgs() {
+      const active = activeSvg(); const hasItems = state.pendingSvgs.length > 0;
+      $('#pendingSvg').classList.toggle('icon-hidden', !hasItems);
+      $('#uploadZone .upload-empty').classList.toggle('icon-hidden', hasItems);
+      $('#uploadState').style.display = active ? 'flex' : 'none';
+      if (active) { $('#fileName').textContent = active.file.name; $('#uploadedPreview').src = active.url; }
+      $('#pendingSvgCount').textContent = `${state.pendingSvgs.length} 个`;
+      $('#pendingSvgList').innerHTML = state.pendingSvgs.map((item) => `<button type="button" class="pending-svg-card ${item.id === state.activeSvgId ? 'active' : ''}" data-pending-svg="${item.id}"><img src="${item.url}" alt="${escapeHtml(item.file.name)} 预览" /><strong>${escapeHtml(item.file.name)}</strong><span>${item.id === state.activeSvgId ? '当前待处理' : '点击切换预览'}</span></button>`).join('');
+      $$('.pending-svg-card').forEach((card) => card.addEventListener('click', () => { state.activeSvgId = card.dataset.pendingSvg; renderPendingSvgs(); }));
+    }
+    function clearFile() { if (state.activeSvgId) removePendingSvg(state.activeSvgId); }
+    function clearValidation() { ['targetError', 'fileError'].forEach((id) => { $('#' + id).style.display = 'none'; }); ['newNameField', 'addDescriptionField', 'deleteReasonField'].forEach((id) => $('#' + id).classList.remove('invalid')); }
+    function validChange() {
+      clearValidation(); let valid = true;
+      if (state.operation !== 'add' && !state.selected) { $('#targetError').style.display = 'block'; valid = false; }
+      if (state.operation !== 'delete' && !activeSvg()) { $('#fileError').style.display = 'block'; valid = false; }
+      if (state.operation === 'add') { const name = $('#newName').value.trim(); const description = $('#addDescription').value.trim(); markInvalid('newNameField', !name); markInvalid('addDescriptionField', !description); valid = valid && !!name && !!description; }
+      if (state.operation === 'delete') { const reason = $('#deleteReason').value.trim(); markInvalid('deleteReasonField', !reason); valid = valid && !!reason; }
+      return valid;
+    }
+    function addChange() {
+      if (!validChange()) { toast('请先补齐标有 * 的信息。'); return; }
+      const svg = activeSvg();
+      const name = state.operation === 'add' ? $('#newName').value.trim() : state.selected.name;
+      state.batch.push({ operation: state.operation, name, target: state.selected, svg: svg ? { name: svg.file.name, url: svg.url } : null });
+      if (svg) removePendingSvg(svg.id, true);
+      state.selected = null; $('#newName').value = ''; $('#addDescription').value = ''; $('#replaceDescription').value = ''; $('#deleteReason').value = ''; $('#replacementName').value = ''; renderTarget(); renderLibrary(); renderBatch(); toast('已加入本次变更。其余 SVG 会继续保留在待处理队列。');
+    }
+    function renderBatch() {
+      $('#batchCount').textContent = state.batch.length;
+      $('#reviewButton').disabled = state.batch.length === 0;
+      $('#batchEmpty').classList.toggle('icon-hidden', state.batch.length > 0);
+      $('#batchChanges').innerHTML = state.batch.map((item, index) => {
+        const label = ({ add: '新增', replace: '替换', delete: '删除' })[item.operation];
+        const remove = `<button class="batch-change-remove" type="button" data-batch-index="${index}" aria-label="移除 ${escapeHtml(item.name)}">×</button>`;
+        if (item.operation === 'delete') return `<article class="batch-change delete"><span class="glyph-box">${glyph(item.target)}</span><span><strong>${label} · ${escapeHtml(item.name)}</strong><span>将从图标仓库移除</span></span>${remove}</article>`;
+        if (item.operation === 'add') return `<article class="batch-change add"><img src="${item.svg.url}" alt="${escapeHtml(item.svg.name)} 预览" /><span><strong>${label} · ${escapeHtml(item.name)}</strong><span>${escapeHtml(item.svg.name)}</span></span>${remove}</article>`;
+        return `<article class="batch-change replace"><span class="glyph-box">${glyph(item.target)}</span><span class="change-arrow">→</span><img src="${item.svg.url}" alt="${escapeHtml(item.svg.name)} 预览" /><span><strong>${label} · ${escapeHtml(item.name)}</strong><span>${escapeHtml(item.svg.name)}</span></span>${remove}</article>`;
+      }).join('');
+      $$('.batch-change-remove').forEach((button) => button.addEventListener('click', () => {
+        const index = Number(button.dataset.batchIndex); const [removed] = state.batch.splice(index, 1); if (removed?.svg) URL.revokeObjectURL(removed.svg.url); renderBatch();
+      }));
+    }
+    function openReview() { renderReviewList(); $('#reviewPanel').classList.add('open'); $('#reviewPanel').setAttribute('aria-hidden', 'false'); setTimeout(() => $('#batchTitle').focus(), 0); }
+    function closeReview() { $('#reviewPanel').classList.remove('open'); $('#reviewPanel').setAttribute('aria-hidden', 'true'); }
+    function renderReviewList() { $('#reviewList').innerHTML = state.batch.map((item) => `<li><span class="op">${({ add: '新增', replace: '替换', delete: '删除' })[item.operation]}</span><strong>${escapeHtml(item.name)}</strong>${item.svg ? ` · ${escapeHtml(item.svg.name)}` : ''}</li>`).join(''); }
+    function submitPrototype() {
+      const title = $('#batchTitle').value.trim(); const description = $('#batchDescription').value.trim(); const designUrl = $('#designUrl').value.trim(); const urlValid = /^https?:\/\/.+/.test(designUrl);
+      markInvalid('batchTitleField', !title); markInvalid('batchDescriptionField', !description); markInvalid('designUrlField', !urlValid);
+      if (!title || !description || !urlValid) { toast('请补齐本次提交的必填信息。'); return; }
+      if (!$('#confirmCheck').checked) { toast('请确认本次变更内容。'); return; }
+      closeReview(); toast('原型演示：下一步将调用校验 API，不会创建 PR。');
+    }
+
+    $$('.operation-tab').forEach((tab) => tab.addEventListener('click', () => { state.operation = tab.dataset.operation; clearValidation(); renderOperation(); }));
+    $('#iconSearch').addEventListener('input', (event) => { state.search = event.target.value; state.page = 1; renderLibrary(); });
+    $$('#filters .filter').forEach((filter) => filter.addEventListener('click', () => { state.filter = filter.dataset.filter; state.page = 1; $$('#filters .filter').forEach((button) => button.classList.toggle('active', button === filter)); renderLibrary(); }));
+    $('#targetZone').addEventListener('dragover', (event) => { if (state.operation !== 'add') { event.preventDefault(); $('#targetZone').classList.add('drag-over'); } });
+    $('#targetZone').addEventListener('dragleave', () => $('#targetZone').classList.remove('drag-over'));
+    $('#targetZone').addEventListener('drop', (event) => { event.preventDefault(); $('#targetZone').classList.remove('drag-over'); const icon = catalog.find((candidate) => candidate.name === event.dataTransfer.getData('text/plain')); if (icon) selectIcon(icon); });
+    $('#uploadZone').addEventListener('dragover', (event) => { event.preventDefault(); $('#uploadZone').classList.add('drag-over'); });
+    $('#uploadZone').addEventListener('dragleave', () => $('#uploadZone').classList.remove('drag-over'));
+    $('#uploadZone').addEventListener('drop', (event) => { event.preventDefault(); $('#uploadZone').classList.remove('drag-over'); if (event.dataTransfer.files?.length) enqueueSvgs(event.dataTransfer.files); });
+    $('#svgFile').addEventListener('change', (event) => { if (event.target.files?.length) enqueueSvgs(event.target.files); });
+    $('#clearFile').addEventListener('click', clearFile); $('#addToBatch').addEventListener('click', addChange); $('#reviewButton').addEventListener('click', openReview); $('#closeReview').addEventListener('click', closeReview); $('#cancelReview').addEventListener('click', closeReview); $('#prototypeSubmit').addEventListener('click', submitPrototype);
+    $('#reviewPanel').addEventListener('click', (event) => { if (event.target === $('#reviewPanel')) closeReview(); });
+    $('#saveIdentity').addEventListener('click', saveIdentity); $('#useSample').addEventListener('click', () => { $('#identityName').value = '李思思'; $('#identityEmail').value = 'sisi.li@pink.example'; }); $('#editProfile').addEventListener('click', () => openIdentity());
+    const profile = loadProfile(); if (profile?.name && profile?.email) { updateProfile(profile); closeIdentity(); } else { openIdentity(null); }
+    renderOperation(); renderBatch();
+  </script>
+</body>
+</html>

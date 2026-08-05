@@ -185,6 +185,11 @@ export class BatchDatabase {
     return (this.db.prepare('SELECT * FROM items WHERE batch_id = ? ORDER BY created_at, id').all(batchId) as ItemRow[]).map(toItem);
   }
 
+  countItems(batchId: string): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS count FROM items WHERE batch_id = ?').get(batchId) as { count: number };
+    return row.count;
+  }
+
   getItem(batchId: string, itemId: string): StoredItem {
     const row = this.db.prepare('SELECT * FROM items WHERE id = ? AND batch_id = ?').get(itemId, batchId) as ItemRow | undefined;
     if (!row) {

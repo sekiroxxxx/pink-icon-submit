@@ -3,7 +3,7 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 
 import { BatchService } from './batch-service.js';
 import { AppError, isAppError } from './errors.js';
-import type { CreateBatchInput, CreateItemInput } from './types.js';
+import type { CatalogGroup, CatalogPageInput, CreateBatchInput, CreateItemInput } from './types.js';
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -48,6 +48,48 @@ async function readItemPayload(request: FastifyRequest): Promise<{ item: CreateI
   return { item, ...(typeof svgBase64 === 'string' ? { svg: Buffer.from(svgBase64, 'base64') } : {}) };
 }
 
+function optionalQueryText(value: unknown, field: string, maximumLength: number): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'string') {
+    throw new AppError('REQUEST_INVALID', `${field} must be a string.`);
+  }
+  const normalized = value.trim();
+  if (normalized.length > maximumLength) {
+    throw new AppError('REQUEST_INVALID', `${field} must be at most ${maximumLength} characters.`);
+  }
+  return normalized || undefined;
+}
+
+function positiveQueryInteger(value: unknown, field: string, fallback: number, maximum: number): number {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    throw new AppError('REQUEST_INVALID', `${field} must be a positive integer.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new AppError('REQUEST_INVALID', `${field} must be between 1 and ${maximum}.`);
+  }
+  return parsed;
+}
+
+function catalogPageInput(query: unknown): CatalogPageInput {
+  const parameters = isObject(query) ? query : {};
+  const groupValue = parameters.group ?? 'all';
+  if (typeof groupValue !== 'string' || !['all', 'pink', 'toolbar', 'common'].includes(groupValue)) {
+    throw new AppError('REQUEST_INVALID', 'group must be all, pink, toolbar, or common.');
+  }
+  return {
+    query: optionalQueryText(parameters.query, 'query', 100),
+    group: groupValue as CatalogGroup,
+    page: positiveQueryInteger(parameters.page, 'page', 1, 10_000),
+    pageSize: positiveQueryInteger(parameters.pageSize, 'pageSize', 24, 48),
+  };
+}
+
 export interface AppDependencies {
   batches: BatchService;
 }
@@ -79,6 +121,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.get('/api/health', async () => ({ status: 'ok' }));
 
   app.get('/api/catalog', async () => dependencies.batches.getCatalog());
+
+  app.get('/api/catalog/page', async (request) => dependencies.batches.getCatalogPage(catalogPageInput(request.query)));
 
   app.get('/api/catalog/icons/:name/svg', async (request, reply) => {
     const { name } = request.params as { name: string };

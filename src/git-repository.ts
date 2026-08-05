@@ -14,11 +14,19 @@ export class GitRepository {
   ) {}
 
   async withLatestWorktree<T>(callback: (worktreePath: string) => Promise<T>): Promise<T> {
+    const upstreamCommit = await this.fetchUpstreamHead();
+    return this.withWorktreeAt(upstreamCommit, callback);
+  }
+
+  async fetchUpstreamHead(): Promise<string> {
     await this.git(['-C', this.repositoryPath, 'fetch', this.upstreamRemote]);
+    return this.git(['-C', this.repositoryPath, 'rev-parse', `${this.upstreamRemote}/${this.upstreamBranch}`]).then((output) => output.trim());
+  }
+
+  async withWorktreeAt<T>(commit: string, callback: (worktreePath: string) => Promise<T>): Promise<T> {
     await mkdir(this.temporaryRoot, { recursive: true });
     const worktreePath = join(this.temporaryRoot, `worktree-${randomUUID()}`);
-    const upstreamRef = `${this.upstreamRemote}/${this.upstreamBranch}`;
-    await this.git(['-C', this.repositoryPath, 'worktree', 'add', '--detach', worktreePath, upstreamRef]);
+    await this.git(['-C', this.repositoryPath, 'worktree', 'add', '--detach', worktreePath, commit]);
     try {
       return await callback(worktreePath);
     } finally {

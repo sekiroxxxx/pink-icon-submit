@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { readFile, writeFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { buildApp } from '../src/app.js';
@@ -107,6 +109,118 @@ test('DRAFT items can be updated and deleted', async (t) => {
   assert.deepEqual((batch.json() as { items: unknown[] }).items, []);
 });
 
+test('catalog page returns canonical icons with SVG thumbnails and normalizes aliases', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+
+  const page = await app.inject({ method: 'GET', url: '/api/catalog/page?query=existing&group=common&page=1&pageSize=24' });
+  assert.equal(page.statusCode, 200);
+  const response = page.json() as {
+    baseCommit: string;
+    page: number;
+    pageSize: number;
+    total: number;
+    icons: Array<{ primaryName: string; aliases: string[]; group: string; svg: string }>;
+  };
+  assert.match(response.baseCommit, /^[0-9a-f]{40}$/);
+  assert.equal(response.page, 1);
+  assert.equal(response.pageSize, 24);
+  assert.equal(response.total, 1);
+  assert.deepEqual(response.icons, [{
+    primaryName: 'existing',
+    aliases: ['existing-alias'],
+    group: 'common',
+    svg: environment.validSvg,
+  }]);
+
+  const invalidPage = await app.inject({ method: 'GET', url: '/api/catalog/page?group=unknown' });
+  assert.equal(invalidPage.statusCode, 400);
+  assert.equal((invalidPage.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
+
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Replace icon',
+      description: 'Canonical target name test',
+      designUrl: 'https://design.example.invalid/replace',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  const batchId = (created.json() as { id: string }).id;
+  const item = await app.inject({
+    method: 'POST',
+    url: `/api/batches/${batchId}/items`,
+    payload: {
+      action: 'replace',
+      targetName: 'existing-alias',
+      svgBase64: Buffer.from(environment.validSvg).toString('base64'),
+    },
+  });
+  assert.equal(item.statusCode, 201);
+  assert.equal((item.json() as { targetName: string }).targetName, 'existing');
+});
+
+test('catalog pages reuse a snapshot until upstream/main changes', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+  const previousLogPath = process.env.PINK_ICON_BATCH_CATALOG_LOG;
+  process.env.PINK_ICON_BATCH_CATALOG_LOG = environment.catalogLogPath;
+  t.after(() => {
+    if (previousLogPath === undefined) delete process.env.PINK_ICON_BATCH_CATALOG_LOG;
+    else process.env.PINK_ICON_BATCH_CATALOG_LOG = previousLogPath;
+  });
+
+  const first = await app.inject({ method: 'GET', url: '/api/catalog/page?page=1&pageSize=24' });
+  const second = await app.inject({ method: 'GET', url: '/api/catalog/page?query=existing&page=1&pageSize=24' });
+  assert.equal(first.statusCode, 200);
+  assert.equal(second.statusCode, 200);
+  assert.equal((await readFile(environment.catalogLogPath, 'utf8')).trim().split('\n').length, 1);
+
+  await writeFile(`${environment.upstreamPath}/README.md`, 'updated upstream state\n');
+  execFileSync('git', ['-C', environment.upstreamPath, 'add', 'README.md']);
+  execFileSync('git', ['-C', environment.upstreamPath, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'update upstream']);
+
+  const refreshed = await app.inject({ method: 'GET', url: '/api/catalog/page?page=1&pageSize=24' });
+  assert.equal(refreshed.statusCode, 200);
+  assert.notEqual(refreshed.json().baseCommit, first.json().baseCommit);
+  assert.equal((await readFile(environment.catalogLogPath, 'utf8')).trim().split('\n').length, 2);
+});
+
+test('batch creation rejects invalid designer email and design links', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+
+  const invalidEmail = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Invalid email',
+      description: 'Validation',
+      designUrl: 'https://design.example.invalid/email',
+      submitter: { name: 'Designer', email: 'not-an-email' },
+    },
+  });
+  assert.equal(invalidEmail.statusCode, 400);
+  assert.equal((invalidEmail.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
+
+  const invalidUrl = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Invalid link',
+      description: 'Validation',
+      designUrl: 'ftp://design.example.invalid/link',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  assert.equal(invalidUrl.statusCode, 400);
+  assert.equal((invalidUrl.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
+});
+
 test('oversized multipart SVG returns UPLOAD_TOO_LARGE', async (t) => {
   const environment = await createTestEnvironment(t);
   const app = await buildApp({ batches: environment.batches });
@@ -140,4 +254,37 @@ test('oversized multipart SVG returns UPLOAD_TOO_LARGE', async (t) => {
       message: `SVG upload exceeds ${environment.config.maxUploadBytes} bytes.`,
     },
   });
+});
+
+test('multipart item payload must be an object', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Malformed item',
+      description: 'Reject malformed multipart JSON',
+      designUrl: 'https://design.example.invalid/malformed-item',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  const batchId = (created.json() as { id: string }).id;
+  const boundary = '----pink-icon-submit-malformed';
+  const response = await app.inject({
+    method: 'POST',
+    url: `/api/batches/${batchId}/items`,
+    headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+    payload: Buffer.from([
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="item"',
+      '',
+      '[]',
+      `--${boundary}--`,
+      '',
+    ].join('\r\n')),
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal((response.json() as { error: { code: string } }).error.code, 'ITEM_INVALID');
 });

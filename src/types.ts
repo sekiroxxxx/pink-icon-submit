@@ -80,3 +80,27 @@ export interface IconBatchResult {
   exitCode: number;
   payload: Record<string, unknown>;
 }
+
+export type CatalogGroup = 'all' | 'pink' | 'toolbar' | 'common';
+
+export interface CatalogPageInput {
+  query?: string;
+  group?: CatalogGroup;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface CatalogPageIcon {
+  primaryName: string;
+  aliases: string[];
+  group: Exclude<CatalogGroup, 'all'>;
+  svg: string;
+}
+
+export interface CatalogPage {
+  baseCommit: string;
+  page: number;
+  pageSize: number;
+  total: number;
+  icons: CatalogPageIcon[];
+}
