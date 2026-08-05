@@ -133,26 +133,37 @@ export class BatchDatabase {
   }
 
   insertItem(batchId: string, id: string, input: CreateItemInput, sourceFile: string | null): StoredItem {
-    const timestamp = now();
-    this.db.prepare(`
-      INSERT INTO items (
-        id, batch_id, action, design_name, target_name, description, reason, replacement_name, source_file, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      batchId,
-      input.action,
-      input.designName ?? null,
-      input.targetName ?? null,
-      input.description ?? null,
-      input.reason ?? null,
-      input.replacementName ?? null,
-      sourceFile,
-      timestamp,
-    );
-    this.touchBatch(batchId, 'DRAFT');
-    const row = this.db.prepare('SELECT * FROM items WHERE id = ?').get(id) as ItemRow;
-    return toItem(row);
+    const insert = this.db.transaction(() => {
+      const batch = this.db.prepare('SELECT state FROM batches WHERE id = ?').get(batchId) as Pick<BatchRow, 'state'> | undefined;
+      if (!batch) {
+        throw new AppError('BATCH_NOT_FOUND', `Unknown batch: ${batchId}`, 404);
+      }
+      if (batch.state !== 'DRAFT') {
+        throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} is ${batch.state} and cannot be edited.`, 409);
+      }
+
+      const timestamp = now();
+      this.db.prepare(`
+        INSERT INTO items (
+          id, batch_id, action, design_name, target_name, description, reason, replacement_name, source_file, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        batchId,
+        input.action,
+        input.designName ?? null,
+        input.targetName ?? null,
+        input.description ?? null,
+        input.reason ?? null,
+        input.replacementName ?? null,
+        sourceFile,
+        timestamp,
+      );
+      this.db.prepare('UPDATE batches SET updated_at = ? WHERE id = ?').run(timestamp, batchId);
+      const row = this.db.prepare('SELECT * FROM items WHERE id = ?').get(id) as ItemRow;
+      return toItem(row);
+    });
+    return insert();
   }
 
   getBatch(id: string): StoredBatch {
@@ -174,14 +185,46 @@ export class BatchDatabase {
     return (this.db.prepare('SELECT * FROM items WHERE batch_id = ? ORDER BY created_at, id').all(batchId) as ItemRow[]).map(toItem);
   }
 
-  saveValidation(batchId: string, validation: unknown, baseCommit: string | null, valid: boolean): void {
-    this.getBatch(batchId);
+  beginValidation(batchId: string): void {
+    const begin = this.db.transaction(() => {
+      const batch = this.db.prepare('SELECT state FROM batches WHERE id = ?').get(batchId) as Pick<BatchRow, 'state'> | undefined;
+      if (!batch) {
+        throw new AppError('BATCH_NOT_FOUND', `Unknown batch: ${batchId}`, 404);
+      }
+      if (batch.state !== 'DRAFT') {
+        throw new AppError('BATCH_NOT_VALIDATABLE', `Batch ${batchId} is ${batch.state}.`, 409);
+      }
+      const result = this.db.prepare(`
+        UPDATE batches
+        SET state = 'VALIDATING', validation_json = NULL, base_commit = NULL,
+            error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ? AND state = 'DRAFT'
+      `).run(now(), batchId);
+      if (result.changes !== 1) {
+        throw new AppError('BATCH_NOT_VALIDATABLE', `Batch ${batchId} state changed before validation started.`, 409);
+      }
+    });
+    begin();
+  }
+
+  completeValidation(batchId: string, validation: unknown, baseCommit: string | null, valid: boolean): void {
     const state: BatchState = valid ? 'READY' : 'DRAFT';
-    this.db.prepare(`
+    const result = this.db.prepare(`
       UPDATE batches
       SET state = ?, validation_json = ?, base_commit = ?, error_code = NULL, error_message = NULL, updated_at = ?
-      WHERE id = ?
+      WHERE id = ? AND state = 'VALIDATING'
     `).run(state, JSON.stringify(validation), baseCommit, now(), batchId);
+    if (result.changes !== 1) {
+      throw new AppError('BATCH_VALIDATION_STATE_CONFLICT', `Batch ${batchId} left VALIDATING before validation completed.`, 409);
+    }
+  }
+
+  abortValidation(batchId: string): void {
+    this.db.prepare(`
+      UPDATE batches
+      SET state = 'DRAFT', error_code = NULL, error_message = NULL, updated_at = ?
+      WHERE id = ? AND state = 'VALIDATING'
+    `).run(now(), batchId);
   }
 
   queueJob(batchId: string): StoredJob {
@@ -238,6 +281,41 @@ export class BatchDatabase {
     this.db.prepare(`
       UPDATE batches SET state = 'FAILED', error_code = ?, error_message = ?, updated_at = ? WHERE id = ?
     `).run(code, message, timestamp, batchId);
+  }
+
+  recoverInterruptedJobs(): number {
+    const recover = this.db.transaction(() => {
+      const jobs = this.db.prepare("SELECT batch_id FROM jobs WHERE state = 'RUNNING'").all() as Array<Pick<JobRow, 'batch_id'>>;
+      if (jobs.length === 0) {
+        return 0;
+      }
+      const timestamp = now();
+      for (const job of jobs) {
+        this.db.prepare(`
+          UPDATE jobs
+          SET state = 'FAILED', error_code = 'WORKER_INTERRUPTED',
+              error_message = 'The worker stopped before this task finished.', updated_at = ?
+          WHERE batch_id = ? AND state = 'RUNNING'
+        `).run(timestamp, job.batch_id);
+        this.db.prepare(`
+          UPDATE batches
+          SET state = 'FAILED', error_code = 'WORKER_INTERRUPTED',
+              error_message = 'The worker stopped before this task finished.', updated_at = ?
+          WHERE id = ?
+        `).run(timestamp, job.batch_id);
+      }
+      return jobs.length;
+    });
+    return recover();
+  }
+
+  recoverInterruptedValidations(): number {
+    const result = this.db.prepare(`
+      UPDATE batches
+      SET state = 'DRAFT', error_code = NULL, error_message = NULL, updated_at = ?
+      WHERE state = 'VALIDATING'
+    `).run(now());
+    return result.changes;
   }
 
   getJob(batchId: string): StoredJob | null {

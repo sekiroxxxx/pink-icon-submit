@@ -60,6 +60,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     if (isAppError(error)) {
       return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message, details: error.details } });
     }
+    if (error instanceof app.multipartErrors.RequestFileTooLargeError) {
+      return reply.status(413).send({
+        error: {
+          code: 'UPLOAD_TOO_LARGE',
+          message: `SVG upload exceeds ${dependencies.batches.uploadLimit} bytes.`,
+        },
+      });
+    }
     return reply.status(500).send({
       error: {
         code: 'INTERNAL_ERROR',

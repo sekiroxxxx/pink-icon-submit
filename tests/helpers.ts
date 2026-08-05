@@ -55,6 +55,9 @@ if (command === 'catalog') {
     writeFileSync(output, source);
     mapping[String(item.codepoint)] = [item.plannedName];
   }
+  if (plan.items.some((item) => item.plannedName === 'unsafe-worker-icon')) {
+    writeFileSync(join(repo, 'outside-plan.txt'), 'unexpected change\n');
+  }
   writeFileSync(mappingPath, JSON.stringify(mapping, null, 2) + '\n');
   emit({ schemaVersion: 1, batchId: plan.batchId, baseCommit: plan.baseCommit, applied: true, modifiedFiles: plan.allowedFiles });
 } else {
@@ -82,11 +85,29 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
   await writeFile(join(upstream, 'src/template/metadata.json'), '{}\n');
   await writeFile(join(upstream, 'src/template/retired-codepoints.json'), '{"schemaVersion":1,"retired":[]}\n');
   await writeFile(join(upstream, 'scripts/icon-batch.mjs'), fakeIconBatchScript);
+  await writeFile(join(upstream, 'package.json'), JSON.stringify({
+    name: 'pink-codicons-test-fixture',
+    private: true,
+    version: '1.0.0',
+  }, null, 2));
+  await writeFile(join(upstream, 'package-lock.json'), JSON.stringify({
+    name: 'pink-codicons-test-fixture',
+    version: '1.0.0',
+    lockfileVersion: 3,
+    requires: true,
+    packages: {
+      '': {
+        name: 'pink-codicons-test-fixture',
+        version: '1.0.0',
+      },
+    },
+  }, null, 2));
   execFileSync('git', ['init', '-q', '-b', 'main', upstream]);
   execFileSync('git', ['-C', upstream, 'add', '.']);
   execFileSync('git', ['-C', upstream, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'initial']);
   execFileSync('git', ['clone', '-q', upstream, checkout]);
   execFileSync('git', ['-C', checkout, 'remote', 'rename', 'origin', 'upstream']);
+  execFileSync('git', ['-C', checkout, 'config', 'core.autocrlf', 'false']);
 
   const config: AppConfig = {
     databasePath: join(data, 'service.sqlite'),

@@ -54,3 +54,38 @@ test('batch API stores uploads, validates through icon-batch, and exposes catalo
   assert.equal(catalog.statusCode, 200);
   assert.equal((catalog.json() as { schemaVersion: number }).schemaVersion, 1);
 });
+
+test('oversized multipart SVG returns UPLOAD_TOO_LARGE', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+
+  const boundary = '----pink-icon-submit-oversized';
+  const payload = Buffer.concat([
+    Buffer.from([
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="svg"; filename="too-large.svg"',
+      'Content-Type: image/svg+xml',
+      '',
+    ].join('\r\n') + '\r\n'),
+    Buffer.alloc(environment.config.maxUploadBytes + 1, 0x61),
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/batches/not-needed/items',
+    headers: {
+      'content-type': `multipart/form-data; boundary=${boundary}`,
+    },
+    payload,
+  });
+
+  assert.equal(response.statusCode, 413);
+  assert.deepEqual(response.json(), {
+    error: {
+      code: 'UPLOAD_TOO_LARGE',
+      message: `SVG upload exceeds ${environment.config.maxUploadBytes} bytes.`,
+    },
+  });
+});

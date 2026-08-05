@@ -16,11 +16,28 @@ const batches = new BatchService(
   new IconBatchCli(),
   config.maxUploadBytes,
 );
+database.recoverInterruptedValidations();
+database.recoverInterruptedJobs();
 const worker = new LocalDiffWorker(batches);
 const app = await buildApp({ batches });
 
+let workerRunning = false;
+const pollWorker = async (): Promise<void> => {
+  if (workerRunning) {
+    return;
+  }
+  workerRunning = true;
+  try {
+    await worker.processNext();
+  } catch (error) {
+    app.log.error(error);
+  } finally {
+    workerRunning = false;
+  }
+};
+
 const workerTimer = setInterval(() => {
-  void worker.processNext();
+  void pollWorker();
 }, config.workerPollIntervalMs);
 
 app.addHook('onClose', async () => {

@@ -36,6 +36,8 @@ function baseCommitFrom(value: unknown): string | null {
 }
 
 export class BatchService {
+  private readonly batchLocks = new Map<string, Promise<void>>();
+
   constructor(
     readonly database: BatchDatabase,
     readonly storage: BatchStorage,
@@ -68,24 +70,33 @@ export class BatchService {
   }
 
   async addItem(batchId: string, input: CreateItemInput, svg: Buffer | undefined): Promise<StoredItem> {
-    const batch = this.database.getBatch(batchId);
-    if (batch.state !== 'DRAFT') {
-      throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} is ${batch.state} and cannot be edited.`, 409);
-    }
-    this.validateItemInput(input, svg);
-    const itemId = createItemId();
-    const sourceFile = svg ? await this.saveSvg(batchId, itemId, svg) : null;
-    return this.database.insertItem(batchId, itemId, input, sourceFile);
+    this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+    return this.withBatchLock(batchId, async () => {
+      this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+      this.validateItemInput(input, svg);
+      const itemId = createItemId();
+      const sourceFile = svg ? await this.saveSvg(batchId, itemId, svg) : null;
+      return this.database.insertItem(batchId, itemId, input, sourceFile);
+    });
   }
 
   async validateBatch(batchId: string): Promise<BatchDetails> {
-    const requestPath = await this.writeRequest(batchId);
-    const validation = await this.repository.withLatestWorktree(async (worktreePath) => {
-      const result = await this.iconBatch.validate(worktreePath, requestPath);
-      return result.payload;
+    this.assertDraft(batchId, 'BATCH_NOT_VALIDATABLE', 'validated');
+    return this.withBatchLock(batchId, async () => {
+      this.database.beginValidation(batchId);
+      try {
+        const requestPath = await this.writeRequest(batchId);
+        const validation = await this.repository.withLatestWorktree(async (worktreePath) => {
+          const result = await this.iconBatch.validate(worktreePath, requestPath);
+          return result.payload;
+        });
+        this.database.completeValidation(batchId, validation, baseCommitFrom(validation), validationIsValid(validation));
+        return this.database.getDetails(batchId);
+      } catch (error) {
+        this.database.abortValidation(batchId);
+        throw error;
+      }
     });
-    this.database.saveValidation(batchId, validation, baseCommitFrom(validation), validationIsValid(validation));
-    return this.database.getDetails(batchId);
   }
 
   async getCatalog(): Promise<Record<string, unknown>> {
@@ -139,6 +150,32 @@ export class BatchService {
       throw new AppError('UPLOAD_TOO_LARGE', `SVG upload exceeds ${this.maxUploadBytes} bytes.`, 413);
     }
     return this.storage.saveSvg(batchId, itemId, svg);
+  }
+
+  private assertDraft(batchId: string, code: string, action: string): void {
+    const batch = this.database.getBatch(batchId);
+    if (batch.state !== 'DRAFT') {
+      throw new AppError(code, `Batch ${batchId} is ${batch.state} and cannot be ${action}.`, 409);
+    }
+  }
+
+  private async withBatchLock<T>(batchId: string, callback: () => Promise<T>): Promise<T> {
+    const previous = this.batchLocks.get(batchId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const current = previous.then(() => gate);
+    this.batchLocks.set(batchId, current);
+    await previous;
+    try {
+      return await callback();
+    } finally {
+      release();
+      if (this.batchLocks.get(batchId) === current) {
+        this.batchLocks.delete(batchId);
+      }
+    }
   }
 
   private validateItemInput(input: CreateItemInput, svg: Buffer | undefined): void {

@@ -1,11 +1,15 @@
 import { spawn } from 'node:child_process';
-import { join } from 'node:path';
+import { access } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 
 import { AppError } from './errors.js';
 import type { IconBatchResult } from './types.js';
 
 export class IconBatchCli {
-  constructor(private readonly nodeExecutable = process.execPath) {}
+  constructor(
+    private readonly nodeExecutable = process.execPath,
+    private readonly npmCliPath = process.env.npm_execpath ?? join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  ) {}
 
   catalog(repositoryPath: string): Promise<IconBatchResult> {
     return this.run(['catalog', '--repo', repositoryPath], repositoryPath, [0]);
@@ -24,21 +28,8 @@ export class IconBatchCli {
   }
 
   private async run(args: string[], cwd: string, acceptedExitCodes: number[]): Promise<IconBatchResult> {
-    const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve, reject) => {
-      const processHandle = spawn(this.nodeExecutable, [join(cwd, 'scripts', 'icon-batch.mjs'), ...args], {
-        cwd,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-      });
-      let stdout = '';
-      let stderr = '';
-      processHandle.stdout.setEncoding('utf8');
-      processHandle.stderr.setEncoding('utf8');
-      processHandle.stdout.on('data', (chunk: string) => { stdout += chunk; });
-      processHandle.stderr.on('data', (chunk: string) => { stderr += chunk; });
-      processHandle.once('error', reject);
-      processHandle.once('close', (exitCode) => resolve({ exitCode: exitCode ?? 1, stdout, stderr }));
-    });
+    await this.ensureDependencies(cwd);
+    const result = await this.execute(this.nodeExecutable, [join(cwd, 'scripts', 'icon-batch.mjs'), ...args], cwd);
 
     let payload: Record<string, unknown>;
     try {
@@ -58,5 +49,47 @@ export class IconBatchCli {
       });
     }
     return { exitCode: result.exitCode, payload };
+  }
+
+  private async ensureDependencies(repositoryPath: string): Promise<void> {
+    try {
+      await access(join(repositoryPath, 'node_modules'));
+      return;
+    } catch {
+      // Temporary worktrees start without dependencies. Install exactly what the upstream lockfile declares.
+    }
+
+    let result: { exitCode: number; stdout: string; stderr: string };
+    try {
+      result = await this.execute(this.nodeExecutable, [this.npmCliPath, 'ci', '--include=dev', '--ignore-scripts', '--no-audit', '--no-fund'], repositoryPath);
+    } catch (error) {
+      throw new AppError('ICON_BATCH_DEPENDENCY_INSTALL_FAILED', 'Unable to start npm ci for the temporary worktree.', 502, {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (result.exitCode !== 0) {
+      throw new AppError('ICON_BATCH_DEPENDENCY_INSTALL_FAILED', 'npm ci failed for the temporary worktree.', 502, {
+        exitCode: result.exitCode,
+        stderr: result.stderr,
+      });
+    }
+  }
+
+  private async execute(executable: string, args: string[], cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const processHandle = spawn(executable, args, {
+        cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      let stdout = '';
+      let stderr = '';
+      processHandle.stdout.setEncoding('utf8');
+      processHandle.stderr.setEncoding('utf8');
+      processHandle.stdout.on('data', (chunk: string) => { stdout += chunk; });
+      processHandle.stderr.on('data', (chunk: string) => { stderr += chunk; });
+      processHandle.once('error', reject);
+      processHandle.once('close', (exitCode) => resolve({ exitCode: exitCode ?? 1, stdout, stderr }));
+    });
   }
 }

@@ -2,6 +2,7 @@ export type ItemAction = 'add' | 'replace' | 'delete';
 
 export type BatchState =
   | 'DRAFT'
+  | 'VALIDATING'
   | 'READY'
   | 'QUEUED'
   | 'RUNNING'
