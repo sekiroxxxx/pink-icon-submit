@@ -69,8 +69,17 @@ export interface CatalogPageIcon {
   svg: string;
 }
 
+export interface CatalogBaseline {
+  packageName: string;
+  requestedTag: string;
+  version: string;
+  integrity: string;
+  sourceRepository: string;
+  sourceCommit: string;
+}
+
 export interface CatalogPage {
-  baseCommit: string;
+  catalogBaseline: CatalogBaseline;
   page: number;
   pageSize: number;
   total: number;

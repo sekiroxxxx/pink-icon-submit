@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFile, writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { buildApp } from '../src/app.js';
@@ -146,19 +146,22 @@ test('catalog page returns canonical icons with SVG thumbnails and normalizes al
   const page = await app.inject({ method: 'GET', url: '/api/catalog/page?query=existing&group=common&page=1&pageSize=24' });
   assert.equal(page.statusCode, 200);
   const response = page.json() as {
-    baseCommit: string;
+    catalogBaseline: { packageName: string; requestedTag: string; version: string; sourceCommit: string };
     page: number;
     pageSize: number;
     total: number;
     icons: Array<{ primaryName: string; aliases: string[]; group: string; svg: string }>;
   };
-  assert.match(response.baseCommit, /^[0-9a-f]{40}$/);
+  assert.equal(response.catalogBaseline.packageName, '@pink/codicons');
+  assert.equal(response.catalogBaseline.requestedTag, 'beta');
+  assert.equal(response.catalogBaseline.version, '0.0.46-test.1');
+  assert.equal(response.catalogBaseline.sourceCommit, 'f'.repeat(40));
   assert.equal(response.page, 1);
   assert.equal(response.pageSize, 24);
   assert.equal(response.total, 1);
   assert.deepEqual(response.icons, [{
     primaryName: 'existing',
-    aliases: ['existing-alias'],
+    aliases: ['existing', 'existing-alias'],
     group: 'common',
     svg: environment.validSvg,
   }]);
@@ -266,22 +269,16 @@ test('warning acknowledgement is persisted for exactly one validation result bef
   assert.equal((queued.json() as { state: string }).state, 'QUEUED');
 });
 
-test('catalog pages reuse a snapshot until upstream/main changes', async (t) => {
+test('catalog pages reuse the npm snapshot when the target branch changes', async (t) => {
   const environment = await createTestEnvironment(t);
   const app = await buildApp({ batches: environment.batches });
   t.after(() => app.close());
-  const previousLogPath = process.env.PINK_ICON_BATCH_CATALOG_LOG;
-  process.env.PINK_ICON_BATCH_CATALOG_LOG = environment.catalogLogPath;
-  t.after(() => {
-    if (previousLogPath === undefined) delete process.env.PINK_ICON_BATCH_CATALOG_LOG;
-    else process.env.PINK_ICON_BATCH_CATALOG_LOG = previousLogPath;
-  });
 
   const first = await app.inject({ method: 'GET', url: '/api/catalog/page?page=1&pageSize=24' });
   const second = await app.inject({ method: 'GET', url: '/api/catalog/page?query=existing&page=1&pageSize=24' });
   assert.equal(first.statusCode, 200);
   assert.equal(second.statusCode, 200);
-  assert.equal((await readFile(environment.catalogLogPath, 'utf8')).trim().split('\n').length, 1);
+  assert.deepEqual(environment.registryRequests, { metadata: 1, tarball: 1 });
 
   await writeFile(`${environment.upstreamPath}/README.md`, 'updated upstream state\n');
   execFileSync('git', ['-C', environment.upstreamPath, 'add', 'README.md']);
@@ -289,8 +286,8 @@ test('catalog pages reuse a snapshot until upstream/main changes', async (t) => 
 
   const refreshed = await app.inject({ method: 'GET', url: '/api/catalog/page?page=1&pageSize=24' });
   assert.equal(refreshed.statusCode, 200);
-  assert.notEqual(refreshed.json().baseCommit, first.json().baseCommit);
-  assert.equal((await readFile(environment.catalogLogPath, 'utf8')).trim().split('\n').length, 2);
+  assert.deepEqual(refreshed.json().catalogBaseline, first.json().catalogBaseline);
+  assert.deepEqual(environment.registryRequests, { metadata: 1, tarball: 1 });
 });
 
 test('batch creation rejects invalid designer email and design links', async (t) => {

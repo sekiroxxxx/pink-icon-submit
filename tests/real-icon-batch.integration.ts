@@ -42,6 +42,14 @@ test('real Stage 1 icon-batch installs svgo in a disposable worktree and produce
     new GitRepository(checkout, join(data, 'worktrees'), 'upstream', 'main'),
     new IconBatchCli(),
     1024 * 1024,
+    {
+      packageName: '@pink/codicons',
+      tag: 'beta',
+      registryUrl: 'https://registry.npmjs.org',
+      sourceRepository: 'sud-global/pink-codicons',
+      cacheRoot: join(data, 'catalog-cache'),
+      refreshIntervalMs: 60_000,
+    },
   );
   const batch = batches.createBatch({
     title: 'Real icon-batch integration',

@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 
-import type { AppConfig } from './types.js';
+import type { AppConfig, NpmPackageCatalogOptions } from './types.js';
 
 function positiveInteger(value: string | undefined, fallback: number): number {
   if (!value) {
@@ -26,9 +26,28 @@ export function configFromEnv(environment = process.env): AppConfig {
     storageRoot: resolve(dataRoot, 'batches'),
     temporaryRoot: resolve(dataRoot, 'worktrees'),
     repositoryPath: resolvedRepositoryPath,
-    upstreamRemote: environment.PINK_ICON_UPSTREAM_REMOTE ?? 'upstream',
+    upstreamRemote: environment.PINK_ICON_UPSTREAM_REMOTE ?? 'origin',
     upstreamBranch: environment.PINK_ICON_UPSTREAM_BRANCH ?? 'main',
+    catalogPackageName: environment.PINK_ICON_CATALOG_PACKAGE ?? '@pink/codicons',
+    catalogTag: environment.PINK_ICON_CATALOG_TAG ?? 'beta',
+    catalogRegistryUrl: environment.PINK_ICON_CATALOG_REGISTRY ?? 'http://creator-npm.cocos.org:7001',
+    catalogAuthToken: environment.PINK_ICON_CATALOG_AUTH_TOKEN,
+    catalogSourceRepository: environment.PINK_ICON_CATALOG_SOURCE_REPOSITORY ?? 'sud-global/pink-codicons',
+    catalogCacheRoot: resolve(dataRoot, 'catalog-cache'),
+    catalogRefreshIntervalMs: positiveInteger(environment.PINK_ICON_CATALOG_REFRESH_MS, 60_000),
     workerPollIntervalMs: positiveInteger(environment.PINK_ICON_WORKER_POLL_MS, 1_000),
     maxUploadBytes: positiveInteger(environment.PINK_ICON_MAX_UPLOAD_BYTES, 1024 * 1024),
+  };
+}
+
+export function catalogOptionsFromConfig(config: AppConfig): NpmPackageCatalogOptions {
+  return {
+    packageName: config.catalogPackageName,
+    tag: config.catalogTag,
+    registryUrl: config.catalogRegistryUrl,
+    ...(config.catalogAuthToken ? { authToken: config.catalogAuthToken } : {}),
+    sourceRepository: config.catalogSourceRepository,
+    cacheRoot: config.catalogCacheRoot,
+    refreshIntervalMs: config.catalogRefreshIntervalMs,
   };
 }

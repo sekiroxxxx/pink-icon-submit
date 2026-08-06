@@ -42,7 +42,7 @@ export class LocalDiffWorker {
       const result = await this.batches.repository.withLatestWorktree(async (worktreePath) => {
         const planned = await this.batches.iconBatch.plan(worktreePath, requestPath);
         if (planned.exitCode !== 0) {
-          throw new AppError('REPLAN_VALIDATION_FAILED', 'The batch is no longer valid against latest upstream/main.', 409, planned.payload);
+          throw new AppError('REPLAN_VALIDATION_FAILED', 'The batch is no longer valid against the latest target branch.', 409, planned.payload);
         }
         const plan = planned.payload;
         if (!isObject(plan)) {

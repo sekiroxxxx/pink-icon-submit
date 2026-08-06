@@ -6,7 +6,7 @@ import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
-import type { BatchDetails, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, StoredItem } from './types.js';
+import type { BatchDetails, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem } from './types.js';
 
 const maximumBatchItems = 100;
 
@@ -79,8 +79,9 @@ export class BatchService {
     readonly repository: GitRepository,
     readonly iconBatch: IconBatchCli,
     private readonly maxUploadBytes: number,
+    catalogOptions: NpmPackageCatalogOptions,
   ) {
-    this.catalog = new CatalogSnapshotCache(repository, iconBatch);
+    this.catalog = new CatalogSnapshotCache(repository, iconBatch, catalogOptions);
   }
 
   get uploadLimit(): number {
@@ -171,10 +172,7 @@ export class BatchService {
   }
 
   async getCatalog(): Promise<Record<string, unknown>> {
-    return this.repository.withLatestWorktree(async (worktreePath) => {
-      const result = await this.iconBatch.catalog(worktreePath);
-      return result.payload;
-    });
+    return this.catalog.summary();
   }
 
   getCatalogPage(input: CatalogPageInput): Promise<CatalogPage> {
@@ -201,7 +199,6 @@ export class BatchService {
       throw new AppError('BATCH_WARNINGS_UNACKNOWLEDGED', 'Acknowledge all validation warnings before submission.', 409);
     }
     this.database.queueJob(batchId);
-    this.catalog.invalidate();
     return this.database.getDetails(batchId);
   }
 

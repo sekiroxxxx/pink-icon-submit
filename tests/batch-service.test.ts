@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { BatchService } from '../src/batch-service.js';
+import { catalogOptionsFromConfig } from '../src/config.js';
 import { IconBatchCli } from '../src/icon-batch-cli.js';
 import type { IconBatchResult } from '../src/types.js';
 import { createTestEnvironment } from './helpers.js';
@@ -59,6 +60,7 @@ test('validation makes the batch immutable until it completes and rejects queued
     environment.batches.repository,
     iconBatch,
     environment.config.maxUploadBytes,
+    catalogOptionsFromConfig(environment.config),
   );
   const batchId = createBatch(batches);
   await batches.addItem(batchId, {

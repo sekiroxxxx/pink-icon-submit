@@ -1,10 +1,16 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { TestContext } from 'node:test';
 
+import { create as createTar } from 'tar';
+
 import { BatchService } from '../src/batch-service.js';
+import { catalogOptionsFromConfig } from '../src/config.js';
 import { BatchDatabase } from '../src/database.js';
 import { GitRepository } from '../src/git-repository.js';
 import { IconBatchCli } from '../src/icon-batch-cli.js';
@@ -90,6 +96,59 @@ export interface TestEnvironment {
   validSvg: string;
   upstreamPath: string;
   catalogLogPath: string;
+  registryRequests: { metadata: number; tarball: number };
+}
+
+async function createNpmCatalogFixture(t: TestContext, root: string): Promise<{ registryUrl: string; registryRequests: { metadata: number; tarball: number } }> {
+  const packageRoot = join(root, 'npm-catalog');
+  const packageDirectory = join(packageRoot, 'package');
+  const tarballPath = join(packageRoot, 'pink-codicons.tgz');
+  await mkdir(join(packageDirectory, 'src/icons'), { recursive: true });
+  await mkdir(join(packageDirectory, 'src/template'), { recursive: true });
+  await writeFile(join(packageDirectory, 'src/icons/existing.svg'), validSvg);
+  await writeFile(join(packageDirectory, 'src/template/mapping.json'), JSON.stringify({ 50000: ['existing', 'existing-alias'] }));
+  await createTar({ cwd: packageRoot, file: tarballPath, gzip: true }, ['package']);
+  const tarball = await readFile(tarballPath);
+  const integrity = `sha512-${createHash('sha512').update(tarball).digest('base64')}`;
+  const registryRequests = { metadata: 0, tarball: 0 };
+  const server = createServer((request, response) => {
+    const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`);
+    if (decodeURIComponent(url.pathname) === '/@pink/codicons') {
+      registryRequests.metadata += 1;
+      const address = server.address() as AddressInfo;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        'dist-tags': { beta: '0.0.46-test.1' },
+        versions: {
+          '0.0.46-test.1': {
+            gitHead: 'f'.repeat(40),
+            dist: {
+              integrity,
+              tarball: `http://127.0.0.1:${address.port}/tarballs/pink-codicons.tgz`,
+            },
+          },
+        },
+      }));
+      return;
+    }
+    if (url.pathname === '/tarballs/pink-codicons.tgz') {
+      registryRequests.tarball += 1;
+      response.writeHead(200, { 'content-type': 'application/octet-stream' });
+      response.end(tarball);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address() as AddressInfo;
+  t.after(async () => {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  });
+  return { registryUrl: `http://127.0.0.1:${address.port}`, registryRequests };
 }
 
 export async function createTestEnvironment(t: TestContext): Promise<TestEnvironment> {
@@ -97,6 +156,7 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
   const upstream = join(root, 'upstream');
   const checkout = join(root, 'checkout');
   const data = join(root, 'data');
+  const npmCatalog = await createNpmCatalogFixture(t, root);
   await mkdir(join(upstream, 'src/icons'), { recursive: true });
   await mkdir(join(upstream, 'src/template'), { recursive: true });
   await mkdir(join(upstream, 'scripts'), { recursive: true });
@@ -136,6 +196,12 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     repositoryPath: checkout,
     upstreamRemote: 'upstream',
     upstreamBranch: 'main',
+    catalogPackageName: '@pink/codicons',
+    catalogTag: 'beta',
+    catalogRegistryUrl: npmCatalog.registryUrl,
+    catalogSourceRepository: 'sud-global/pink-codicons',
+    catalogCacheRoot: join(data, 'catalog-cache'),
+    catalogRefreshIntervalMs: 60_000,
     workerPollIntervalMs: 10,
     maxUploadBytes: 1024 * 1024,
   };
@@ -150,6 +216,15 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     new GitRepository(config.repositoryPath, config.temporaryRoot, config.upstreamRemote, config.upstreamBranch),
     new IconBatchCli(),
     config.maxUploadBytes,
+    catalogOptionsFromConfig(config),
   );
-  return { config, database, batches, validSvg, upstreamPath: upstream, catalogLogPath: join(root, 'catalog.log') };
+  return {
+    config,
+    database,
+    batches,
+    validSvg,
+    upstreamPath: upstream,
+    catalogLogPath: join(root, 'catalog.log'),
+    registryRequests: npmCatalog.registryRequests,
+  };
 }

@@ -73,6 +73,13 @@ export interface AppConfig {
   temporaryRoot: string;
   upstreamRemote: string;
   upstreamBranch: string;
+  catalogPackageName: string;
+  catalogTag: string;
+  catalogRegistryUrl: string;
+  catalogAuthToken?: string;
+  catalogSourceRepository: string;
+  catalogCacheRoot: string;
+  catalogRefreshIntervalMs: number;
   workerPollIntervalMs: number;
   maxUploadBytes: number;
 }
@@ -98,8 +105,37 @@ export interface CatalogPageIcon {
   svg: string;
 }
 
+export interface CatalogBaseline {
+  packageName: string;
+  requestedTag: string;
+  version: string;
+  integrity: string;
+  sourceRepository: string;
+  sourceCommit: string;
+}
+
+export interface NpmCatalogIcon extends CatalogPageIcon {
+  sourceName: string;
+  codepoint: number;
+}
+
+export interface NpmCatalogSnapshot {
+  baseline: CatalogBaseline;
+  icons: NpmCatalogIcon[];
+}
+
+export interface NpmPackageCatalogOptions {
+  packageName: string;
+  tag: string;
+  registryUrl: string;
+  authToken?: string;
+  sourceRepository: string;
+  cacheRoot: string;
+  refreshIntervalMs: number;
+}
+
 export interface CatalogPage {
-  baseCommit: string;
+  catalogBaseline: CatalogBaseline;
   page: number;
   pageSize: number;
   total: number;

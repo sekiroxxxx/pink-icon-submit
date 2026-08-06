@@ -1,6 +1,6 @@
 import { buildApp } from './app.js';
 import { BatchService } from './batch-service.js';
-import { configFromEnv } from './config.js';
+import { catalogOptionsFromConfig, configFromEnv } from './config.js';
 import { BatchDatabase } from './database.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
@@ -15,6 +15,7 @@ const batches = new BatchService(
   new GitRepository(config.repositoryPath, config.temporaryRoot, config.upstreamRemote, config.upstreamBranch),
   new IconBatchCli(),
   config.maxUploadBytes,
+  catalogOptionsFromConfig(config),
 );
 database.recoverInterruptedValidations();
 database.recoverInterruptedJobs();
