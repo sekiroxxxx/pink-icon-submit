@@ -29,6 +29,7 @@ button:disabled { cursor: not-allowed; opacity: .52; }
   padding: 0 max(24px, calc((100vw - 1320px) / 2)); background: rgb(255 255 255 / 92%); border-bottom: 1px solid var(--line); backdrop-filter: blur(10px);
 }
 .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; letter-spacing: -.03em; }
+.brand-logo { display: block; width: 32px; height: 32px; flex: 0 0 auto; object-fit: contain; }
 .brand-mark { display: grid; width: 32px; height: 32px; place-items: center; border-radius: 10px; background: var(--brand); box-shadow: 0 5px 12px rgb(255 158 173 / 42%); color: var(--brand-ink); font-weight: 900; }
 .profile-button { display: flex; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px 5px 5px; background: #fff; color: var(--ink); text-align: left; }
 .profile-button:hover { border-color: #f5b7c2; background: #fff8fa; }

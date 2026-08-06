@@ -819,7 +819,7 @@ export function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand"><span className="brand-mark">P</span><span>PinK 图标工作台</span></div>
+        <div className="brand"><img className="brand-logo" src="/pink-icon.svg" alt="" /><span>PinK 图标工作台</span></div>
         {profile && <button className="profile-button" type="button" onClick={() => setIdentityOpen(true)} aria-label="修改设计师身份"><span className="avatar">{profile.name.slice(0, 1)}</span><span><strong>{profile.name}</strong><small>{profile.email}</small></span></button>}
       </header>
       <main className="page-shell">
