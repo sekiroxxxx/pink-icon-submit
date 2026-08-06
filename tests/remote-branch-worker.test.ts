@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { AppError } from '../src/errors.js';
+import type { GitHubPullRequest, GitHubPullRequestClient, GitHubPullRequestLookup } from '../src/github-client.js';
 import { RemoteBranchWorker } from '../src/remote-branch-worker.js';
 import { createTestEnvironment, type TestEnvironment } from './helpers.js';
 
@@ -12,15 +14,49 @@ function remoteHead(repositoryPath: string, branch: string): string {
   return execFileSync('git', [`--git-dir=${repositoryPath}`, 'rev-parse', `refs/heads/${branch}`], { encoding: 'utf8' }).trim();
 }
 
-function workerFor(environment: TestEnvironment): RemoteBranchWorker {
+class FakeGitHubPullRequestClient implements GitHubPullRequestClient {
+  readonly created: Array<{ repository: string; title: string; head: string; base: string; body: string }> = [];
+  readonly pullRequests: Array<{ head: string; marker: string | null; pullRequest: GitHubPullRequest }> = [];
+  lookupFailure: Error | null = null;
+
+  async findPullRequest(_repository: string, head: string, marker: string): Promise<GitHubPullRequestLookup> {
+    if (this.lookupFailure) {
+      throw this.lookupFailure;
+    }
+    const matching = this.pullRequests.find((entry) => entry.head === head && entry.marker === marker)?.pullRequest ?? null;
+    const conflicting = matching
+      ? null
+      : this.pullRequests.find((entry) => entry.head === head)?.pullRequest ?? null;
+    return { matching, conflicting };
+  }
+
+  async createDraftPullRequest(repository: string, input: { title: string; head: string; base: string; body: string }): Promise<GitHubPullRequest> {
+    const pullRequest: GitHubPullRequest = {
+      number: this.pullRequests.length + 1,
+      url: `https://github.example.invalid/${repository}/pull/${this.pullRequests.length + 1}`,
+      state: 'open',
+      isDraft: true,
+      createdAt: '2026-08-06T00:00:00.000Z',
+    };
+    const marker = /<!-- pink-icon-submit:batch=[^\s]+ -->/.exec(input.body)?.[0] ?? null;
+    this.created.push({ repository, ...input });
+    this.pullRequests.push({ head: input.head, marker, pullRequest });
+    return pullRequest;
+  }
+}
+
+function workerFor(environment: TestEnvironment, github = new FakeGitHubPullRequestClient()): RemoteBranchWorker {
   const delivery = environment.config.remoteDelivery;
   if (!delivery) {
     throw new Error('Remote test environment is missing delivery config.');
   }
   return new RemoteBranchWorker(environment.batches, {
     pushRemote: delivery.pushRemote,
+    pushRepository: delivery.pushRepository,
     pushBranchPrefix: delivery.pushBranchPrefix,
     committer: delivery.committer,
+    targetRepository: environment.config.targetRepository,
+    github,
     authentication: {
       username: delivery.pushRepository.split('/')[0],
       token: delivery.githubToken,
@@ -45,21 +81,35 @@ async function createSubmittedRemoteBatch(t: test.TestContext): Promise<{ enviro
   return { environment, batchId: batch.id };
 }
 
-test('remote worker creates one bot branch commit and pushes it without touching target main', async (t) => {
+test('remote worker creates one bot branch commit and one Draft PR without touching target main', async (t) => {
   const { environment, batchId } = await createSubmittedRemoteBatch(t);
-  const outcome = await workerFor(environment).processNext();
+  const github = new FakeGitHubPullRequestClient();
+  const outcome = await workerFor(environment, github).processNext();
   assert.deepEqual(outcome, { processed: true, batchId });
 
   const completed = environment.batches.getBatch(batchId);
   const branch = `bot/${batchId}`;
-  assert.equal(completed.state, 'BRANCH_PUSHED');
-  assert.equal(completed.delivery.checkpoint, 'BRANCH_PUSHED');
+  assert.equal(completed.state, 'PR_CREATED');
+  assert.equal(completed.delivery.checkpoint, 'PR_CREATED');
   assert.equal(completed.delivery.branch, branch);
   assert.equal(completed.delivery.commitSha, remoteHead(environment.pushRepositoryPath!, branch));
+  assert.deepEqual(completed.delivery.pullRequest, {
+    number: 1,
+    url: 'https://github.example.invalid/sekiroxxxx/sekiroxxxx-pink-codicons-automation-test/pull/1',
+    state: 'open',
+    isDraft: true,
+    createdAt: '2026-08-06T00:00:00.000Z',
+  });
   assert.equal(completed.job?.state, 'COMPLETED');
   const message = execFileSync('git', [`--git-dir=${environment.pushRepositoryPath!}`, 'log', '-1', '--format=%B', branch], { encoding: 'utf8' });
   assert.match(message, new RegExp(`PinK-Icon-Batch: ${batchId}`));
   assert.match(message, /PinK-Icon-Request-SHA256: a{64}/);
+  assert.equal(github.created.length, 1);
+  assert.equal(github.created[0]?.head, `sud-icon-bot:${branch}`);
+  assert.equal(github.created[0]?.base, 'main');
+  assert.match(github.created[0]?.body ?? '', new RegExp(`<!-- pink-icon-submit:batch=${batchId} -->`));
+  assert.match(github.created[0]?.body ?? '', /平台不再 push 或修改该分支/);
+  assert.throws(() => environment.batches.retry(batchId), /PR_CREATED/);
   assert.deepEqual(await readdir(environment.config.temporaryRoot), []);
   assert.equal(remoteHead(environment.pushRepositoryPath!, 'main'), environment.config.targetRepository.branch === 'main'
     ? execFileSync('git', ['-C', environment.config.repositoryPath, 'rev-parse', 'upstream/main'], { encoding: 'utf8' }).trim()
@@ -68,29 +118,86 @@ test('remote worker creates one bot branch commit and pushes it without touching
 
 test('remote worker recovers a successful push when only the COMMIT_PREPARED checkpoint survived', async (t) => {
   const { environment, batchId } = await createSubmittedRemoteBatch(t);
-  await workerFor(environment).processNext();
+  const github = new FakeGitHubPullRequestClient();
+  await workerFor(environment, github).processNext();
   const pushed = environment.batches.getBatch(batchId);
   const branch = pushed.delivery.branch!;
   const commitSha = pushed.delivery.commitSha!;
 
   environment.database.failJob(batchId, 'WORKER_INTERRUPTED', 'Simulated interruption after push.');
   const inspection = new (await import('better-sqlite3')).default(environment.config.databasePath);
-  inspection.prepare("UPDATE batches SET delivery_checkpoint = 'COMMIT_PREPARED' WHERE id = ?").run(batchId);
+  inspection.prepare(`
+    UPDATE batches
+    SET state = 'FAILED', delivery_checkpoint = 'COMMIT_PREPARED', pr_number = NULL, pr_url = NULL, pr_state = NULL,
+        pr_is_draft = NULL, pr_created_at = NULL, handoff_at = NULL
+    WHERE id = ?
+  `).run(batchId);
   inspection.close();
   environment.batches.retry(batchId);
 
-  await workerFor(environment).processNext();
+  await workerFor(environment, github).processNext();
   const recovered = environment.batches.getBatch(batchId);
-  assert.equal(recovered.state, 'BRANCH_PUSHED');
-  assert.equal(recovered.delivery.checkpoint, 'BRANCH_PUSHED');
+  assert.equal(recovered.state, 'PR_CREATED');
+  assert.equal(recovered.delivery.checkpoint, 'PR_CREATED');
   assert.equal(recovered.delivery.commitSha, commitSha);
   assert.equal(remoteHead(environment.pushRepositoryPath!, branch), commitSha);
   assert.equal(recovered.job?.state, 'COMPLETED');
+  assert.equal(github.created.length, 1);
 });
 
-test('remote worker refuses to overwrite a bot branch changed by a developer', async (t) => {
+test('remote worker recovers a successful Draft PR when only PR_CREATING survived', async (t) => {
   const { environment, batchId } = await createSubmittedRemoteBatch(t);
-  await workerFor(environment).processNext();
+  const github = new FakeGitHubPullRequestClient();
+  await workerFor(environment, github).processNext();
+
+  environment.database.failJob(batchId, 'WORKER_INTERRUPTED', 'Simulated interruption after Draft PR creation.');
+  const inspection = new (await import('better-sqlite3')).default(environment.config.databasePath);
+  inspection.prepare(`
+    UPDATE batches
+    SET state = 'FAILED', delivery_checkpoint = 'PR_CREATING', pr_number = NULL, pr_url = NULL, pr_state = NULL,
+        pr_is_draft = NULL, pr_created_at = NULL, handoff_at = NULL
+    WHERE id = ?
+  `).run(batchId);
+  inspection.close();
+  environment.batches.retry(batchId);
+
+  await workerFor(environment, github).processNext();
+  const recovered = environment.batches.getBatch(batchId);
+  assert.equal(recovered.state, 'PR_CREATED');
+  assert.equal(recovered.delivery.checkpoint, 'PR_CREATED');
+  assert.equal(recovered.delivery.pullRequest?.number, 1);
+  assert.equal(github.created.length, 1);
+  assert.equal(recovered.job?.state, 'COMPLETED');
+});
+
+test('remote worker refuses to create a duplicate PR when the bot branch already has an unmarked PR', async (t) => {
+  const { environment, batchId } = await createSubmittedRemoteBatch(t);
+  const github = new FakeGitHubPullRequestClient();
+  github.pullRequests.push({
+    head: `sud-icon-bot:bot/${batchId}`,
+    marker: null,
+    pullRequest: {
+      number: 77,
+      url: 'https://github.example.invalid/existing/pull/77',
+      state: 'open',
+      isDraft: true,
+      createdAt: '2026-08-06T00:00:00.000Z',
+    },
+  });
+
+  await workerFor(environment, github).processNext();
+
+  const failed = environment.batches.getBatch(batchId);
+  assert.equal(failed.state, 'FAILED');
+  assert.equal(failed.error?.code, 'PR_BRANCH_ALREADY_EXISTS');
+  assert.equal(github.created.length, 0);
+});
+
+test('remote worker refuses to create a PR from a bot branch changed by a developer', async (t) => {
+  const { environment, batchId } = await createSubmittedRemoteBatch(t);
+  const github = new FakeGitHubPullRequestClient();
+  github.lookupFailure = new AppError('GITHUB_API_REQUEST_FAILED', 'Simulated GitHub lookup failure.', 502);
+  await workerFor(environment, github).processNext();
   const pushed = environment.batches.getBatch(batchId);
   const branch = pushed.delivery.branch!;
   const developerClone = await mkdtemp(join(tmpdir(), 'pink-icon-submit-developer-'));
@@ -104,12 +211,13 @@ test('remote worker refuses to overwrite a bot branch changed by a developer', a
   const developerHead = remoteHead(environment.pushRepositoryPath!, branch);
   assert.notEqual(developerHead, pushed.delivery.commitSha);
 
-  environment.database.failJob(batchId, 'WORKER_INTERRUPTED', 'Simulated restart after developer handoff.');
   environment.batches.retry(batchId);
-  await workerFor(environment).processNext();
+  github.lookupFailure = null;
+  await workerFor(environment, github).processNext();
 
   const failed = environment.batches.getBatch(batchId);
   assert.equal(failed.state, 'FAILED');
   assert.equal(failed.error?.code, 'REMOTE_BRANCH_DIVERGED');
   assert.equal(remoteHead(environment.pushRepositoryPath!, branch), developerHead);
+  assert.equal(github.created.length, 0);
 });

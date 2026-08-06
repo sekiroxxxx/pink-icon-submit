@@ -242,6 +242,10 @@ export async function createTestEnvironment(t: TestContext, options: TestEnviron
       ...(config.remoteDelivery ? {
         targetRemote: config.remoteDelivery.targetRemote,
         targetBranch: config.targetRepository.branch,
+        remoteAuthentication: {
+          username: config.remoteDelivery.pushRepository.split('/')[0],
+          token: config.remoteDelivery.githubToken,
+        },
       } : {}),
     }),
     new IconBatchCli(),

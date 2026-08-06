@@ -305,3 +305,45 @@ test('validation warnings remain visible without requiring a designer acknowledg
   await user.click(screen.getByRole('button', { name: '生成本地修改' }));
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-WARNING/submit', { method: 'POST' }));
 });
+
+test('a completed remote batch shows its Draft PR link and handoff boundary', async () => {
+  saveProfile();
+  const draftDelivery = {
+    branch: 'bot/ICON-PR',
+    commitSha: 'a'.repeat(40),
+    pullRequest: {
+      number: 42,
+      url: 'https://github.example.invalid/sekiroxxxx/sekiroxxxx-pink-codicons-automation-test/pull/42',
+      state: 'open',
+      isDraft: true,
+      createdAt: '2026-08-06T00:00:00.000Z',
+    },
+    handoffAt: '2026-08-06T00:00:00.000Z',
+  };
+  const fetchMock = vi.fn((path: string) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
+    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ id: 'ICON-PR', state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, delivery: { ...draftDelivery, pullRequest: null }, error: null }));
+    if (url.pathname === '/api/batches/ICON-PR/items') return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-PR', action: 'add', sourceFile: 'items/item-1.svg' }));
+    if (url.pathname === '/api/batches/ICON-PR/validate') return Promise.resolve(jsonResponse({ id: 'ICON-PR', state: 'READY', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: null, delivery: { ...draftDelivery, pullRequest: null }, error: null }));
+    if (url.pathname === '/api/batches/ICON-PR/submit') return Promise.resolve(jsonResponse({ id: 'ICON-PR', state: 'PR_CREATED', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: { changedFiles: ['src/icons/pink-new-icon.svg'], patch: '' }, delivery: draftDelivery, error: null }));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await addOneSvgChange(user);
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await user.type(screen.getByLabelText(/^本次变更标题/), 'PR 结果展示');
+  await user.type(screen.getByLabelText(/^整体需求说明/), '验证 Draft PR 链接。');
+  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/pr');
+  await user.click(screen.getByRole('checkbox'));
+  await user.click(screen.getByRole('button', { name: '进入校验' }));
+  await screen.findByText('校验通过，可以生成本地修改。');
+  await user.click(screen.getByRole('button', { name: '生成本地修改' }));
+
+  const link = await screen.findByRole('link', { name: '打开 Draft PR #42' });
+  expect(link.getAttribute('href')).toBe(draftDelivery.pullRequest.url);
+  expect(screen.getByText('平台已停止写入该机器人分支；后续调整请直接在 PR 中完成。')).toBeTruthy();
+});

@@ -187,3 +187,45 @@ test('startup recovery preserves an already handed-off PR_CREATED batch', async 
   assert.equal(database.getJob('ICON-20260806-ABCDEF12')?.state, 'COMPLETED');
   database.close();
 });
+
+test('P3-C resumes a completed P3-B branch checkpoint for Draft PR delivery', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'pink-icon-submit-branch-resume-'));
+  const databasePath = join(root, 'service.sqlite');
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const database = new BatchDatabase(databasePath);
+  const batchId = 'ICON-20260806-ABCDEF12';
+  database.createBatch(
+    batchId,
+    {
+      title: 'Resume P3-B branch',
+      description: 'A completed branch checkpoint must continue into P3-C.',
+      designUrl: 'https://design.example.invalid/resume',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+    {
+      packageName: '@pink/codicons',
+      requestedTag: 'beta',
+      version: '0.0.46-test.1',
+      integrity: 'sha512-test',
+      sourceRepository: 'sud-global/pink-codicons',
+      sourceCommit: 'a'.repeat(40),
+    },
+    { repository: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test', branch: 'main' },
+    {
+      executionMode: 'remote',
+      pushRepository: 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test',
+      pushBranchPrefix: 'bot/',
+    },
+  );
+  database.queueJob(batchId);
+  database.claimNextJob();
+  database.recordCommitPrepared(batchId, { items: [] }, 'a'.repeat(40), { changedFiles: [] }, `bot/${batchId}`, 'b'.repeat(40));
+  database.recordBranchPushed(batchId);
+  database.completeAlreadyHandedOffJob(batchId);
+
+  assert.equal(database.resumeBranchPushedJobs(), 1);
+  assert.equal(database.getBatch(batchId).state, 'QUEUED');
+  assert.equal(database.getBatch(batchId).delivery.checkpoint, 'BRANCH_PUSHED');
+  assert.equal(database.getJob(batchId)?.state, 'QUEUED');
+  database.close();
+});

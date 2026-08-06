@@ -17,12 +17,17 @@ const repository = new GitRepository(config.repositoryPath, config.temporaryRoot
   ...(config.remoteDelivery ? {
     targetRemote: config.remoteDelivery.targetRemote,
     targetBranch: config.targetRepository.branch,
+    remoteAuthentication: {
+      username: config.remoteDelivery.pushRepository.split('/')[0],
+      token: config.remoteDelivery.githubToken,
+    },
   } : {}),
 });
-if (config.remoteDelivery) {
+const github = config.remoteDelivery ? new GitHubApiClient(config.remoteDelivery.githubToken) : undefined;
+if (config.remoteDelivery && github) {
   await new RemoteTopologyPreflight(
     repository,
-    new GitHubApiClient(config.remoteDelivery.githubToken),
+    github,
     config.targetRepository,
     config.remoteDelivery,
   ).verify();
@@ -45,11 +50,17 @@ const batches = new BatchService(
 );
 database.recoverInterruptedValidations();
 database.recoverInterruptedJobs();
+if (config.remoteDelivery) {
+  database.resumeBranchPushedJobs();
+}
 const worker = config.remoteDelivery
   ? new RemoteBranchWorker(batches, {
     pushRemote: config.remoteDelivery.pushRemote,
+    pushRepository: config.remoteDelivery.pushRepository,
     pushBranchPrefix: config.remoteDelivery.pushBranchPrefix,
     committer: config.remoteDelivery.committer,
+    targetRepository: config.targetRepository,
+    github: github!,
     authentication: {
       username: config.remoteDelivery.pushRepository.split('/')[0],
       token: config.remoteDelivery.githubToken,

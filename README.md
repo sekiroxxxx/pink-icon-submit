@@ -1,6 +1,6 @@
 # PinK Icon Submit
 
-PinK 图标自动 Draft PR MVP 的独立编排服务。当前包含 Fastify、SQLite、批次 API、本地 worktree Worker 和 React/Vite 设计提交页；Stage 1 v2 目前只接入本地开发闭环。
+PinK 图标自动 Draft PR MVP 的独立编排服务。当前包含 Fastify、SQLite、批次 API、worktree Worker 和 React/Vite 设计提交页；remote 模式从 R2 worktree 调用 Stage 1 v2，local 模式可显式指定本地 Stage 1 源码。
 
 ## 边界
 
@@ -8,9 +8,9 @@ PinK 图标自动 Draft PR MVP 的独立编排服务。当前包含 Fastify、SQ
 - 设计提交页的图标目录直接读取 `@pink/codicons@beta` 的 npm tarball：只解析 `src/template/mapping.json` 和 `src/icons/*.svg`，验证 npm 的 sha512 SRI，并按 integrity 的 SHA-256 缓存解析后的不可变快照和原始 `.tgz`。不会安装该包、执行包脚本或本地构建设计目录。
 - 创建批次时会冻结 npm 的 `catalogBaseline`（包名、tag、精确版本、SRI、来源仓库和 commit）及目标仓库；后续校验、plan 和 apply 始终使用该批次对应的缓存 tarball。
 - 目录展示基于 npm 发布物；名称预览、最终校验和本地 diff 基于目标 Git ref。`local` 模式只解析本地 ref，绝不执行 `git fetch`；本地 Stage 1 源码只提供 CLI 实现，不能替代 npm catalog 基线。
-- local Worker 只在临时 worktree 生成本地 diff；remote Worker 已在 P3-B 创建一个 `bot/<batchId>` commit 并普通 push 到 R3，但不会创建 GitHub PR。
+- local Worker 只在临时 worktree 生成本地 diff；remote Worker 会在 R3 创建一个 `bot/<batchId>` commit、普通 push，并向 R2/main 创建一个 GitHub Draft PR。
 - 前端只负责批次表单、SVG 预览、目录选择和状态展示；不解析 mapping、不分配 codepoint、不持有 GitHub Token。
-- 本地批次状态为 `DRAFT → VALIDATING → READY → QUEUED → RUNNING → LOCAL_DIFF_READY`。远程交付目前到 `COMMIT_PREPARED → BRANCH_PUSHED`，P3-C 再接入 `PR_CREATING → PR_CREATED`。进程重启时遗留的 `VALIDATING` 批次会安全退回 `DRAFT`；遗留的 `RUNNING` job 会标记为 `FAILED/WORKER_INTERRUPTED`，但未来已 `PR_CREATED` 的交接不会被降级或重试。
+- 本地批次状态为 `DRAFT → VALIDATING → READY → QUEUED → RUNNING → LOCAL_DIFF_READY`。远程交付依次经过 `COMMIT_PREPARED → BRANCH_PUSHED → PR_CREATING → PR_CREATED`；`PR_CREATED` 为开发接管终态，平台不再 push 或修改该分支。进程重启时遗留的 `VALIDATING` 批次会安全退回 `DRAFT`；遗留的 `RUNNING` job 会标记为 `FAILED/WORKER_INTERRUPTED`，但已 `PR_CREATED` 的交接不会被降级或重试。
 
 ## 配置
 
@@ -34,7 +34,7 @@ PINK_ICON_CATALOG_SOURCE_REPOSITORY=sud-global/pink-codicons # 可选
 PINK_ICON_CATALOG_REFRESH_MS=60000                         # 可选，默认 60 秒
 ```
 
-P3 开发期远程模式（创建 R3 的 `bot/<batchId>` 分支；不会创建 PR）：
+P3 开发期远程模式（创建 R3 的 `bot/<batchId>` 分支和 R2 的 Draft PR）：
 
 ```text
 PINK_ICON_EXECUTION_MODE=remote
@@ -67,8 +67,8 @@ npm ci
 
 ## 尚未接入正式环境
 
-- P3-B 不创建 Draft PR，也不做 npm 发布、构建或自动合并。
-- P3-C 尚未实现 Draft PR 创建、PR 幂等恢复和创建后写入封锁；工作线 C 的真实 R2/R3 验收尚未开始。
+- P3 不做 npm 发布、构建或自动合并；工作线 C 的真实 R2/R3 验收尚未开始。
+- R2/R3 的真实 push 和 Draft PR 仅由工作线 C 验收；当前仓库测试只使用本地 bare Git remote 和 GitHub API fake。
 - R0/R1 不接入、不读取为目标、更不写入。
 - 正式迁移时，旧批次必须以当时的 npm tarball 与目标 main 重新校验、重新生成 plan，不能复用本地 diff。
 

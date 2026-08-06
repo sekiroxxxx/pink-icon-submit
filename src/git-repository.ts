@@ -20,6 +20,7 @@ export interface GitRepositoryOptions {
   mode: ExecutionMode;
   targetRemote?: string;
   targetBranch?: string;
+  remoteAuthentication?: GitHubTokenAuthentication;
   localTargetRef?: string;
 }
 
@@ -44,7 +45,10 @@ export class GitRepository {
     if (!this.options.targetRemote || !this.options.targetBranch) {
       throw new AppError('GIT_CONFIGURATION_INVALID', 'Remote execution requires a target remote and branch.', 500);
     }
-    await this.git(['-C', this.repositoryPath, 'fetch', this.options.targetRemote]);
+    await this.withAuthentication(this.options.remoteAuthentication, (environment) => this.git([
+      '-C', this.repositoryPath,
+      'fetch', this.options.targetRemote!,
+    ], environment));
     return this.git(['-C', this.repositoryPath, 'rev-parse', `${this.options.targetRemote}/${this.options.targetBranch}`]).then((output) => output.trim());
   }
 

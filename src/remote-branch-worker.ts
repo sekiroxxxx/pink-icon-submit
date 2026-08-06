@@ -1,8 +1,10 @@
 import { AppError, isAppError } from './errors.js';
 import type { GitCommitIdentity, GitHubTokenAuthentication } from './git-repository.js';
+import type { GitHubPullRequestClient } from './github-client.js';
+import { draftPullRequestForBatch } from './pull-request-template.js';
 import { branchForBatch } from './remote-preflight.js';
 import { BatchService } from './batch-service.js';
-import type { CommitterIdentity, StoredBatch } from './types.js';
+import type { CommitterIdentity, StoredBatch, TargetRepository } from './types.js';
 import type { WorkerResult } from './worker.js';
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -47,8 +49,11 @@ function commitText(batch: StoredBatch, baseCommit: string): { subject: string; 
 
 export interface RemoteBranchWorkerOptions {
   pushRemote: string;
+  pushRepository: string;
   pushBranchPrefix: 'bot/';
   committer: CommitterIdentity;
+  targetRepository: TargetRepository;
+  github: GitHubPullRequestClient;
   authentication?: GitHubTokenAuthentication;
 }
 
@@ -118,7 +123,7 @@ export class RemoteBranchWorker {
       this.batches.database.recordCommitPrepared(job.batchId, result.plan, result.baseCommit, result.localDiff, branch, result.commitSha);
       await this.pushOrRecoverBranch(branch, result.commitSha);
       this.batches.database.recordBranchPushed(job.batchId);
-      this.batches.database.completeBranchPushJob(job.batchId);
+      await this.createOrRecoverDraftPullRequest(this.batches.database.getBatch(job.batchId));
       return { processed: true, batchId: job.batchId };
     } catch (error) {
       if (isAppError(error)) {
@@ -132,14 +137,26 @@ export class RemoteBranchWorker {
 
   private requireRemoteBatch(batchId: string): StoredBatch {
     const batch = this.batches.database.getBatch(batchId);
-    if (batch.executionMode !== 'remote' || !batch.pushRepository || batch.pushBranchPrefix !== this.options.pushBranchPrefix) {
+    if (batch.executionMode !== 'remote'
+      || !batch.pushRepository
+      || batch.pushRepository !== this.options.pushRepository
+      || batch.pushBranchPrefix !== this.options.pushBranchPrefix
+      || !batch.targetRepository
+      || batch.targetRepository.repository !== this.options.targetRepository.repository
+      || batch.targetRepository.branch !== this.options.targetRepository.branch) {
       throw new AppError('REMOTE_DELIVERY_CONTEXT_MISSING', `Batch ${batchId} lacks the required P3 remote delivery context.`, 409);
     }
     return batch;
   }
 
   private async recoverRemoteBranch(batch: StoredBatch): Promise<boolean> {
-    if (batch.delivery.checkpoint !== 'COMMIT_PREPARED' && batch.delivery.checkpoint !== 'BRANCH_PUSHED') {
+    if (batch.delivery.checkpoint === 'PR_CREATED') {
+      this.batches.database.completeAlreadyHandedOffJob(batch.id);
+      return true;
+    }
+    if (batch.delivery.checkpoint !== 'COMMIT_PREPARED'
+      && batch.delivery.checkpoint !== 'BRANCH_PUSHED'
+      && batch.delivery.checkpoint !== 'PR_CREATING') {
       return false;
     }
     if (!batch.delivery.branch || !batch.delivery.commitSha) {
@@ -159,8 +176,53 @@ export class RemoteBranchWorker {
     if (batch.delivery.checkpoint === 'COMMIT_PREPARED') {
       this.batches.database.recordBranchPushed(batch.id);
     }
-    this.batches.database.completeBranchPushJob(batch.id);
+    await this.createOrRecoverDraftPullRequest(this.batches.database.getBatch(batch.id));
     return true;
+  }
+
+  private async createOrRecoverDraftPullRequest(batch: StoredBatch): Promise<void> {
+    const pushRepository = batch.pushRepository;
+    if (!batch.delivery.branch || !batch.delivery.commitSha || !pushRepository) {
+      throw new AppError('DELIVERY_CHECKPOINT_INVALID', `Batch ${batch.id} has an incomplete remote branch checkpoint.`, 409);
+    }
+    if (batch.delivery.checkpoint === 'PR_CREATED') {
+      this.batches.database.completeAlreadyHandedOffJob(batch.id);
+      return;
+    }
+    const remoteHead = await this.batches.repository.remoteBranchHead(
+      this.options.pushRemote,
+      batch.delivery.branch,
+      this.options.authentication,
+    );
+    if (remoteHead !== batch.delivery.commitSha) {
+      throw new AppError('REMOTE_BRANCH_DIVERGED', `Remote branch ${batch.delivery.branch} no longer matches this batch commit.`, 409);
+    }
+    if (batch.delivery.checkpoint === 'BRANCH_PUSHED') {
+      this.batches.database.beginPullRequestCreation(batch.id);
+      batch = this.batches.database.getBatch(batch.id);
+    }
+    if (batch.delivery.checkpoint !== 'PR_CREATING') {
+      throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batch.id} cannot create a Draft PR from its current checkpoint.`, 409);
+    }
+    const details = this.batches.database.getDetails(batch.id);
+    const draft = draftPullRequestForBatch(details);
+    const owner = pushRepository.slice(0, pushRepository.indexOf('/'));
+    const head = `${owner}:${batch.delivery.branch}`;
+    const existing = await this.options.github.findPullRequest(this.options.targetRepository.repository, head, draft.marker);
+    if (existing.matching) {
+      this.batches.database.recordPullRequestCreated(batch.id, existing.matching);
+      return;
+    }
+    if (existing.conflicting) {
+      throw new AppError('PR_BRANCH_ALREADY_EXISTS', `Remote branch ${batch.delivery.branch} already has a non-matching pull request.`, 409);
+    }
+    const pullRequest = await this.options.github.createDraftPullRequest(this.options.targetRepository.repository, {
+      title: draft.title,
+      head,
+      base: this.options.targetRepository.branch,
+      body: draft.body,
+    });
+    this.batches.database.recordPullRequestCreated(batch.id, pullRequest);
   }
 
   private async pushOrRecoverBranch(branch: string, commitSha: string): Promise<void> {

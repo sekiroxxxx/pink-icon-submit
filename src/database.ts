@@ -76,6 +76,14 @@ interface JobRow {
   updated_at: string;
 }
 
+interface PullRequestRecord {
+  number: number;
+  url: string;
+  state: string;
+  isDraft: boolean;
+  createdAt: string | null;
+}
+
 function parseJson(value: string | null): unknown | null {
   return value === null ? null : JSON.parse(value);
 }
@@ -502,14 +510,100 @@ export class BatchDatabase {
     }
   }
 
-  completeBranchPushJob(batchId: string): void {
+  beginPullRequestCreation(batchId: string): void {
+    const begin = this.db.transaction(() => {
+      const job = this.db.prepare('SELECT state FROM jobs WHERE batch_id = ?').get(batchId) as Pick<JobRow, 'state'> | undefined;
+      if (!job || job.state !== 'RUNNING') {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} is not running a delivery job.`, 409);
+      }
+      const result = this.db.prepare(`
+        UPDATE batches
+        SET state = 'PR_CREATING', delivery_checkpoint = 'PR_CREATING',
+            error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ? AND delivery_checkpoint = 'BRANCH_PUSHED'
+      `).run(now(), batchId);
+      if (result.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} cannot begin Draft PR creation from its current checkpoint.`, 409);
+      }
+    });
+    begin();
+  }
+
+  recordPullRequestCreated(batchId: string, pullRequest: PullRequestRecord): void {
+    const record = this.db.transaction(() => {
+      const job = this.db.prepare('SELECT state FROM jobs WHERE batch_id = ?').get(batchId) as Pick<JobRow, 'state'> | undefined;
+      if (!job || job.state !== 'RUNNING') {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} is not running a delivery job.`, 409);
+      }
+      const timestamp = now();
+      const batchResult = this.db.prepare(`
+        UPDATE batches
+        SET state = 'PR_CREATED', delivery_checkpoint = 'PR_CREATED',
+            pr_number = ?, pr_url = ?, pr_state = ?, pr_is_draft = ?, pr_created_at = ?, handoff_at = ?,
+            error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ? AND delivery_checkpoint = 'PR_CREATING'
+      `).run(
+        pullRequest.number,
+        pullRequest.url,
+        pullRequest.state,
+        pullRequest.isDraft ? 1 : 0,
+        pullRequest.createdAt,
+        timestamp,
+        timestamp,
+        batchId,
+      );
+      if (batchResult.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} cannot record its Draft PR from its current checkpoint.`, 409);
+      }
+      const jobResult = this.db.prepare(`
+        UPDATE jobs SET state = 'COMPLETED', error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE batch_id = ? AND state = 'RUNNING'
+      `).run(timestamp, batchId);
+      if (jobResult.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} Draft PR job cannot be completed.`, 409);
+      }
+    });
+    record();
+  }
+
+  completeAlreadyHandedOffJob(batchId: string): void {
     const result = this.db.prepare(`
       UPDATE jobs SET state = 'COMPLETED', error_code = NULL, error_message = NULL, updated_at = ?
       WHERE batch_id = ? AND state = 'RUNNING'
     `).run(now(), batchId);
     if (result.changes !== 1) {
-      throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} delivery job cannot be completed.`, 409);
+      throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} handed-off delivery job cannot be completed.`, 409);
     }
+  }
+
+  resumeBranchPushedJobs(): number {
+    const resume = this.db.transaction(() => {
+      const batches = this.db.prepare(`
+        SELECT batches.id
+        FROM batches JOIN jobs ON jobs.batch_id = batches.id
+        WHERE batches.state = 'BRANCH_PUSHED'
+          AND batches.delivery_checkpoint = 'BRANCH_PUSHED'
+          AND jobs.state = 'COMPLETED'
+      `).all() as Array<Pick<BatchRow, 'id'>>;
+      if (batches.length === 0) {
+        return 0;
+      }
+      const timestamp = now();
+      for (const batch of batches) {
+        this.db.prepare(`
+          UPDATE jobs
+          SET state = 'QUEUED', attempt = attempt + 1, error_code = NULL, error_message = NULL, updated_at = ?
+          WHERE batch_id = ? AND state = 'COMPLETED'
+        `).run(timestamp, batch.id);
+        this.db.prepare(`
+          UPDATE batches
+          SET state = 'QUEUED', error_code = NULL, error_message = NULL, updated_at = ?
+          WHERE id = ? AND state = 'BRANCH_PUSHED' AND delivery_checkpoint = 'BRANCH_PUSHED'
+        `).run(timestamp, batch.id);
+      }
+      return batches.length;
+    });
+    return resume();
   }
 
   failJob(batchId: string, code: string, message: string): void {
