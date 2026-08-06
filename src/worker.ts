@@ -38,9 +38,9 @@ export class LocalDiffWorker {
     }
 
     try {
-      const requestPath = await this.batches.writeRequest(job.batchId);
-      const result = await this.batches.repository.withLatestWorktree(async (worktreePath) => {
-        const planned = await this.batches.iconBatch.plan(worktreePath, requestPath);
+      const stage1Input = await this.batches.prepareStage1Request(job.batchId);
+      const result = await this.batches.repository.withBaseWorktree(async (worktreePath) => {
+        const planned = await this.batches.iconBatch.plan(worktreePath, stage1Input.requestPath, stage1Input);
         if (planned.exitCode !== 0) {
           throw new AppError('REPLAN_VALIDATION_FAILED', 'The batch is no longer valid against the latest target branch.', 409, planned.payload);
         }
@@ -49,7 +49,10 @@ export class LocalDiffWorker {
           throw new AppError('PLAN_INVALID', 'icon-batch plan output must be an object.', 502);
         }
         const planPath = await this.batches.storage.writePlan(job.batchId, plan);
-        await this.batches.iconBatch.apply(worktreePath, planPath);
+        await this.batches.iconBatch.apply(worktreePath, planPath, {
+          ...stage1Input,
+          requestPath: stage1Input.requestPath,
+        });
 
         const changedFiles = await this.batches.repository.diffFiles(worktreePath);
         const expectedFiles = allowedFiles(plan);

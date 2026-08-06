@@ -1,6 +1,4 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { writeFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { buildApp } from '../src/app.js';
@@ -269,7 +267,7 @@ test('warning acknowledgement is persisted for exactly one validation result bef
   assert.equal((queued.json() as { state: string }).state, 'QUEUED');
 });
 
-test('catalog pages reuse the npm snapshot when the target branch changes', async (t) => {
+test('catalog pages reuse the immutable npm snapshot across repeated reads', async (t) => {
   const environment = await createTestEnvironment(t);
   const app = await buildApp({ batches: environment.batches });
   t.after(() => app.close());
@@ -279,10 +277,6 @@ test('catalog pages reuse the npm snapshot when the target branch changes', asyn
   assert.equal(first.statusCode, 200);
   assert.equal(second.statusCode, 200);
   assert.deepEqual(environment.registryRequests, { metadata: 1, tarball: 1 });
-
-  await writeFile(`${environment.upstreamPath}/README.md`, 'updated upstream state\n');
-  execFileSync('git', ['-C', environment.upstreamPath, 'add', 'README.md']);
-  execFileSync('git', ['-C', environment.upstreamPath, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'update upstream']);
 
   const refreshed = await app.inject({ method: 'GET', url: '/api/catalog/page?page=1&pageSize=24' });
   assert.equal(refreshed.statusCode, 200);

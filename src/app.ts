@@ -144,7 +144,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   });
 
   app.post('/api/batches', async (request, reply) => {
-    const batch = dependencies.batches.createBatch(request.body as CreateBatchInput);
+    const batch = await dependencies.batches.createBatch(request.body as CreateBatchInput);
     return reply.status(201).send(batch);
   });
 

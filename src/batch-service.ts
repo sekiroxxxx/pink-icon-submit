@@ -6,7 +6,7 @@ import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
-import type { BatchDetails, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem } from './types.js';
+import type { BatchDetails, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
 
 const maximumBatchItems = 100;
 
@@ -80,6 +80,7 @@ export class BatchService {
     readonly iconBatch: IconBatchCli,
     private readonly maxUploadBytes: number,
     catalogOptions: NpmPackageCatalogOptions,
+    private readonly targetRepository: TargetRepository,
   ) {
     this.catalog = new CatalogSnapshotCache(repository, iconBatch, catalogOptions);
   }
@@ -88,7 +89,7 @@ export class BatchService {
     return this.maxUploadBytes;
   }
 
-  createBatch(input: CreateBatchInput): BatchDetails {
+  async createBatch(input: CreateBatchInput): Promise<BatchDetails> {
     const submitted: Record<string, unknown> = isObject(input) ? input : {};
     const submitter = isObject(submitted.submitter) ? submitted.submitter : {};
     const normalized: CreateBatchInput = {
@@ -111,7 +112,8 @@ export class BatchService {
     } catch {
       throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
     }
-    const batch = this.database.createBatch(createBatchId(), normalized);
+    const catalogBaseline = await this.catalog.baseline();
+    const batch = this.database.createBatch(createBatchId(), normalized, catalogBaseline, this.targetRepository);
     return this.database.getDetails(batch.id);
   }
 
@@ -157,9 +159,9 @@ export class BatchService {
     return this.withBatchLock(batchId, async () => {
       this.database.beginValidation(batchId);
       try {
-        const requestPath = await this.writeRequest(batchId);
-        const validation = await this.repository.withLatestWorktree(async (worktreePath) => {
-          const result = await this.iconBatch.validate(worktreePath, requestPath);
+        const stage1Input = await this.prepareStage1Request(batchId);
+        const validation = await this.repository.withBaseWorktree(async (worktreePath) => {
+          const result = await this.iconBatch.validate(worktreePath, stage1Input.requestPath, stage1Input);
           return result.payload;
         });
         this.database.completeValidation(batchId, validation, baseCommitFrom(validation), validationIsValid(validation));
@@ -227,6 +229,10 @@ export class BatchService {
   }
 
   async writeRequest(batchId: string): Promise<string> {
+    return (await this.prepareStage1Request(batchId)).requestPath;
+  }
+
+  async prepareStage1Request(batchId: string): Promise<{ requestPath: string; catalogTarball: string; targetRepository: string }> {
     const details = this.database.getDetails(batchId);
     if (details.items.length === 0) {
       throw new AppError('BATCH_EMPTY', 'A batch needs at least one item before validation.', 409);
@@ -234,7 +240,14 @@ export class BatchService {
     if (details.items.length > maximumBatchItems) {
       throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
     }
-    return this.storage.writeRequest(details, details.items);
+    if (!details.catalogBaseline || !details.targetRepository) {
+      throw new AppError('BATCH_PROTOCOL_CONTEXT_MISSING', `Batch ${batchId} predates the Stage 1 v2 protocol and must be recreated.`, 409);
+    }
+    return {
+      requestPath: await this.storage.writeRequest(details, details.items),
+      catalogTarball: await this.catalog.tarballPath(details.catalogBaseline),
+      targetRepository: details.targetRepository.repository,
+    };
   }
 
   private async saveSvg(batchId: string, itemId: string, svg: Buffer): Promise<string> {

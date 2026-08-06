@@ -1,5 +1,7 @@
 export type ItemAction = 'add' | 'replace' | 'delete';
 
+export type ExecutionMode = 'local' | 'remote';
+
 export type BatchState =
   | 'DRAFT'
   | 'VALIDATING'
@@ -34,6 +36,8 @@ export interface CreateItemInput {
 
 export interface StoredBatch extends CreateBatchInput {
   id: string;
+  catalogBaseline: CatalogBaseline | null;
+  targetRepository: TargetRepository | null;
   state: BatchState;
   validation: unknown | null;
   warningsAcknowledged: boolean;
@@ -71,8 +75,12 @@ export interface AppConfig {
   storageRoot: string;
   repositoryPath: string;
   temporaryRoot: string;
+  executionMode: ExecutionMode;
+  stage1SourcePath?: string;
+  localTargetRef?: string;
   upstreamRemote: string;
   upstreamBranch: string;
+  targetRepository: TargetRepository;
   catalogPackageName: string;
   catalogTag: string;
   catalogRegistryUrl: string;
@@ -112,6 +120,11 @@ export interface CatalogBaseline {
   integrity: string;
   sourceRepository: string;
   sourceCommit: string;
+}
+
+export interface TargetRepository {
+  repository: string;
+  branch: 'main';
 }
 
 export interface NpmCatalogIcon extends CatalogPageIcon {

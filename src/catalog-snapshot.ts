@@ -124,7 +124,7 @@ export class CatalogSnapshotCache {
   }
 
   async previewName(input: string): Promise<IconNamePreview> {
-    const baseCommit = await this.repository.fetchUpstreamHead();
+    const baseCommit = await this.repository.resolveBaseCommit();
     const cacheKey = `${baseCommit}\u0000${input}`;
     const cached = this.namePreviews.get(cacheKey);
     if (cached) {
@@ -147,12 +147,20 @@ export class CatalogSnapshotCache {
     return Buffer.from(icon.svg, 'utf8');
   }
 
+  async baseline(): Promise<CatalogBaseline> {
+    return (await this.latestNpmSnapshot()).baseline;
+  }
+
+  tarballPath(baseline: CatalogBaseline): Promise<string> {
+    return this.npmCatalog.cachedTarballPath(baseline);
+  }
+
   private latestNpmSnapshot(): Promise<NpmCatalogSnapshot> {
     return this.npmCatalog.latest();
   }
 
   private async latestTargetSnapshot(): Promise<TargetCatalogSnapshot> {
-    const baseCommit = await this.repository.fetchUpstreamHead();
+    const baseCommit = await this.repository.resolveBaseCommit();
     if (this.targetSnapshot?.baseCommit === baseCommit) {
       return this.targetSnapshot;
     }

@@ -12,10 +12,16 @@ const database = new BatchDatabase(config.databasePath);
 const batches = new BatchService(
   database,
   new BatchStorage(config.storageRoot),
-  new GitRepository(config.repositoryPath, config.temporaryRoot, config.upstreamRemote, config.upstreamBranch),
-  new IconBatchCli(),
+  new GitRepository(config.repositoryPath, config.temporaryRoot, {
+    mode: config.executionMode,
+    upstreamRemote: config.upstreamRemote,
+    upstreamBranch: config.upstreamBranch,
+    ...(config.localTargetRef ? { localTargetRef: config.localTargetRef } : {}),
+  }),
+  new IconBatchCli(config.stage1SourcePath ? { sourceDirectory: config.stage1SourcePath } : {}),
   config.maxUploadBytes,
   catalogOptionsFromConfig(config),
+  config.targetRepository,
 );
 database.recoverInterruptedValidations();
 database.recoverInterruptedJobs();

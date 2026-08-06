@@ -21,7 +21,7 @@ const validSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><p
 
 const fakeIconBatchScript = String.raw`
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+  import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const [command, inputPath, ...rest] = process.argv.slice(2);
@@ -30,7 +30,6 @@ const repo = repoFlag >= 0 ? rest[repoFlag + 1] : process.cwd();
 const head = () => execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 const emit = (value, exitCode = 0) => { process.stdout.write(JSON.stringify(value)); process.exitCode = exitCode; };
 if (command === 'catalog') {
-  if (process.env.PINK_ICON_BATCH_CATALOG_LOG) appendFileSync(process.env.PINK_ICON_BATCH_CATALOG_LOG, head() + '\n');
   emit({ schemaVersion: 1, baseCommit: head(), icons: [{ primaryName: 'existing', sourceName: 'existing', aliases: ['existing-alias'], codepoint: 50000, sourceFile: 'src/icons/existing.svg', metadataPresent: false }], retiredCodepoints: [] });
 } else if (command === 'validate') {
   const request = JSON.parse(readFileSync(inputPath, 'utf8'));
@@ -94,8 +93,6 @@ export interface TestEnvironment {
   database: BatchDatabase;
   batches: BatchService;
   validSvg: string;
-  upstreamPath: string;
-  catalogLogPath: string;
   registryRequests: { metadata: number; tarball: number };
 }
 
@@ -105,6 +102,10 @@ async function createNpmCatalogFixture(t: TestContext, root: string): Promise<{ 
   const tarballPath = join(packageRoot, 'pink-codicons.tgz');
   await mkdir(join(packageDirectory, 'src/icons'), { recursive: true });
   await mkdir(join(packageDirectory, 'src/template'), { recursive: true });
+  await writeFile(join(packageDirectory, 'package.json'), JSON.stringify({
+    name: '@pink/codicons',
+    version: '0.0.46-test.1',
+  }));
   await writeFile(join(packageDirectory, 'src/icons/existing.svg'), validSvg);
   await writeFile(join(packageDirectory, 'src/template/mapping.json'), JSON.stringify({ 50000: ['existing', 'existing-alias'] }));
   await createTar({ cwd: packageRoot, file: tarballPath, gzip: true }, ['package']);
@@ -161,7 +162,7 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
   await mkdir(join(upstream, 'src/template'), { recursive: true });
   await mkdir(join(upstream, 'scripts'), { recursive: true });
   await writeFile(join(upstream, 'src/icons/existing.svg'), validSvg);
-  await writeFile(join(upstream, 'src/template/mapping.json'), '{"50000":["existing"]}\n');
+  await writeFile(join(upstream, 'src/template/mapping.json'), '{"50000":["existing","existing-alias"]}\n');
   await writeFile(join(upstream, 'src/template/metadata.json'), '{}\n');
   await writeFile(join(upstream, 'src/template/retired-codepoints.json'), '{"schemaVersion":1,"retired":[]}\n');
   await writeFile(join(upstream, 'scripts/icon-batch.mjs'), fakeIconBatchScript);
@@ -194,8 +195,11 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     storageRoot: join(data, 'batches'),
     temporaryRoot: join(data, 'worktrees'),
     repositoryPath: checkout,
+    executionMode: 'local',
+    localTargetRef: 'main',
     upstreamRemote: 'upstream',
     upstreamBranch: 'main',
+    targetRepository: { repository: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test', branch: 'main' },
     catalogPackageName: '@pink/codicons',
     catalogTag: 'beta',
     catalogRegistryUrl: npmCatalog.registryUrl,
@@ -213,18 +217,22 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
   const batches = new BatchService(
     database,
     new BatchStorage(config.storageRoot),
-    new GitRepository(config.repositoryPath, config.temporaryRoot, config.upstreamRemote, config.upstreamBranch),
+    new GitRepository(config.repositoryPath, config.temporaryRoot, {
+      mode: config.executionMode,
+      localTargetRef: config.localTargetRef,
+      upstreamRemote: config.upstreamRemote,
+      upstreamBranch: config.upstreamBranch,
+    }),
     new IconBatchCli(),
     config.maxUploadBytes,
     catalogOptionsFromConfig(config),
+    config.targetRepository,
   );
   return {
     config,
     database,
     batches,
     validSvg,
-    upstreamPath: upstream,
-    catalogLogPath: join(root, 'catalog.log'),
     registryRequests: npmCatalog.registryRequests,
   };
 }

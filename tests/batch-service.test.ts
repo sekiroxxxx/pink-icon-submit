@@ -42,13 +42,13 @@ class BlockingIconBatchCli extends IconBatchCli {
   }
 }
 
-function createBatch(batches: BatchService): string {
-  return batches.createBatch({
+async function createBatch(batches: BatchService): Promise<string> {
+  return (await batches.createBatch({
     title: 'State test',
     description: 'State transition test',
     designUrl: 'https://design.example.invalid/state-test',
     submitter: { name: 'Designer', email: 'designer@example.invalid' },
-  }).id;
+  })).id;
 }
 
 test('validation makes the batch immutable until it completes and rejects queued revalidation', async (t) => {
@@ -61,8 +61,9 @@ test('validation makes the batch immutable until it completes and rejects queued
     iconBatch,
     environment.config.maxUploadBytes,
     catalogOptionsFromConfig(environment.config),
+    environment.config.targetRepository,
   );
-  const batchId = createBatch(batches);
+  const batchId = await createBatch(batches);
   await batches.addItem(batchId, {
     action: 'add',
     designName: 'state-test-icon',
@@ -87,7 +88,7 @@ test('validation makes the batch immutable until it completes and rejects queued
 
 test('interrupted RUNNING jobs become retryable failures on startup recovery', async (t) => {
   const environment = await createTestEnvironment(t);
-  const batchId = createBatch(environment.batches);
+  const batchId = await createBatch(environment.batches);
   await environment.batches.addItem(batchId, {
     action: 'add',
     designName: 'recovery-test-icon',
@@ -110,7 +111,7 @@ test('interrupted RUNNING jobs become retryable failures on startup recovery', a
 
 test('interrupted VALIDATING batches return to DRAFT on startup recovery', async (t) => {
   const environment = await createTestEnvironment(t);
-  const batchId = createBatch(environment.batches);
+  const batchId = await createBatch(environment.batches);
   await environment.batches.addItem(batchId, {
     action: 'add',
     designName: 'validation-recovery-icon',
@@ -132,7 +133,7 @@ test('interrupted VALIDATING batches return to DRAFT on startup recovery', async
 
 test('editing a DRAFT batch clears an obsolete validation result and acknowledgement', async (t) => {
   const environment = await createTestEnvironment(t);
-  const batchId = createBatch(environment.batches);
+  const batchId = await createBatch(environment.batches);
   await environment.batches.addItem(batchId, {
     action: 'add',
     designName: 'obsolete-validation-icon',

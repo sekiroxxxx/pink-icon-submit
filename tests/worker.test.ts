@@ -5,9 +5,9 @@ import test from 'node:test';
 import { LocalDiffWorker } from '../src/worker.js';
 import { createTestEnvironment } from './helpers.js';
 
-test('worker replans against a temporary upstream worktree and stores the allowed local diff', async (t) => {
+test('worker replans against a temporary target worktree and stores the allowed local diff', async (t) => {
   const environment = await createTestEnvironment(t);
-  const batch = environment.batches.createBatch({
+  const batch = await environment.batches.createBatch({
     title: 'Worker add',
     description: 'Worker test batch',
     designUrl: 'https://design.example.invalid/worker',
@@ -37,7 +37,7 @@ test('worker replans against a temporary upstream worktree and stores the allowe
 
 test('worker rejects an out-of-plan diff and removes its temporary worktree', async (t) => {
   const environment = await createTestEnvironment(t);
-  const batch = environment.batches.createBatch({
+  const batch = await environment.batches.createBatch({
     title: 'Unsafe worker add',
     description: 'Worker allowlist test',
     designUrl: 'https://design.example.invalid/unsafe-worker',

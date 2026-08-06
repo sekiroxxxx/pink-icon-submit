@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
+import { AppError } from './errors.js';
 import type { StoredBatch, StoredItem } from './types.js';
 
 export class BatchStorage {
@@ -15,11 +16,16 @@ export class BatchStorage {
   }
 
   async writeRequest(batch: StoredBatch, items: StoredItem[]): Promise<string> {
+    if (!batch.catalogBaseline || !batch.targetRepository) {
+      throw new AppError('BATCH_PROTOCOL_CONTEXT_MISSING', `Batch ${batch.id} predates the Stage 1 v2 protocol and must be recreated.`, 409);
+    }
     const requestPath = this.resolveBatchPath(batch.id, 'request.json');
     await mkdir(resolve(requestPath, '..'), { recursive: true });
     const request = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       batchId: batch.id,
+      catalogBaseline: batch.catalogBaseline,
+      targetRepository: batch.targetRepository,
       title: batch.title,
       description: batch.description,
       designUrl: batch.designUrl,

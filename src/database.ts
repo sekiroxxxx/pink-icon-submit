@@ -6,12 +6,14 @@ import { AppError } from './errors.js';
 import type {
   BatchDetails,
   BatchState,
+  CatalogBaseline,
   CreateBatchInput,
   CreateItemInput,
   JobState,
   StoredBatch,
   StoredItem,
   StoredJob,
+  TargetRepository,
 } from './types.js';
 
 interface BatchRow {
@@ -21,6 +23,8 @@ interface BatchRow {
   design_url: string;
   submitter_name: string;
   submitter_email: string;
+  catalog_baseline_json: string | null;
+  target_repository_json: string | null;
   state: BatchState;
   validation_json: string | null;
   warning_ack_request_sha256: string | null;
@@ -60,6 +64,45 @@ function parseJson(value: string | null): unknown | null {
   return value === null ? null : JSON.parse(value);
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function storedCatalogBaseline(value: string | null): CatalogBaseline | null {
+  const parsed = parseJson(value);
+  if (parsed === null) {
+    return null;
+  }
+  if (!isObject(parsed)
+    || typeof parsed.packageName !== 'string'
+    || typeof parsed.requestedTag !== 'string'
+    || typeof parsed.version !== 'string'
+    || typeof parsed.integrity !== 'string'
+    || typeof parsed.sourceRepository !== 'string'
+    || typeof parsed.sourceCommit !== 'string') {
+    throw new Error('Stored catalog baseline is invalid.');
+  }
+  return {
+    packageName: parsed.packageName,
+    requestedTag: parsed.requestedTag,
+    version: parsed.version,
+    integrity: parsed.integrity,
+    sourceRepository: parsed.sourceRepository,
+    sourceCommit: parsed.sourceCommit,
+  };
+}
+
+function storedTargetRepository(value: string | null): TargetRepository | null {
+  const parsed = parseJson(value);
+  if (parsed === null) {
+    return null;
+  }
+  if (!isObject(parsed) || typeof parsed.repository !== 'string' || parsed.branch !== 'main') {
+    throw new Error('Stored target repository is invalid.');
+  }
+  return { repository: parsed.repository, branch: 'main' };
+}
+
 function toBatch(row: BatchRow): StoredBatch {
   const validation = parseJson(row.validation_json);
   const requestSha256 = validationRequestSha256(validation);
@@ -69,6 +112,8 @@ function toBatch(row: BatchRow): StoredBatch {
     description: row.description,
     designUrl: row.design_url,
     submitter: { name: row.submitter_name, email: row.submitter_email },
+    catalogBaseline: storedCatalogBaseline(row.catalog_baseline_json),
+    targetRepository: storedTargetRepository(row.target_repository_json),
     state: row.state,
     validation,
     warningsAcknowledged: requestSha256 !== null && row.warning_ack_request_sha256 === requestSha256,
@@ -79,10 +124,6 @@ function toBatch(row: BatchRow): StoredBatch {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function validationRequestSha256(validation: unknown): string | null {
@@ -138,13 +179,24 @@ export class BatchDatabase {
     this.db.close();
   }
 
-  createBatch(id: string, input: CreateBatchInput): StoredBatch {
+  createBatch(id: string, input: CreateBatchInput, catalogBaseline: CatalogBaseline, targetRepository: TargetRepository): StoredBatch {
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO batches (
-        id, title, description, design_url, submitter_name, submitter_email, state, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?)
-    `).run(id, input.title, input.description, input.designUrl, input.submitter.name, input.submitter.email, timestamp, timestamp);
+        id, title, description, design_url, submitter_name, submitter_email, catalog_baseline_json, target_repository_json, state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?)
+    `).run(
+      id,
+      input.title,
+      input.description,
+      input.designUrl,
+      input.submitter.name,
+      input.submitter.email,
+      JSON.stringify(catalogBaseline),
+      JSON.stringify(targetRepository),
+      timestamp,
+      timestamp,
+    );
     return this.getBatch(id);
   }
 
@@ -439,7 +491,9 @@ export class BatchDatabase {
   }
 
   private migrate(): void {
-    this.db.exec(`
+    this.db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)');
+    this.applyMigration(1, () => {
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS batches (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
@@ -479,10 +533,36 @@ export class BatchDatabase {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-    `);
-    const batchColumns = this.db.prepare('PRAGMA table_info(batches)').all() as Array<{ name: string }>;
-    if (!batchColumns.some((column) => column.name === 'warning_ack_request_sha256')) {
-      this.db.exec('ALTER TABLE batches ADD COLUMN warning_ack_request_sha256 TEXT');
-    }
+      `);
+      if (!this.batchColumnNames().has('warning_ack_request_sha256')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN warning_ack_request_sha256 TEXT');
+      }
+    });
+    this.applyMigration(2, () => {
+      const columns = this.batchColumnNames();
+      if (!columns.has('catalog_baseline_json')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN catalog_baseline_json TEXT');
+      }
+      if (!columns.has('target_repository_json')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN target_repository_json TEXT');
+      }
+    });
+  }
+
+  private applyMigration(version: number, apply: () => void): void {
+    const migration = this.db.transaction(() => {
+      const existing = this.db.prepare('SELECT version FROM schema_migrations WHERE version = ?').get(version) as { version: number } | undefined;
+      if (existing) {
+        return;
+      }
+      apply();
+      this.db.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(version);
+    });
+    migration();
+  }
+
+  private batchColumnNames(): Set<string> {
+    const columns = this.db.prepare('PRAGMA table_info(batches)').all() as Array<{ name: string }>;
+    return new Set(columns.map((column) => column.name));
   }
 }

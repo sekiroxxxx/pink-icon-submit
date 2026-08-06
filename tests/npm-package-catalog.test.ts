@@ -144,6 +144,19 @@ test('reuses an integrity-addressed disk snapshot without downloading the tarbal
   assert.deepEqual(requests, { metadata: 2, tarball: 1 });
 });
 
+test('keeps the SRI-verified tarball for the exact immutable catalog baseline', async (t) => {
+  const tarball = await createTarball(t, { 50000: ['existing'] }, { existing: validSvg });
+  const currentRelease = release('0.0.46-test.1', 'e'.repeat(40), tarball);
+  const requests = { metadata: 0, tarball: 0 };
+  const catalog = new NpmPackageCatalog(options(await cacheRoot(t)), registryFetch(() => currentRelease, requests));
+
+  const snapshot = await catalog.latest();
+  const cachedPath = await catalog.cachedTarballPath(snapshot.baseline);
+
+  assert.deepEqual(await readFile(cachedPath), tarball);
+  assert.deepEqual(requests, { metadata: 1, tarball: 1 });
+});
+
 test('refreshes beta when the tag resolves to a new immutable package version', async (t) => {
   const firstTarball = await createTarball(t, { 50000: ['existing'] }, { existing: validSvg });
   const secondTarball = await createTarball(t, { 50001: ['pink-new'] }, { 'pink-new': validSvg });

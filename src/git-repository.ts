@@ -4,23 +4,38 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { AppError } from './errors.js';
+import type { ExecutionMode } from './types.js';
+
+export interface GitRepositoryOptions {
+  mode: ExecutionMode;
+  upstreamRemote?: string;
+  upstreamBranch?: string;
+  localTargetRef?: string;
+}
 
 export class GitRepository {
   constructor(
     private readonly repositoryPath: string,
     private readonly temporaryRoot: string,
-    private readonly upstreamRemote: string,
-    private readonly upstreamBranch: string,
+    private readonly options: GitRepositoryOptions,
   ) {}
 
-  async withLatestWorktree<T>(callback: (worktreePath: string) => Promise<T>): Promise<T> {
-    const upstreamCommit = await this.fetchUpstreamHead();
-    return this.withWorktreeAt(upstreamCommit, callback);
+  async withBaseWorktree<T>(callback: (worktreePath: string) => Promise<T>): Promise<T> {
+    return this.withWorktreeAt(await this.resolveBaseCommit(), callback);
   }
 
-  async fetchUpstreamHead(): Promise<string> {
-    await this.git(['-C', this.repositoryPath, 'fetch', this.upstreamRemote]);
-    return this.git(['-C', this.repositoryPath, 'rev-parse', `${this.upstreamRemote}/${this.upstreamBranch}`]).then((output) => output.trim());
+  async resolveBaseCommit(): Promise<string> {
+    if (this.options.mode === 'local') {
+      if (!this.options.localTargetRef) {
+        throw new AppError('GIT_CONFIGURATION_INVALID', 'Local execution requires a configured local target ref.', 500);
+      }
+      return this.git(['-C', this.repositoryPath, 'rev-parse', this.options.localTargetRef]).then((output) => output.trim());
+    }
+    if (!this.options.upstreamRemote || !this.options.upstreamBranch) {
+      throw new AppError('GIT_CONFIGURATION_INVALID', 'Remote execution requires an upstream remote and branch.', 500);
+    }
+    await this.git(['-C', this.repositoryPath, 'fetch', this.options.upstreamRemote]);
+    return this.git(['-C', this.repositoryPath, 'rev-parse', `${this.options.upstreamRemote}/${this.options.upstreamBranch}`]).then((output) => output.trim());
   }
 
   async withWorktreeAt<T>(commit: string, callback: (worktreePath: string) => Promise<T>): Promise<T> {

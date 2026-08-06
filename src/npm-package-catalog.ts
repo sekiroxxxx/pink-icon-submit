@@ -278,6 +278,17 @@ async function writeJsonAtomically(path: string, value: unknown): Promise<void> 
   }
 }
 
+async function writeBufferAtomically(path: string, value: Buffer): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, value);
+    await rename(temporaryPath, path);
+  } finally {
+    await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
 export class NpmPackageCatalog {
   private snapshot: NpmCatalogSnapshot | undefined;
   private inFlight: Promise<NpmCatalogSnapshot> | undefined;
@@ -314,18 +325,26 @@ export class NpmPackageCatalog {
     }
   }
 
+  async cachedTarballPath(baseline: CatalogBaseline): Promise<string> {
+    const tarball = await this.readCachedTarball(baseline);
+    if (!tarball) {
+      throw new AppError('CATALOG_TARBALL_CACHE_MISSING', `The cached npm catalog tarball for ${baseline.packageName}@${baseline.version} is unavailable. Create a new batch after refreshing the catalog.`, 409);
+    }
+    return this.tarballPath(baseline.integrity);
+  }
+
   private async loadLatest(): Promise<NpmCatalogSnapshot> {
     const resolved = await this.resolvePackage();
     if (this.snapshot && sameBaseline(this.snapshot.baseline, resolved.baseline)) {
+      await this.ensureCachedTarball(resolved);
       return this.snapshot;
     }
     const cached = await this.readSnapshot(resolved.baseline);
     if (cached) {
+      await this.ensureCachedTarball(resolved);
       return cached;
     }
-    const response = await this.fetchCatalogTarball(resolved.tarballUrl);
-    const tarball = Buffer.from(await response.arrayBuffer());
-    verifyIntegrity(tarball, resolved.baseline.integrity);
+    const tarball = await this.ensureCachedTarball(resolved);
     const entries = await readTarballEntries(tarball);
     let mapping: unknown;
     try {
@@ -339,6 +358,18 @@ export class NpmPackageCatalog {
     };
     await this.writeSnapshot(snapshot);
     return snapshot;
+  }
+
+  private async ensureCachedTarball(resolved: ResolvedPackage): Promise<Buffer> {
+    const cached = await this.readCachedTarball(resolved.baseline);
+    if (cached) {
+      return cached;
+    }
+    const response = await this.fetchCatalogTarball(resolved.tarballUrl);
+    const tarball = Buffer.from(await response.arrayBuffer());
+    verifyIntegrity(tarball, resolved.baseline.integrity);
+    await writeBufferAtomically(this.tarballPath(resolved.baseline.integrity), tarball);
+    return tarball;
   }
 
   private async resolvePackage(): Promise<ResolvedPackage> {
@@ -438,6 +469,16 @@ export class NpmPackageCatalog {
     }
   }
 
+  private async readCachedTarball(baseline: CatalogBaseline): Promise<Buffer | undefined> {
+    try {
+      const tarball = await readFile(this.tarballPath(baseline.integrity));
+      verifyIntegrity(tarball, baseline.integrity);
+      return tarball;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async writeSnapshot(snapshot: NpmCatalogSnapshot): Promise<void> {
     await writeJsonAtomically(this.snapshotPath(snapshot.baseline.integrity), {
       schemaVersion: cacheSchemaVersion,
@@ -489,5 +530,9 @@ export class NpmPackageCatalog {
 
   private snapshotPath(integrity: string): string {
     return join(this.options.cacheRoot, 'snapshots', cacheKey(integrity), 'catalog.json');
+  }
+
+  private tarballPath(integrity: string): string {
+    return join(this.options.cacheRoot, 'tarballs', `${cacheKey(integrity)}.tgz`);
   }
 }
