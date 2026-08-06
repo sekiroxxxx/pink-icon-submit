@@ -463,13 +463,63 @@ export class BatchDatabase {
     `).run(JSON.stringify(plan), baseCommit, JSON.stringify(localDiff), timestamp, batchId);
   }
 
+  recordCommitPrepared(
+    batchId: string,
+    plan: unknown,
+    baseCommit: string,
+    localDiff: unknown,
+    branch: string,
+    commitSha: string,
+  ): void {
+    const record = this.db.transaction(() => {
+      const job = this.db.prepare('SELECT state FROM jobs WHERE batch_id = ?').get(batchId) as Pick<JobRow, 'state'> | undefined;
+      if (!job || job.state !== 'RUNNING') {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} is not running a delivery job.`, 409);
+      }
+      const result = this.db.prepare(`
+        UPDATE batches
+        SET state = 'COMMIT_PREPARED', plan_json = ?, base_commit = ?, local_diff_json = ?,
+            delivery_checkpoint = 'COMMIT_PREPARED', delivery_branch = ?, delivery_commit_sha = ?,
+            error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ?
+      `).run(JSON.stringify(plan), baseCommit, JSON.stringify(localDiff), branch, commitSha, now(), batchId);
+      if (result.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} disappeared before its commit checkpoint was saved.`, 409);
+      }
+    });
+    record();
+  }
+
+  recordBranchPushed(batchId: string): void {
+    const result = this.db.prepare(`
+      UPDATE batches
+      SET state = 'BRANCH_PUSHED', delivery_checkpoint = 'BRANCH_PUSHED',
+          error_code = NULL, error_message = NULL, updated_at = ?
+      WHERE id = ? AND delivery_checkpoint = 'COMMIT_PREPARED'
+    `).run(now(), batchId);
+    if (result.changes !== 1) {
+      throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} cannot record a pushed branch from its current checkpoint.`, 409);
+    }
+  }
+
+  completeBranchPushJob(batchId: string): void {
+    const result = this.db.prepare(`
+      UPDATE jobs SET state = 'COMPLETED', error_code = NULL, error_message = NULL, updated_at = ?
+      WHERE batch_id = ? AND state = 'RUNNING'
+    `).run(now(), batchId);
+    if (result.changes !== 1) {
+      throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} delivery job cannot be completed.`, 409);
+    }
+  }
+
   failJob(batchId: string, code: string, message: string): void {
     const timestamp = now();
     this.db.prepare(`
       UPDATE jobs SET state = 'FAILED', error_code = ?, error_message = ?, updated_at = ? WHERE batch_id = ?
     `).run(code, message, timestamp, batchId);
     this.db.prepare(`
-      UPDATE batches SET state = 'FAILED', error_code = ?, error_message = ?, updated_at = ? WHERE id = ?
+      UPDATE batches SET state = 'FAILED', error_code = ?, error_message = ?, updated_at = ?
+      WHERE id = ? AND state <> 'PR_CREATED'
     `).run(code, message, timestamp, batchId);
   }
 

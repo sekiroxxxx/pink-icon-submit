@@ -8,6 +8,7 @@ import { BatchStorage } from './storage.js';
 import { LocalDiffWorker } from './worker.js';
 import { GitHubApiClient } from './github-client.js';
 import { RemoteTopologyPreflight } from './remote-preflight.js';
+import { RemoteBranchWorker } from './remote-branch-worker.js';
 
 const config = configFromEnv();
 const repository = new GitRepository(config.repositoryPath, config.temporaryRoot, {
@@ -44,7 +45,17 @@ const batches = new BatchService(
 );
 database.recoverInterruptedValidations();
 database.recoverInterruptedJobs();
-const worker = new LocalDiffWorker(batches);
+const worker = config.remoteDelivery
+  ? new RemoteBranchWorker(batches, {
+    pushRemote: config.remoteDelivery.pushRemote,
+    pushBranchPrefix: config.remoteDelivery.pushBranchPrefix,
+    committer: config.remoteDelivery.committer,
+    authentication: {
+      username: config.remoteDelivery.pushRepository.split('/')[0],
+      token: config.remoteDelivery.githubToken,
+    },
+  })
+  : new LocalDiffWorker(batches);
 const app = await buildApp({ batches });
 
 let workerRunning = false;
