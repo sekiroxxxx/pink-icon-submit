@@ -148,7 +148,6 @@ export const api = {
   deleteItem: (batchId: string, itemId: string) => request<void>(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}`, { method: 'DELETE' }),
   validateBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/validate`, { method: 'POST' }),
   submitBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/submit`, { method: 'POST' }),
-  acknowledgeWarnings: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/warnings/acknowledge`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
 };

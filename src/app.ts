@@ -177,11 +177,6 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return dependencies.batches.submit(batchId);
   });
 
-  app.post('/api/batches/:batchId/warnings/acknowledge', async (request) => {
-    const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.acknowledgeWarnings(batchId);
-  });
-
   app.get('/api/batches/:batchId', async (request) => {
     const { batchId } = request.params as { batchId: string };
     return dependencies.batches.getBatch(batchId);

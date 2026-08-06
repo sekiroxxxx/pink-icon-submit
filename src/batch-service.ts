@@ -61,10 +61,6 @@ function validationIsValid(value: unknown): boolean {
   return isObject(value) && value.valid === true;
 }
 
-function validationHasWarnings(value: unknown): boolean {
-  return isObject(value) && Array.isArray(value.warnings) && value.warnings.length > 0;
-}
-
 function baseCommitFrom(value: unknown): string | null {
   return isObject(value) && typeof value.baseCommit === 'string' ? value.baseCommit : null;
 }
@@ -197,9 +193,6 @@ export class BatchService {
     if (!['READY', 'FAILED'].includes(batch.state)) {
       throw new AppError('BATCH_NOT_SUBMITTABLE', `Batch ${batchId} is ${batch.state}.`, 409);
     }
-    if (validationHasWarnings(batch.validation) && !batch.warningsAcknowledged) {
-      throw new AppError('BATCH_WARNINGS_UNACKNOWLEDGED', 'Acknowledge all validation warnings before submission.', 409);
-    }
     this.database.queueJob(batchId);
     return this.database.getDetails(batchId);
   }
@@ -212,19 +205,11 @@ export class BatchService {
     if (!validationIsValid(batch.validation)) {
       throw new AppError('BATCH_NOT_READY', 'The batch requires a successful validation before retry.', 409);
     }
-    if (validationHasWarnings(batch.validation) && !batch.warningsAcknowledged) {
-      throw new AppError('BATCH_WARNINGS_UNACKNOWLEDGED', 'Acknowledge all validation warnings before retrying.', 409);
-    }
     this.database.queueJob(batchId);
     return this.database.getDetails(batchId);
   }
 
   getBatch(batchId: string): BatchDetails {
-    return this.database.getDetails(batchId);
-  }
-
-  acknowledgeWarnings(batchId: string): BatchDetails {
-    this.database.acknowledgeWarnings(batchId);
     return this.database.getDetails(batchId);
   }
 

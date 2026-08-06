@@ -271,6 +271,7 @@ function CatalogBrowser({
   onGroupChange,
   onPageChange,
   onSelect,
+  onClose,
 }: {
   catalog?: Awaited<ReturnType<typeof api.getCatalogPage>>;
   loading: boolean;
@@ -285,6 +286,7 @@ function CatalogBrowser({
   onGroupChange: (value: CatalogGroup) => void;
   onPageChange: (page: number) => void;
   onSelect: (icon: CatalogPageIcon) => void;
+  onClose: () => void;
 }) {
   const totalPages = catalog ? Math.max(1, Math.ceil(catalog.total / catalog.pageSize)) : 1;
   const groups: Array<{ value: CatalogGroup; label: string }> = [
@@ -295,15 +297,16 @@ function CatalogBrowser({
   ];
 
   return (
-    <section className="catalog-browser" aria-labelledby="catalog-title">
+    <div className="catalog-overlay" role="presentation">
+      <section className="catalog-browser" role="dialog" aria-modal="true" aria-labelledby="catalog-title">
       <div className="catalog-heading">
         <div>
-          <p className="eyebrow">从当前图标仓库选择</p>
+          <p className="eyebrow">选择现有图标</p>
           <h3 id="catalog-title">图标目录</h3>
         </div>
-        <span>{catalog ? `${catalog.total} 个结果` : '加载中…'}</span>
+        <div><span>{catalog ? `${catalog.total} 个结果` : '加载中…'}</span><button type="button" onClick={onClose} aria-label="关闭图标目录">×</button></div>
       </div>
-      <p className="catalog-copy">{selectionCopy} 名称与 alias 都能搜索。点击选择，或把图标拖到下方目标区域。</p>
+      <p className="catalog-copy">{selectionCopy} 名称与 alias 都能搜索。</p>
       <label className="sr-only" htmlFor="catalog-search">搜索名称或别名</label>
       <input id="catalog-search" type="search" value={query} disabled={disabled} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索名称或别名，例如 pink、preview、logo" />
       <div className="filter-row" aria-label="图标分类">
@@ -321,16 +324,13 @@ function CatalogBrowser({
               key={icon.primaryName}
               className={`catalog-card ${selected?.primaryName === icon.primaryName ? 'selected' : ''} ${unavailable ? 'used' : ''}`}
               type="button"
-              draggable={!disabled && !unavailable}
               disabled={disabled || unavailable}
               onClick={() => onSelect(icon)}
-              onDragStart={(event) => event.dataTransfer.setData('application/x-pink-icon', icon.primaryName)}
               aria-label={unavailable ? `${icon.primaryName} ${targetUseLabel(targetUse)}` : `选择 ${icon.primaryName}`}
               title={unavailable ? `${icon.primaryName}${targetUseLabel(targetUse)}，不能在同一批次重复修改。` : undefined}
             >
               <img src={svgPreviewUrl(icon.svg)} alt="" />
               <strong>{icon.primaryName}</strong>
-              <span>{targetUse ? targetUseLabel(targetUse) : icon.aliases.length ? icon.aliases.join(' · ') : icon.group}</span>
             </button>
           );
         })}
@@ -342,32 +342,25 @@ function CatalogBrowser({
           <button type="button" disabled={disabled || catalog.page === totalPages} onClick={() => onPageChange(catalog.page + 1)}>下一页</button>
         </div>
       )}
-    </section>
+      </section>
+    </div>
   );
 }
 
-function TargetZone({ action, target, error, disabled, onDrop, onClear }: { action: 'replace' | 'delete'; target?: CatalogPageIcon; error?: string; disabled: boolean; onDrop: (name: string) => void; onClear: () => void }) {
+function TargetZone({ action, target, error, disabled, onOpenCatalog, onClear }: { action: 'replace' | 'delete'; target?: CatalogPageIcon; error?: string; disabled: boolean; onOpenCatalog: () => void; onClear: () => void }) {
   const label = action === 'replace' ? '需要替换的图标' : '需要删除的图标';
   return (
     <div className="form-field">
       <span className="field-label">{label}<RequiredMark /></span>
-      <div
-        className={`target-zone ${target ? 'has-target' : ''}`}
-        onDragOver={(event) => { if (!disabled) event.preventDefault(); }}
-        onDrop={(event) => {
-          event.preventDefault();
-          const name = event.dataTransfer.getData('application/x-pink-icon');
-          if (name) onDrop(name);
-        }}
-      >
+      <div className={`target-zone ${target ? 'has-target' : ''}`}>
         {target ? (
           <div className="target-card">
             <img src={svgPreviewUrl(target.svg)} alt={`${target.primaryName} 当前图标`} />
             <span><strong>{target.primaryName}</strong><small>{action === 'replace' ? '待替换图标' : '待删除图标'} · {target.aliases.join(' · ') || target.group}</small></span>
-            <button type="button" disabled={disabled} onClick={onClear}>重新选择</button>
+            <button type="button" disabled={disabled} onClick={() => { onClear(); onOpenCatalog(); }}>更换图标</button>
           </div>
         ) : (
-          <span><strong>从上方图标目录拖到这里</strong><small>或点击任意图标卡片进行选择</small></span>
+          <div className="target-empty"><strong>尚未选择图标</strong><button className="button secondary" type="button" disabled={disabled} onClick={onOpenCatalog}>选择图标</button></div>
         )}
       </div>
       <FieldError message={error} />
@@ -418,7 +411,7 @@ function SvgQueue({ pending, activeSvgId, disabled, error, onQueue, onActivate, 
           </div>
         </div>
       )}
-      <p className="field-hint">每个 SVG 会保留独立预览。这里只做浏览器可见的文件、XML 和 viewBox 快速检查；颜色、字体轮廓和仓库兼容性仍由后续 Stage 1 校验。</p>
+      <p className="field-hint">每个 SVG 都会显示独立预览，可一次加入多个图标变更。</p>
       <FieldError message={error} />
     </div>
   );
@@ -470,7 +463,7 @@ function ReviewDrawer({
     <div className="review-overlay" role="presentation">
       <section className="review-drawer" role="dialog" aria-modal="true" aria-labelledby="review-title">
         <div className="drawer-heading"><div><p className="eyebrow">提交前确认</p><h2 id="review-title">让开发准确理解这次设计</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div>
-        <p className="review-note">提交人会自动使用 <strong>{profile.name}</strong>（{profile.email}）。这里不会展示 codepoint 或 mapping；它们由图标仓库规则生成并由开发审核。</p>
+        <p className="review-note">提交人会自动使用 <strong>{profile.name}</strong>（{profile.email}）。校验结果和后续开发审核会一并记录本次设计变更。</p>
         <div className="form-field"><label htmlFor="batch-title">本次变更标题<RequiredMark /></label><input id="batch-title" maxLength={limits.batchTitle} value={form.title} onChange={(event) => onChange({ title: event.target.value })} placeholder="例如：模型页图标视觉更新" /><FieldCounter value={form.title} maximum={limits.batchTitle} /><FieldError message={errors.title} /></div>
         <div className="form-field"><label htmlFor="batch-description">整体需求说明<RequiredMark /></label><textarea id="batch-description" maxLength={limits.batchDescription} value={form.description} onChange={(event) => onChange({ description: event.target.value })} placeholder="说明设计变更的背景、目的和影响范围。" /><FieldCounter value={form.description} maximum={limits.batchDescription} /><FieldError message={errors.description} /></div>
         <div className="form-field"><label htmlFor="design-url">设计稿链接<RequiredMark /></label><input id="design-url" type="url" value={form.designUrl} onChange={(event) => onChange({ designUrl: event.target.value })} placeholder="https://figma.com/..." /><FieldError message={errors.designUrl} /></div>
@@ -496,7 +489,6 @@ export function App() {
   const [replaceDescription, setReplaceDescription] = useState('');
   const [deleteReason, setDeleteReason] = useState('');
   const [replacement, setReplacement] = useState<CatalogPageIcon>();
-  const [deleteImpactAcknowledged, setDeleteImpactAcknowledged] = useState(false);
   const [changeErrors, setChangeErrors] = useState<FieldErrors>({});
   const [catalogQuery, setCatalogQuery] = useState('');
   const [catalogGroup, setCatalogGroup] = useState<CatalogGroup>('all');
@@ -505,6 +497,7 @@ export function App() {
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState<string>();
   const [catalogSelection, setCatalogSelection] = useState<'target' | 'replacement'>('target');
+  const [catalogOpen, setCatalogOpen] = useState(false);
   const [namePreview, setNamePreview] = useState<NamePreview>();
   const [namePreviewPending, setNamePreviewPending] = useState(false);
   const [namePreviewError, setNamePreviewError] = useState<string>();
@@ -518,7 +511,7 @@ export function App() {
   const liveSvgDrafts = useRef(new Map<string, SvgDraft>());
 
   const editable = !batch || batch.state === 'DRAFT';
-  const needsCatalog = editable && (action === 'replace' || action === 'delete');
+  const needsCatalog = catalogOpen && editable && (action === 'replace' || action === 'delete');
   const activeSvg = useMemo(() => pendingSvgs.find((svg) => svg.id === activeSvgId), [activeSvgId, pendingSvgs]);
   const usedTargets = useMemo(() => {
     const result = new Map<string, TargetUse>();
@@ -593,8 +586,8 @@ export function App() {
     setAction(nextAction);
     setTarget(undefined);
     setReplacement(undefined);
-    setDeleteImpactAcknowledged(false);
     setCatalogSelection('target');
+    setCatalogOpen(false);
     setChangeErrors({});
   };
 
@@ -656,7 +649,7 @@ export function App() {
     if (replacement?.primaryName === icon.primaryName) {
       setReplacement(undefined);
     }
-    setDeleteImpactAcknowledged(false);
+    setCatalogOpen(false);
     setChangeErrors((current) => ({ ...current, target: '' }));
   };
 
@@ -668,20 +661,13 @@ export function App() {
     }
     setReplacement(icon);
     setCatalogSelection('target');
+    setCatalogOpen(false);
     setChangeErrors((current) => ({ ...current, replacement: '' }));
-  };
-
-  const resolveDroppedTarget = (name: string) => {
-    const icon = catalog?.icons.find((candidate) => candidate.primaryName === name);
-    if (icon) {
-      if (catalogSelection === 'replacement') selectReplacement(icon);
-      else selectTarget(icon);
-    }
   };
 
   const clearStaleValidation = (): boolean => {
     if (!batch?.validation) return false;
-    setBatch((current) => current ? { ...current, validation: null, warningsAcknowledged: false } : current);
+    setBatch((current) => current ? { ...current, validation: null } : current);
     return true;
   };
 
@@ -707,7 +693,6 @@ export function App() {
       if (!target) errors.target = '请选择一个需要删除的现有图标。';
       if (!deleteReason.trim()) errors.reason = '请填写删除原因。';
       else if (fieldLengthIssue(deleteReason, '删除原因', limits.itemText)) errors.reason = fieldLengthIssue(deleteReason, '删除原因', limits.itemText)!;
-      if (!deleteImpactAcknowledged) errors.deleteImpact = '请确认已考虑删除对现有调用方的影响。';
       if (replacement && replacementUnavailableTargets.has(replacement.primaryName)) errors.replacement = '替代图标不能是正在删除的图标。';
     }
     if (target && (action === 'replace' || action === 'delete')) {
@@ -728,7 +713,7 @@ export function App() {
     const stale = clearStaleValidation();
     if (activeSvg) removePendingSvg(activeSvg.id, true);
     setTarget(undefined);
-    setAddName(''); setAddDescription(''); setReplaceDescription(''); setDeleteReason(''); setReplacement(undefined); setDeleteImpactAcknowledged(false);
+    setAddName(''); setAddDescription(''); setReplaceDescription(''); setDeleteReason(''); setReplacement(undefined);
     setChangeErrors({});
     setNotice(stale ? '变更已修改，需要重新校验。' : '已加入本次变更。其余 SVG 会继续保留在待处理队列。');
   };
@@ -813,19 +798,6 @@ export function App() {
     }
   };
 
-  const acknowledgeWarnings = async () => {
-    if (!batch) return;
-    setBusy(true);
-    try {
-      setBatch(await api.acknowledgeWarnings(batch.id));
-      setNotice('已确认本次校验中的全部提醒。');
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : '无法确认校验提醒。');
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const retry = async () => {
     if (!batch) return;
     setBusy(true);
@@ -851,9 +823,7 @@ export function App() {
         {profile && <button className="profile-button" type="button" onClick={() => setIdentityOpen(true)} aria-label="修改设计师身份"><span className="avatar">{profile.name.slice(0, 1)}</span><span><strong>{profile.name}</strong><small>{profile.email}</small></span></button>}
       </header>
       <main className="page-shell">
-        <header className="page-header"><h1>先完成设计，再交给代码</h1><p>在同一个工作台里选择现有图标、拖入新 SVG，并汇总成一次清晰的设计变更。图标命名、codepoint 与仓库规则由后续校验处理。</p></header>
-        <p className="required-legend"><RequiredMark /> 为提交前必须补全的信息</p>
-        <nav className="steps" aria-label="提交流程"><span className="done">✓ 设计师身份</span><span className="active">2 编辑图标变更</span><span>3 确认并校验</span></nav>
+        <header className="page-header"><h1>完成设计，交给开发</h1><p>选择现有图标或拖入新的 SVG，把本次设计变更一次提交给开发审核。</p></header>
 
         {notice && <p className="notice">{notice}</p>}
         {batch && <p className={`state-notice state-${batch.state.toLowerCase()}`}>批次状态：<strong>{stateLabel[batch.state]}</strong></p>}
@@ -861,10 +831,12 @@ export function App() {
         <section className="composer-card" aria-labelledby="composer-title">
           <p className="eyebrow">正在编辑一项变更</p>
           <h2 id="composer-title">{({ add: '新增一个图标', replace: '替换已有图标', delete: '删除已有图标' })[action]}</h2>
-          <p className="composer-copy">{action === 'add' ? '拖入一个或多个 SVG。每个 SVG 会显示预览，并可依次加入新增队列。' : action === 'replace' ? '从下方目录选择要替换的旧图标，再从待处理 SVG 中选择对应的新图标。可重复完成多项替换。' : '从下方目录选择要删除的图标，并说明为什么可以安全移除。删除不需要 SVG。'}</p>
+          <p className="composer-copy">{action === 'add' ? '拖入一个或多个 SVG。每个 SVG 会显示预览，并可依次加入新增队列。' : action === 'replace' ? '选择要替换的旧图标，再从待处理 SVG 中选择对应的新图标。可重复完成多项替换。' : '选择要删除的图标并说明删除原因。兼容性影响会由开发审核处理。'}</p>
           <div className="action-tabs" role="tablist" aria-label="变更类型">
             {(['add', 'replace', 'delete'] as ItemAction[]).map((option) => <button key={option} className={action === option ? 'active' : ''} type="button" role="tab" aria-selected={action === option} disabled={!editable || busy} onClick={() => selectAction(option)}>{({ add: '新增图标', replace: '替换图标', delete: '删除图标' })[option]}</button>)}
           </div>
+
+          {action !== 'add' && <TargetZone action={action} target={target} error={changeErrors.target} disabled={!editable || busy} onOpenCatalog={() => { setCatalogSelection('target'); setCatalogOpen(true); }} onClear={() => { setTarget(undefined); setReplacement(undefined); setCatalogSelection('target'); }} />}
 
           {needsCatalog && <CatalogBrowser
             catalog={catalog}
@@ -880,17 +852,15 @@ export function App() {
             onGroupChange={(value) => { setCatalogGroup(value); setCatalogPage(1); }}
             onPageChange={setCatalogPage}
             onSelect={(icon) => { if (catalogSelection === 'replacement') selectReplacement(icon); else selectTarget(icon); }}
+            onClose={() => setCatalogOpen(false)}
           />}
-
-          {action !== 'add' && <TargetZone action={action} target={target} error={changeErrors.target} disabled={!editable || busy} onDrop={resolveDroppedTarget} onClear={() => { setTarget(undefined); setReplacement(undefined); setDeleteImpactAcknowledged(false); setCatalogSelection('target'); }} />}
 
           {action === 'add' && <div className="form-field"><label htmlFor="add-name">图标建议名称<RequiredMark /></label><input id="add-name" maxLength={limits.name} value={addName} disabled={!editable || busy} onChange={(event) => setAddName(event.target.value)} placeholder="例如：pink-model-preview" /><FieldCounter value={addName} maximum={limits.name} />{namePreviewPending && <p className="field-hint">正在按图标仓库规则生成最终名称…</p>}{namePreview && <p className={`name-preview ${namePreview.collision ? 'collision' : ''}`}>建议名称：<strong>{namePreview.input}</strong> → 最终名称：<strong>{namePreview.normalizedName || '无效'}</strong>{namePreview.collision && <span> 已与 {namePreview.collision.primaryName}（{namePreview.collision.aliases.join('、')}）冲突。</span>}</p>}{namePreviewError && <p className="field-error">名称预览失败：{namePreviewError}</p>}<FieldError message={changeErrors.designName} /></div>}
           {action === 'add' && <div className="form-field"><label htmlFor="add-description">用途说明<RequiredMark /></label><textarea id="add-description" maxLength={limits.itemText} value={addDescription} disabled={!editable || busy} onChange={(event) => setAddDescription(event.target.value)} placeholder="说明图标表达的对象或操作。" /><FieldCounter value={addDescription} maximum={limits.itemText} /><FieldError message={changeErrors.description} /></div>}
           {action === 'replace' && <div className="form-field"><label htmlFor="replace-description">本次替换说明 <em>（可选）</em></label><textarea id="replace-description" maxLength={limits.itemText} value={replaceDescription} disabled={!editable || busy} onChange={(event) => setReplaceDescription(event.target.value)} placeholder="例如：与新的模型资产视觉语言保持一致。" /><FieldCounter value={replaceDescription} maximum={limits.itemText} /><FieldError message={changeErrors.description} /></div>}
           {action === 'delete' && <>
             <div className="form-field"><label htmlFor="delete-reason">删除原因<RequiredMark /></label><textarea id="delete-reason" maxLength={limits.itemText} value={deleteReason} disabled={!editable || busy} onChange={(event) => setDeleteReason(event.target.value)} placeholder="例如：图标已废弃且无替代用途。" /><FieldCounter value={deleteReason} maximum={limits.itemText} /><FieldError message={changeErrors.reason} /></div>
-            <div className="form-field"><span className="field-label">建议使用的替代图标 <em>（可选）</em></span>{replacement ? <div className="replacement-choice"><img src={svgPreviewUrl(replacement.svg)} alt={`${replacement.primaryName} 替代图标`} /><span><strong>{replacement.primaryName}</strong><small>现有 primary 图标</small></span><button type="button" disabled={!editable || busy} onClick={() => { setReplacement(undefined); setCatalogSelection('replacement'); }}>重新选择</button></div> : <button className="button secondary" type="button" disabled={!editable || busy || !target} onClick={() => setCatalogSelection('replacement')}>从图标目录选择替代图标</button>}<FieldError message={changeErrors.replacement} /></div>
-            <label className="confirm-check delete-impact-check"><input type="checkbox" checked={deleteImpactAcknowledged} disabled={!editable || busy} onChange={(event) => setDeleteImpactAcknowledged(event.target.checked)} /><span>我已确认删除可能影响现有调用方，并会在后续人工审核中处理兼容性。{target?.aliases.length ? ` 当前图标还包含 alias：${target.aliases.join('、')}。` : ''}</span></label><FieldError message={changeErrors.deleteImpact} />
+            <div className="form-field"><span className="field-label">建议使用的替代图标 <em>（可选）</em></span>{replacement ? <div className="replacement-choice"><img src={svgPreviewUrl(replacement.svg)} alt={`${replacement.primaryName} 替代图标`} /><span><strong>{replacement.primaryName}</strong><small>现有 primary 图标</small></span><button type="button" disabled={!editable || busy} onClick={() => { setReplacement(undefined); setCatalogSelection('replacement'); setCatalogOpen(true); }}>重新选择</button></div> : <button className="button secondary" type="button" disabled={!editable || busy || !target} onClick={() => { setCatalogSelection('replacement'); setCatalogOpen(true); }}>从图标目录选择替代图标</button>}<FieldError message={changeErrors.replacement} /></div>
           </>}
           {action !== 'delete' && <SvgQueue pending={pendingSvgs} activeSvgId={activeSvgId} disabled={!editable || busy} error={changeErrors.svg} onQueue={queueSvgs} onActivate={setActiveSvgId} onRemove={removePendingSvg} />}
           {action === 'replace' && target && activeSvg?.content === target.svg && <p className="inline-warning">新 SVG 与当前仓库文件内容完全一致；这次替换可能不会产生实际改动。</p>}
@@ -900,12 +870,10 @@ export function App() {
         <section className="changes-card" aria-label="本次变更"><div><h2>本次变更 {changes.length} 项</h2><p>{changes.length === 0 ? '把一项操作加入队列后，会在这里同时显示所有待改动图标。' : '确认前可移除任何一项变更。'}</p></div><div className="change-list">{changes.map((change) => <ChangeCard key={change.clientId} change={change} disabled={!editable || busy} onRemove={() => void removeChange(change)} />)}</div><div className="changes-actions"><button className="button primary" type="button" disabled={!editable || busy || changes.length === 0} onClick={() => { setReviewErrors({}); setReviewOpen(true); }}>确认本次变更</button></div></section>
 
         <DiagnosticList title="需要修正的问题" diagnostics={batch?.validation?.errors ?? []} tone="error" />
-        <DiagnosticList title="需要开发确认的提醒" diagnostics={batch?.validation?.warnings ?? []} tone="warning" />
-        {batch?.state === 'READY' && (batch.validation?.warnings.length ?? 0) > 0 && !batch.warningsAcknowledged && <section className="warning-acknowledgement"><strong>这些提醒需要人工判断。</strong><span>确认后才可以生成本地修改；任何变更或重新校验都会使本次确认失效。</span><button className="button secondary" type="button" disabled={busy} onClick={() => void acknowledgeWarnings()}>我已阅读并确认全部提醒</button></section>}
-        {batch?.state === 'READY' && (batch.validation?.warnings.length ?? 0) > 0 && batch.warningsAcknowledged && <p className="state-notice state-ready">已确认当前校验结果中的全部提醒。</p>}
+        <DiagnosticList title="开发审核提醒" diagnostics={batch?.validation?.warnings ?? []} tone="warning" />
         {batch?.error && <section className="diagnostics error"><h2>处理失败</h2><p><strong>{batch.error.code}</strong> {batch.error.message}</p></section>}
         {batch?.localDiff && <section className="result-card"><p className="eyebrow">本地修改已就绪</p><h2>等待阶段 3 创建 Draft PR</h2><p>当前阶段只生成并保存可审阅的本地 diff，不会创建 GitHub 分支或 Pull Request。</p><details><summary>查看技术详情</summary><ul>{batch.localDiff.changedFiles.map((file) => <li key={file}>{file}</li>)}</ul></details></section>}
-        <section className="post-validation-actions">{batch?.state === 'READY' && <button className="button primary" type="button" disabled={busy || ((batch.validation?.warnings.length ?? 0) > 0 && !batch.warningsAcknowledged)} onClick={() => void submit()}>生成本地修改</button>}{batch?.state === 'FAILED' && <button className="button primary" type="button" disabled={busy || ((batch.validation?.warnings.length ?? 0) > 0 && !batch.warningsAcknowledged)} onClick={() => void retry()}>重试</button>}</section>
+        <section className="post-validation-actions">{batch?.state === 'READY' && <button className="button primary" type="button" disabled={busy} onClick={() => void submit()}>生成本地修改</button>}{batch?.state === 'FAILED' && <button className="button primary" type="button" disabled={busy} onClick={() => void retry()}>重试</button>}</section>
       </main>
       {identityOpen && <IdentityDialog profile={profile} onSave={saveProfile} onClose={profile ? () => setIdentityOpen(false) : undefined} />}
       {reviewOpen && profile && <ReviewDrawer changes={changes} form={batchForm} profile={profile} errors={reviewErrors} confirmed={confirmed} busy={busy} onChange={(patch) => setBatchForm((current) => ({ ...current, ...patch }))} onConfirmedChange={setConfirmed} onClose={() => setReviewOpen(false)} onSubmit={() => void startValidation()} />}

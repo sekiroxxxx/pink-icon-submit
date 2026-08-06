@@ -224,7 +224,7 @@ test('name preview delegates normalization and catalog collision checks to icon-
   });
 });
 
-test('warning acknowledgement is persisted for exactly one validation result before submission', async (t) => {
+test('validation warnings are retained for developer review without blocking submission', async (t) => {
   const environment = await createTestEnvironment(t);
   const app = await buildApp({ batches: environment.batches });
   t.after(() => app.close());
@@ -252,16 +252,6 @@ test('warning acknowledgement is persisted for exactly one validation result bef
   assert.equal(item.statusCode, 201);
   const validated = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/validate` });
   assert.equal(validated.statusCode, 200);
-  assert.equal((validated.json() as { warningsAcknowledged: boolean }).warningsAcknowledged, false);
-
-  const blocked = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/submit` });
-  assert.equal(blocked.statusCode, 409);
-  assert.equal((blocked.json() as { error: { code: string } }).error.code, 'BATCH_WARNINGS_UNACKNOWLEDGED');
-
-  const acknowledged = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/warnings/acknowledge` });
-  assert.equal(acknowledged.statusCode, 200);
-  assert.equal((acknowledged.json() as { warningsAcknowledged: boolean }).warningsAcknowledged, true);
-
   const queued = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/submit` });
   assert.equal(queued.statusCode, 200);
   assert.equal((queued.json() as { state: string }).state, 'QUEUED');

@@ -88,7 +88,7 @@ test('first use asks for a local designer profile and stores it in this browser'
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
-test('replace requests the catalog only after its action is selected and chooses a canonical target', async () => {
+test('replace opens the catalog on demand and closes it after choosing a canonical target', async () => {
   saveProfile();
   const fetchMock = vi.fn().mockResolvedValue(jsonResponse(catalogResponse()));
   vi.stubGlobal('fetch', fetchMock);
@@ -98,10 +98,14 @@ test('replace requests the catalog only after its action is selected and chooses
 
   expect(fetchMock).not.toHaveBeenCalled();
   await user.click(screen.getByRole('tab', { name: '替换图标' }));
+  expect(fetchMock).not.toHaveBeenCalled();
+  expect(screen.queryByRole('dialog', { name: '图标目录' })).toBeNull();
+  await user.click(screen.getByRole('button', { name: '选择图标' }));
   await screen.findByText('existing');
   expect(fetchMock).toHaveBeenCalledWith('/api/catalog/page?group=all&page=1&pageSize=24', {});
   await user.click(screen.getByRole('button', { name: '选择 existing' }));
 
+  expect(screen.queryByRole('dialog', { name: '图标目录' })).toBeNull();
   expect(screen.getByRole('img', { name: 'existing 当前图标' })).toBeTruthy();
   expect(screen.getByText('待替换图标 · existing-alias')).toBeTruthy();
 });
@@ -113,15 +117,18 @@ test('a replace target becomes unavailable after it is added to the same batch',
 
   render(<App />);
   await user.click(screen.getByRole('tab', { name: '替换图标' }));
+  await user.click(screen.getByRole('button', { name: '选择图标' }));
   await screen.findByText('existing');
   await user.click(screen.getByRole('button', { name: '选择 existing' }));
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('replacement.svg'));
   await user.click(screen.getByRole('button', { name: '加入替换队列' }));
 
+  await user.click(screen.getByRole('button', { name: '选择图标' }));
+  await screen.findByText('existing');
   const usedTarget = screen.getByRole('button', { name: 'existing 已用于第 1 项替换' });
   expect((usedTarget as HTMLButtonElement).disabled).toBe(true);
-  expect(screen.getByText('已用于第 1 项替换')).toBeTruthy();
+  expect(usedTarget.getAttribute('title')).toContain('不能在同一批次重复修改');
 });
 
 test('multiple SVG files stay in the pending queue until each is paired with a change', async () => {
@@ -171,21 +178,20 @@ test('an add name collision returned by Stage 1 cannot be added to the batch', a
   expect(screen.getByText('本次变更 0 项')).toBeTruthy();
 });
 
-test('delete requires an explicit call-site impact acknowledgement before it enters the queue', async () => {
+test('delete only needs a target and design reason before it enters the queue', async () => {
   saveProfile();
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(catalogResponse())));
   const user = userEvent.setup();
   render(<App />);
   await user.click(screen.getByRole('tab', { name: '删除图标' }));
+  await user.click(screen.getByRole('button', { name: '选择图标' }));
   await screen.findByText('existing');
   await user.click(screen.getByRole('button', { name: '选择 existing' }));
   await user.type(screen.getByLabelText(/^删除原因/), '旧图标已废弃。');
   await user.click(screen.getByRole('button', { name: '加入删除队列' }));
 
-  expect(screen.getByText('请确认已考虑删除对现有调用方的影响。')).toBeTruthy();
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '加入删除队列' }));
   expect(screen.getByText('本次变更 1 项')).toBeTruthy();
+  expect(screen.queryByText(/删除可能影响现有调用方/)).toBeNull();
 });
 
 test('review drawer blocks incomplete batch details before any batch is created', async () => {
@@ -251,4 +257,51 @@ test('a confirmed change creates a batch, uploads its SVG, and starts validation
   expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/batches/ICON-TEST/items');
   expect(fetchMock.mock.calls[3]?.[0]).toBe('/api/batches/ICON-TEST/validate');
   expect(screen.getByText('校验通过，可以生成本地修改。')).toBeTruthy();
+});
+
+test('validation warnings remain visible without requiring a designer acknowledgement', async () => {
+  saveProfile();
+  const fetchMock = vi.fn((path: string) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/names/preview') {
+      return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
+    }
+    if (url.pathname === '/api/batches') {
+      return Promise.resolve(jsonResponse({ id: 'ICON-WARNING', state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, error: null }));
+    }
+    if (url.pathname === '/api/batches/ICON-WARNING/items') {
+      return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-WARNING', action: 'add', sourceFile: 'items/item-1.svg' }));
+    }
+    if (url.pathname === '/api/batches/ICON-WARNING/validate') {
+      return Promise.resolve(jsonResponse({
+        id: 'ICON-WARNING',
+        state: 'READY',
+        items: [],
+        validation: { valid: true, errors: [], warnings: [{ code: 'TEST_WARNING', message: '需要开发审核。' }] },
+        warningsAcknowledged: false,
+        localDiff: null,
+        error: null,
+      }));
+    }
+    if (url.pathname === '/api/batches/ICON-WARNING/submit') {
+      return Promise.resolve(jsonResponse({ id: 'ICON-WARNING', state: 'QUEUED', items: [], validation: { valid: true, errors: [], warnings: [{ code: 'TEST_WARNING', message: '需要开发审核。' }] }, warningsAcknowledged: false, localDiff: null, error: null }));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await addOneSvgChange(user);
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await user.type(screen.getByLabelText(/^本次变更标题/), '模型入口图标');
+  await user.type(screen.getByLabelText(/^整体需求说明/), '新增模型入口图标。');
+  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/icon');
+  await user.click(screen.getByRole('checkbox'));
+  await user.click(screen.getByRole('button', { name: '进入校验' }));
+
+  await screen.findByText('开发审核提醒');
+  expect(screen.queryByRole('button', { name: '我已阅读并确认全部提醒' })).toBeNull();
+  await user.click(screen.getByRole('button', { name: '生成本地修改' }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-WARNING/submit', { method: 'POST' }));
 });

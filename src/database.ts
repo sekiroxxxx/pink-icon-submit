@@ -130,10 +130,6 @@ function validationRequestSha256(validation: unknown): string | null {
   return isObject(validation) && typeof validation.requestSha256 === 'string' ? validation.requestSha256 : null;
 }
 
-function validationHasWarnings(validation: unknown): boolean {
-  return isObject(validation) && Array.isArray(validation.warnings) && validation.warnings.length > 0;
-}
-
 function toItem(row: ItemRow): StoredItem {
   return {
     id: row.id,
@@ -346,28 +342,6 @@ export class BatchDatabase {
       SET state = 'DRAFT', error_code = NULL, error_message = NULL, updated_at = ?
       WHERE id = ? AND state = 'VALIDATING'
     `).run(now(), batchId);
-  }
-
-  acknowledgeWarnings(batchId: string): void {
-    const acknowledge = this.db.transaction(() => {
-      const batch = this.getBatch(batchId);
-      if (batch.state !== 'READY' || !isObject(batch.validation) || batch.validation.valid !== true) {
-        throw new AppError('BATCH_NOT_READY', 'A successful READY validation is required before acknowledging warnings.', 409);
-      }
-      const requestSha256 = validationRequestSha256(batch.validation);
-      if (!requestSha256 || !validationHasWarnings(batch.validation)) {
-        throw new AppError('BATCH_WARNING_ACK_NOT_REQUIRED', 'This validation has no warnings to acknowledge.', 409);
-      }
-      const result = this.db.prepare(`
-        UPDATE batches
-        SET warning_ack_request_sha256 = ?, updated_at = ?
-        WHERE id = ? AND state = 'READY'
-      `).run(requestSha256, now(), batchId);
-      if (result.changes !== 1) {
-        throw new AppError('BATCH_WARNING_ACK_STATE_CONFLICT', `Batch ${batchId} state changed before warnings were acknowledged.`, 409);
-      }
-    });
-    acknowledge();
   }
 
   queueJob(batchId: string): StoredJob {
