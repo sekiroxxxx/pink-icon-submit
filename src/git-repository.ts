@@ -8,8 +8,8 @@ import type { ExecutionMode } from './types.js';
 
 export interface GitRepositoryOptions {
   mode: ExecutionMode;
-  upstreamRemote?: string;
-  upstreamBranch?: string;
+  targetRemote?: string;
+  targetBranch?: string;
   localTargetRef?: string;
 }
 
@@ -31,11 +31,15 @@ export class GitRepository {
       }
       return this.git(['-C', this.repositoryPath, 'rev-parse', this.options.localTargetRef]).then((output) => output.trim());
     }
-    if (!this.options.upstreamRemote || !this.options.upstreamBranch) {
-      throw new AppError('GIT_CONFIGURATION_INVALID', 'Remote execution requires an upstream remote and branch.', 500);
+    if (!this.options.targetRemote || !this.options.targetBranch) {
+      throw new AppError('GIT_CONFIGURATION_INVALID', 'Remote execution requires a target remote and branch.', 500);
     }
-    await this.git(['-C', this.repositoryPath, 'fetch', this.options.upstreamRemote]);
-    return this.git(['-C', this.repositoryPath, 'rev-parse', `${this.options.upstreamRemote}/${this.options.upstreamBranch}`]).then((output) => output.trim());
+    await this.git(['-C', this.repositoryPath, 'fetch', this.options.targetRemote]);
+    return this.git(['-C', this.repositoryPath, 'rev-parse', `${this.options.targetRemote}/${this.options.targetBranch}`]).then((output) => output.trim());
+  }
+
+  remoteUrl(remote: string): Promise<string> {
+    return this.git(['-C', this.repositoryPath, 'remote', 'get-url', remote]).then((output) => output.trim());
   }
 
   async withWorktreeAt<T>(commit: string, callback: (worktreePath: string) => Promise<T>): Promise<T> {

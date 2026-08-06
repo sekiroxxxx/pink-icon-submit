@@ -8,14 +8,16 @@ PinK 图标自动 Draft PR MVP 的独立编排服务。当前包含 Fastify、SQ
 - 设计提交页的图标目录直接读取 `@pink/codicons@beta` 的 npm tarball：只解析 `src/template/mapping.json` 和 `src/icons/*.svg`，验证 npm 的 sha512 SRI，并按 integrity 的 SHA-256 缓存解析后的不可变快照和原始 `.tgz`。不会安装该包、执行包脚本或本地构建设计目录。
 - 创建批次时会冻结 npm 的 `catalogBaseline`（包名、tag、精确版本、SRI、来源仓库和 commit）及目标仓库；后续校验、plan 和 apply 始终使用该批次对应的缓存 tarball。
 - 目录展示基于 npm 发布物；名称预览、最终校验和本地 diff 基于目标 Git ref。`local` 模式只解析本地 ref，绝不执行 `git fetch`；本地 Stage 1 源码只提供 CLI 实现，不能替代 npm catalog 基线。
-- Worker 只在临时 worktree 生成本地 diff；不 commit、push 或创建 GitHub PR。
+- Worker 只在临时 worktree 生成本地 diff；P3-A 已加入远程拓扑预检和交付检查点，但仍不 commit、push 或创建 GitHub PR。
 - 前端只负责批次表单、SVG 预览、目录选择和状态展示；不解析 mapping、不分配 codepoint、不持有 GitHub Token。
-- 批次状态依次为 `DRAFT → VALIDATING → READY → QUEUED → RUNNING → LOCAL_DIFF_READY`；验证、编辑和提交互斥。进程重启时遗留的 `VALIDATING` 批次会安全退回 `DRAFT`；遗留的 `RUNNING` job 会标记为 `FAILED/WORKER_INTERRUPTED`，可通过 retry 重新排队。
+- 本地批次状态为 `DRAFT → VALIDATING → READY → QUEUED → RUNNING → LOCAL_DIFF_READY`。远程交付预留 `COMMIT_PREPARED → BRANCH_PUSHED → PR_CREATING → PR_CREATED` 检查点；P3-A 尚不进入这些状态。进程重启时遗留的 `VALIDATING` 批次会安全退回 `DRAFT`；遗留的 `RUNNING` job 会标记为 `FAILED/WORKER_INTERRUPTED`，但未来已 `PR_CREATED` 的交接不会被降级或重试。
 
 ## 配置
 
+本地开发模式：
+
 ```text
-PINK_ICON_EXECUTION_MODE=local                              # 必填；本轮唯一支持的运行方式
+PINK_ICON_EXECUTION_MODE=local                              # 必填
 PINK_CODICONS_DIR=C:\path\to\isolated-target-clone         # 目标 Git 工作区，不是 Stage 1 源码目录
 PINK_ICON_STAGE1_SOURCE_DIR=C:\path\to\pink-codicons       # 含 Stage 1 v2 代码和 node_modules
 PINK_ICON_LOCAL_TARGET_REF=main                              # 必填；从此本地 ref 创建临时 worktree
@@ -32,6 +34,24 @@ PINK_ICON_CATALOG_SOURCE_REPOSITORY=sud-global/pink-codicons # 可选
 PINK_ICON_CATALOG_REFRESH_MS=60000                         # 可选，默认 60 秒
 ```
 
+P3 开发期远程模式（当前仅执行只读 preflight 和本地 diff，不会 push 或创建 PR）：
+
+```text
+PINK_ICON_EXECUTION_MODE=remote
+PINK_CODICONS_DIR=C:\path\to\pink-codicons-automation-test
+PINK_ICON_TARGET_REPOSITORY=sekiroxxxx/sekiroxxxx-pink-codicons-automation-test
+PINK_ICON_TARGET_BRANCH=main
+PINK_ICON_TARGET_REMOTE=upstream
+PINK_ICON_PUSH_REPOSITORY=sud-icon-bot/sekiroxxxx-pink-codicons-automation-test
+PINK_ICON_PUSH_REMOTE=origin
+PINK_ICON_PUSH_BRANCH_PREFIX=bot/
+PINK_ICON_GITHUB_TOKEN=<deployment-secret>
+PINK_ICON_GIT_COMMITTER_NAME=PinK Icon Bot
+PINK_ICON_GIT_COMMITTER_EMAIL=<approved-bot-email>
+```
+
+远程模式只允许上述 R2/R3 配对，启动时验证 target/push remote URL、R3 的直接 fork parent 和 `bot/` 前缀。Token 只用于后端 GitHub API Authorization header；不写入 remote URL、数据库、前端或错误消息。
+
 `local` 模式的 `PINK_CODICONS_DIR` 应是隔离的本地目标仓库 clone。Worker 从 `PINK_ICON_LOCAL_TARGET_REF` 创建临时 detached worktree，生成、应用和读取 diff 后删除该 worktree；不会 fetch、commit、push 或创建 PR。`PINK_ICON_STAGE1_SOURCE_DIR` 是当前 `codex/icon-automation-v2` 工作区，只用来执行 `scripts/icon-batch.mjs`；服务不会在其中安装依赖或修改文件。
 
 npm registry 暂时不可用时，服务会尝试使用本地已验证的 tag 解析记录、integrity 快照和原始 tarball；没有可验证的本地数据时，目录 API 或新批次创建会返回明确错误。迁移前创建、没有 `catalogBaseline` 与目标仓库上下文的旧批次不能用于 v2，必须重新创建。
@@ -47,9 +67,9 @@ npm ci
 
 ## 尚未接入正式环境
 
-- 不使用 R2、R3 或 R0 的远程 main，不验证 GitHub 权限，不连接机器人 fork。
-- 不 push、不创建 Draft PR，也不做 npm 发布、构建或自动合并。
-- `remote` 配置分支仅为后续迁移预留；在 Stage 1 v2 通过人工 PR 合入目标仓库 main 前，不得作为运行方式使用。
+- P3-A 不 push、不创建 Draft PR，也不做 npm 发布、构建或自动合并。
+- P3-B/P3-C 尚未实现本地 commit、安全 push、Draft PR 创建和幂等恢复；工作线 C 的真实 R2/R3 验收尚未开始。
+- R0/R1 不接入、不读取为目标、更不写入。
 - 正式迁移时，旧批次必须以当时的 npm tarball 与目标 main 重新校验、重新生成 plan，不能复用本地 diff。
 
 ## 命令

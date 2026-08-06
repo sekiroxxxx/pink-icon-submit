@@ -6,22 +6,41 @@ import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
 import { LocalDiffWorker } from './worker.js';
+import { GitHubApiClient } from './github-client.js';
+import { RemoteTopologyPreflight } from './remote-preflight.js';
 
 const config = configFromEnv();
+const repository = new GitRepository(config.repositoryPath, config.temporaryRoot, {
+  mode: config.executionMode,
+  ...(config.localTargetRef ? { localTargetRef: config.localTargetRef } : {}),
+  ...(config.remoteDelivery ? {
+    targetRemote: config.remoteDelivery.targetRemote,
+    targetBranch: config.targetRepository.branch,
+  } : {}),
+});
+if (config.remoteDelivery) {
+  await new RemoteTopologyPreflight(
+    repository,
+    new GitHubApiClient(config.remoteDelivery.githubToken),
+    config.targetRepository,
+    config.remoteDelivery,
+  ).verify();
+}
+
 const database = new BatchDatabase(config.databasePath);
 const batches = new BatchService(
   database,
   new BatchStorage(config.storageRoot),
-  new GitRepository(config.repositoryPath, config.temporaryRoot, {
-    mode: config.executionMode,
-    upstreamRemote: config.upstreamRemote,
-    upstreamBranch: config.upstreamBranch,
-    ...(config.localTargetRef ? { localTargetRef: config.localTargetRef } : {}),
-  }),
+  repository,
   new IconBatchCli(config.stage1SourcePath ? { sourceDirectory: config.stage1SourcePath } : {}),
   config.maxUploadBytes,
   catalogOptionsFromConfig(config),
   config.targetRepository,
+  {
+    executionMode: config.executionMode,
+    pushRepository: config.remoteDelivery?.pushRepository ?? null,
+    pushBranchPrefix: config.remoteDelivery?.pushBranchPrefix ?? null,
+  },
 );
 database.recoverInterruptedValidations();
 database.recoverInterruptedJobs();

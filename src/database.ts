@@ -4,12 +4,16 @@ import { dirname } from 'node:path';
 
 import { AppError } from './errors.js';
 import type {
+  BatchExecutionContext,
   BatchDetails,
   BatchState,
   CatalogBaseline,
   CreateBatchInput,
   CreateItemInput,
+  DeliveryCheckpoint,
+  ExecutionMode,
   JobState,
+  RemoteDeliveryState,
   StoredBatch,
   StoredItem,
   StoredJob,
@@ -25,6 +29,18 @@ interface BatchRow {
   submitter_email: string;
   catalog_baseline_json: string | null;
   target_repository_json: string | null;
+  execution_mode: ExecutionMode | null;
+  push_repository: string | null;
+  push_branch_prefix: string | null;
+  delivery_checkpoint: DeliveryCheckpoint;
+  delivery_branch: string | null;
+  delivery_commit_sha: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  pr_state: string | null;
+  pr_is_draft: number | null;
+  pr_created_at: string | null;
+  handoff_at: string | null;
   state: BatchState;
   validation_json: string | null;
   warning_ack_request_sha256: string | null;
@@ -103,6 +119,48 @@ function storedTargetRepository(value: string | null): TargetRepository | null {
   return { repository: parsed.repository, branch: 'main' };
 }
 
+function storedExecutionMode(value: string | null): ExecutionMode | null {
+  if (value === null) {
+    return null;
+  }
+  if (value !== 'local' && value !== 'remote') {
+    throw new Error('Stored execution mode is invalid.');
+  }
+  return value;
+}
+
+function storedDeliveryCheckpoint(value: string): DeliveryCheckpoint {
+  if (value === 'NONE' || value === 'COMMIT_PREPARED' || value === 'BRANCH_PUSHED' || value === 'PR_CREATING' || value === 'PR_CREATED') {
+    return value;
+  }
+  throw new Error('Stored delivery checkpoint is invalid.');
+}
+
+function storedRemoteDelivery(row: BatchRow): RemoteDeliveryState {
+  const hasPullRequest = row.pr_number !== null || row.pr_url !== null || row.pr_state !== null || row.pr_is_draft !== null || row.pr_created_at !== null;
+  if (hasPullRequest && (row.pr_number === null || row.pr_url === null || row.pr_state === null || row.pr_is_draft === null)) {
+    throw new Error('Stored pull request delivery state is invalid.');
+  }
+  if (row.pr_is_draft !== null && row.pr_is_draft !== 0 && row.pr_is_draft !== 1) {
+    throw new Error('Stored pull request draft state is invalid.');
+  }
+  return {
+    checkpoint: storedDeliveryCheckpoint(row.delivery_checkpoint),
+    branch: row.delivery_branch,
+    commitSha: row.delivery_commit_sha,
+    pullRequest: hasPullRequest
+      ? {
+        number: row.pr_number!,
+        url: row.pr_url!,
+        state: row.pr_state!,
+        isDraft: row.pr_is_draft === 1,
+        createdAt: row.pr_created_at,
+      }
+      : null,
+    handoffAt: row.handoff_at,
+  };
+}
+
 function toBatch(row: BatchRow): StoredBatch {
   const validation = parseJson(row.validation_json);
   const requestSha256 = validationRequestSha256(validation);
@@ -114,6 +172,10 @@ function toBatch(row: BatchRow): StoredBatch {
     submitter: { name: row.submitter_name, email: row.submitter_email },
     catalogBaseline: storedCatalogBaseline(row.catalog_baseline_json),
     targetRepository: storedTargetRepository(row.target_repository_json),
+    executionMode: storedExecutionMode(row.execution_mode),
+    pushRepository: row.push_repository,
+    pushBranchPrefix: row.push_branch_prefix,
+    delivery: storedRemoteDelivery(row),
     state: row.state,
     validation,
     warningsAcknowledged: requestSha256 !== null && row.warning_ack_request_sha256 === requestSha256,
@@ -175,12 +237,20 @@ export class BatchDatabase {
     this.db.close();
   }
 
-  createBatch(id: string, input: CreateBatchInput, catalogBaseline: CatalogBaseline, targetRepository: TargetRepository): StoredBatch {
+  createBatch(
+    id: string,
+    input: CreateBatchInput,
+    catalogBaseline: CatalogBaseline,
+    targetRepository: TargetRepository,
+    executionContext: BatchExecutionContext,
+  ): StoredBatch {
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO batches (
-        id, title, description, design_url, submitter_name, submitter_email, catalog_baseline_json, target_repository_json, state, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?)
+        id, title, description, design_url, submitter_name, submitter_email,
+        catalog_baseline_json, target_repository_json, execution_mode, push_repository, push_branch_prefix,
+        state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?)
     `).run(
       id,
       input.title,
@@ -190,6 +260,9 @@ export class BatchDatabase {
       input.submitter.email,
       JSON.stringify(catalogBaseline),
       JSON.stringify(targetRepository),
+      executionContext.executionMode,
+      executionContext.pushRepository,
+      executionContext.pushBranchPrefix,
       timestamp,
       timestamp,
     );
@@ -402,12 +475,23 @@ export class BatchDatabase {
 
   recoverInterruptedJobs(): number {
     const recover = this.db.transaction(() => {
-      const jobs = this.db.prepare("SELECT batch_id FROM jobs WHERE state = 'RUNNING'").all() as Array<Pick<JobRow, 'batch_id'>>;
+      const jobs = this.db.prepare(`
+        SELECT jobs.batch_id, batches.state AS batch_state
+        FROM jobs JOIN batches ON batches.id = jobs.batch_id
+        WHERE jobs.state = 'RUNNING'
+      `).all() as Array<Pick<JobRow, 'batch_id'> & { batch_state: BatchState }>;
       if (jobs.length === 0) {
         return 0;
       }
       const timestamp = now();
       for (const job of jobs) {
+        if (job.batch_state === 'PR_CREATED') {
+          this.db.prepare(`
+            UPDATE jobs SET state = 'COMPLETED', error_code = NULL, error_message = NULL, updated_at = ?
+            WHERE batch_id = ? AND state = 'RUNNING'
+          `).run(timestamp, job.batch_id);
+          continue;
+        }
         this.db.prepare(`
           UPDATE jobs
           SET state = 'FAILED', error_code = 'WORKER_INTERRUPTED',
@@ -519,6 +603,45 @@ export class BatchDatabase {
       }
       if (!columns.has('target_repository_json')) {
         this.db.exec('ALTER TABLE batches ADD COLUMN target_repository_json TEXT');
+      }
+    });
+    this.applyMigration(3, () => {
+      const columns = this.batchColumnNames();
+      if (!columns.has('execution_mode')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN execution_mode TEXT');
+      }
+      if (!columns.has('push_repository')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN push_repository TEXT');
+      }
+      if (!columns.has('push_branch_prefix')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN push_branch_prefix TEXT');
+      }
+      if (!columns.has('delivery_checkpoint')) {
+        this.db.exec("ALTER TABLE batches ADD COLUMN delivery_checkpoint TEXT NOT NULL DEFAULT 'NONE'");
+      }
+      if (!columns.has('delivery_branch')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN delivery_branch TEXT');
+      }
+      if (!columns.has('delivery_commit_sha')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN delivery_commit_sha TEXT');
+      }
+      if (!columns.has('pr_number')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN pr_number INTEGER');
+      }
+      if (!columns.has('pr_url')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN pr_url TEXT');
+      }
+      if (!columns.has('pr_state')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN pr_state TEXT');
+      }
+      if (!columns.has('pr_is_draft')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN pr_is_draft INTEGER');
+      }
+      if (!columns.has('pr_created_at')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN pr_created_at TEXT');
+      }
+      if (!columns.has('handoff_at')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN handoff_at TEXT');
       }
     });
   }

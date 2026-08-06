@@ -2,6 +2,13 @@ export type ItemAction = 'add' | 'replace' | 'delete';
 
 export type ExecutionMode = 'local' | 'remote';
 
+export type DeliveryCheckpoint =
+  | 'NONE'
+  | 'COMMIT_PREPARED'
+  | 'BRANCH_PUSHED'
+  | 'PR_CREATING'
+  | 'PR_CREATED';
+
 export type BatchState =
   | 'DRAFT'
   | 'VALIDATING'
@@ -9,6 +16,10 @@ export type BatchState =
   | 'QUEUED'
   | 'RUNNING'
   | 'LOCAL_DIFF_READY'
+  | 'COMMIT_PREPARED'
+  | 'BRANCH_PUSHED'
+  | 'PR_CREATING'
+  | 'PR_CREATED'
   | 'FAILED';
 
 export type JobState = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
@@ -38,6 +49,10 @@ export interface StoredBatch extends CreateBatchInput {
   id: string;
   catalogBaseline: CatalogBaseline | null;
   targetRepository: TargetRepository | null;
+  executionMode: ExecutionMode | null;
+  pushRepository: string | null;
+  pushBranchPrefix: string | null;
+  delivery: RemoteDeliveryState;
   state: BatchState;
   validation: unknown | null;
   warningsAcknowledged: boolean;
@@ -78,9 +93,8 @@ export interface AppConfig {
   executionMode: ExecutionMode;
   stage1SourcePath?: string;
   localTargetRef?: string;
-  upstreamRemote: string;
-  upstreamBranch: string;
   targetRepository: TargetRepository;
+  remoteDelivery?: RemoteDeliveryConfig;
   catalogPackageName: string;
   catalogTag: string;
   catalogRegistryUrl: string;
@@ -125,6 +139,40 @@ export interface CatalogBaseline {
 export interface TargetRepository {
   repository: string;
   branch: 'main';
+}
+
+export interface RemoteDeliveryConfig {
+  targetRemote: string;
+  pushRepository: string;
+  pushRemote: string;
+  pushBranchPrefix: 'bot/';
+  githubToken: string;
+  committer: CommitterIdentity;
+}
+
+export interface CommitterIdentity {
+  name: string;
+  email: string;
+}
+
+export interface BatchExecutionContext {
+  executionMode: ExecutionMode;
+  pushRepository: string | null;
+  pushBranchPrefix: string | null;
+}
+
+export interface RemoteDeliveryState {
+  checkpoint: DeliveryCheckpoint;
+  branch: string | null;
+  commitSha: string | null;
+  pullRequest: {
+    number: number;
+    url: string;
+    state: string;
+    isDraft: boolean;
+    createdAt: string | null;
+  } | null;
+  handoffAt: string | null;
 }
 
 export interface NpmCatalogIcon extends CatalogPageIcon {

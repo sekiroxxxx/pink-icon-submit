@@ -53,6 +53,10 @@ const stateLabel: Record<BatchDetails['state'], string> = {
   QUEUED: '等待生成本地修改',
   RUNNING: '正在生成本地修改',
   LOCAL_DIFF_READY: '本地修改已生成',
+  COMMIT_PREPARED: '正在准备机器人提交',
+  BRANCH_PUSHED: '机器人分支已创建',
+  PR_CREATING: '正在创建 Draft PR',
+  PR_CREATED: 'Draft PR 已创建',
   FAILED: '处理失败',
 };
 
@@ -575,7 +579,7 @@ export function App() {
   }, [action, addName, editable]);
 
   useEffect(() => {
-    if (!batch || !['QUEUED', 'RUNNING'].includes(batch.state)) return undefined;
+    if (!batch || !['QUEUED', 'RUNNING', 'COMMIT_PREPARED', 'BRANCH_PUSHED', 'PR_CREATING'].includes(batch.state)) return undefined;
     const timer = window.setInterval(() => {
       void api.getBatch(batch.id).then(setBatch).catch((error: unknown) => setNotice(error instanceof Error ? error.message : '无法刷新批次状态。'));
     }, 1_500);

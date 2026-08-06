@@ -197,8 +197,6 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     repositoryPath: checkout,
     executionMode: 'local',
     localTargetRef: 'main',
-    upstreamRemote: 'upstream',
-    upstreamBranch: 'main',
     targetRepository: { repository: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test', branch: 'main' },
     catalogPackageName: '@pink/codicons',
     catalogTag: 'beta',
@@ -220,8 +218,6 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     new GitRepository(config.repositoryPath, config.temporaryRoot, {
       mode: config.executionMode,
       localTargetRef: config.localTargetRef,
-      upstreamRemote: config.upstreamRemote,
-      upstreamBranch: config.upstreamBranch,
     }),
     new IconBatchCli(),
     config.maxUploadBytes,
