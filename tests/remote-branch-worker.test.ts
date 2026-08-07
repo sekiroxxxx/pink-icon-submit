@@ -14,6 +14,23 @@ function remoteHead(repositoryPath: string, branch: string): string {
   return execFileSync('git', [`--git-dir=${repositoryPath}`, 'rev-parse', `refs/heads/${branch}`], { encoding: 'utf8' }).trim();
 }
 
+async function advanceTargetMain(environment: TestEnvironment): Promise<string> {
+  const targetRepositoryPath = execFileSync('git', [
+    '-C', environment.config.repositoryPath,
+    'remote', 'get-url',
+    environment.config.remoteDelivery!.targetRemote,
+  ], { encoding: 'utf8' }).trim();
+  await writeFile(join(targetRepositoryPath, 'target-baseline-advance.txt'), 'target baseline advanced\n');
+  execFileSync('git', ['-C', targetRepositoryPath, 'add', 'target-baseline-advance.txt']);
+  execFileSync('git', [
+    '-C', targetRepositoryPath,
+    '-c', 'user.name=Target Developer',
+    '-c', 'user.email=target-developer@example.invalid',
+    'commit', '-qm', 'advance target main',
+  ]);
+  return execFileSync('git', ['-C', targetRepositoryPath, 'rev-parse', 'main'], { encoding: 'utf8' }).trim();
+}
+
 class FakeGitHubPullRequestClient implements GitHubPullRequestClient {
   readonly created: Array<{ repository: string; title: string; head: string; base: string; body: string }> = [];
   readonly pullRequests: Array<{ head: string; marker: string | null; pullRequest: GitHubPullRequest }> = [];
@@ -82,7 +99,7 @@ async function createSubmittedRemoteBatch(t: test.TestContext): Promise<{ enviro
   return { environment, batchId: batch.id };
 }
 
-test('remote worker creates one bot branch commit and one Draft PR without touching target main', async (t) => {
+test('remote worker creates one Draft PR only while the target base remains current', async (t) => {
   const { environment, batchId } = await createSubmittedRemoteBatch(t);
   const github = new FakeGitHubPullRequestClient();
   const outcome = await workerFor(environment, github).processNext();
@@ -142,6 +159,45 @@ test('branch delivery phase stops after a safe push without creating a Draft PR'
   assert.equal(pushed.job?.state, 'COMPLETED');
   assert.equal(remoteHead(environment.pushRepositoryPath!, pushed.delivery.branch!), pushed.delivery.commitSha);
   assert.equal(github.created.length, 0);
+});
+
+test('remote worker refuses Draft PR creation after the target base advances without changing the bot branch', async (t) => {
+  const { environment, batchId } = await createSubmittedRemoteBatch(t);
+  const github = new FakeGitHubPullRequestClient();
+  const delivery = environment.config.remoteDelivery!;
+  const branchWorker = new RemoteBranchWorker(environment.batches, {
+    pushRemote: delivery.pushRemote,
+    pushRepository: delivery.pushRepository,
+    pushBranchPrefix: delivery.pushBranchPrefix,
+    deliveryPhase: 'branch',
+    committer: delivery.committer,
+    targetRepository: environment.config.targetRepository,
+    github,
+    authentication: {
+      username: delivery.pushRepository.split('/')[0],
+      token: delivery.githubToken,
+    },
+  });
+  await branchWorker.processNext();
+
+  const pushed = environment.batches.getBatch(batchId);
+  const branch = pushed.delivery.branch!;
+  const branchHead = remoteHead(environment.pushRepositoryPath!, branch);
+  const advancedBaseCommit = await advanceTargetMain(environment);
+  assert.notEqual(advancedBaseCommit, pushed.baseCommit);
+  assert.equal(environment.database.resumeBranchPushedJobs(), 1);
+
+  await workerFor(environment, github).processNext();
+
+  const failed = environment.batches.getBatch(batchId);
+  assert.equal(failed.state, 'FAILED');
+  assert.equal(failed.delivery.checkpoint, 'BRANCH_PUSHED');
+  assert.deepEqual(failed.error, {
+    code: 'TARGET_BASE_ADVANCED',
+    message: `Target base changed before Draft PR creation (expected ${pushed.baseCommit!.slice(0, 12)}, actual ${advancedBaseCommit.slice(0, 12)}).`,
+  });
+  assert.equal(github.created.length, 0);
+  assert.equal(remoteHead(environment.pushRepositoryPath!, branch), branchHead);
 });
 
 test('remote worker retains a Git failure diagnostic when a retry replaces the active job error', async (t) => {
@@ -218,6 +274,8 @@ test('remote worker recovers a successful Draft PR when only PR_CREATING survive
   `).run(batchId);
   inspection.close();
   environment.batches.retry(batchId);
+  const advancedBaseCommit = await advanceTargetMain(environment);
+  assert.notEqual(advancedBaseCommit, environment.batches.getBatch(batchId).baseCommit);
 
   await workerFor(environment, github).processNext();
   const recovered = environment.batches.getBatch(batchId);

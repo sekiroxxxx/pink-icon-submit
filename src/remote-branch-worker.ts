@@ -206,11 +206,7 @@ export class RemoteBranchWorker {
     if (remoteHead !== batch.delivery.commitSha) {
       throw new AppError('REMOTE_BRANCH_DIVERGED', `Remote branch ${batch.delivery.branch} no longer matches this batch commit.`, 409);
     }
-    if (batch.delivery.checkpoint === 'BRANCH_PUSHED') {
-      this.batches.database.beginPullRequestCreation(batch.id);
-      batch = this.batches.database.getBatch(batch.id);
-    }
-    if (batch.delivery.checkpoint !== 'PR_CREATING') {
+    if (batch.delivery.checkpoint !== 'BRANCH_PUSHED' && batch.delivery.checkpoint !== 'PR_CREATING') {
       throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batch.id} cannot create a Draft PR from its current checkpoint.`, 409);
     }
     const details = this.batches.database.getDetails(batch.id);
@@ -219,11 +215,37 @@ export class RemoteBranchWorker {
     const head = `${owner}:${batch.delivery.branch}`;
     const existing = await this.options.github.findPullRequest(this.options.targetRepository.repository, head, draft.marker);
     if (existing.matching) {
+      if (batch.delivery.checkpoint === 'BRANCH_PUSHED') {
+        this.batches.database.beginPullRequestCreation(batch.id);
+        batch = this.batches.database.getBatch(batch.id);
+      }
+      if (batch.delivery.checkpoint !== 'PR_CREATING') {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batch.id} cannot recover its Draft PR from its current checkpoint.`, 409);
+      }
       this.batches.database.recordPullRequestCreated(batch.id, existing.matching);
       return;
     }
     if (existing.conflicting) {
       throw new AppError('PR_BRANCH_ALREADY_EXISTS', `Remote branch ${batch.delivery.branch} already has a non-matching pull request.`, 409);
+    }
+    if (!batch.baseCommit) {
+      throw new AppError('DELIVERY_CHECKPOINT_INVALID', `Batch ${batch.id} is missing the base commit required to create a Draft PR.`, 409);
+    }
+    const actualBaseCommit = await this.batches.repository.resolveBaseCommit();
+    if (actualBaseCommit !== batch.baseCommit) {
+      throw new AppError(
+        'TARGET_BASE_ADVANCED',
+        `Target base changed before Draft PR creation (expected ${batch.baseCommit.slice(0, 12)}, actual ${actualBaseCommit.slice(0, 12)}).`,
+        409,
+        { expectedBaseCommit: batch.baseCommit, actualBaseCommit },
+      );
+    }
+    if (batch.delivery.checkpoint === 'BRANCH_PUSHED') {
+      this.batches.database.beginPullRequestCreation(batch.id);
+      batch = this.batches.database.getBatch(batch.id);
+    }
+    if (batch.delivery.checkpoint !== 'PR_CREATING') {
+      throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batch.id} cannot create a Draft PR from its current checkpoint.`, 409);
     }
     const pullRequest = await this.options.github.createDraftPullRequest(this.options.targetRepository.repository, {
       title: draft.title,
