@@ -32,6 +32,26 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 
 test('disabled Worker runtime leaves queued and running jobs untouched in API-only mode', async (t) => {
   const environment = await createTestEnvironment(t);
+  const branchPushedBatchId = await createSubmittedBatch(environment, 'branch-pushed');
+  const branchPushedJob = environment.database.claimNextJob();
+  assert.ok(branchPushedJob);
+  assert.equal(branchPushedJob.batchId, branchPushedBatchId);
+  environment.database.recordCommitPrepared(
+    branchPushedBatchId,
+    { items: [] },
+    'a'.repeat(40),
+    { changedFiles: [] },
+    `bot/${branchPushedBatchId}`,
+    'b'.repeat(40),
+  );
+  environment.database.recordBranchPushed(branchPushedBatchId);
+  environment.database.completeBranchPushedJob(branchPushedBatchId);
+  const branchPushedBatchBefore = environment.batches.getBatch(branchPushedBatchId);
+  const branchPushedJobBefore = environment.database.getJob(branchPushedBatchId);
+  assert.equal(branchPushedBatchBefore.state, 'BRANCH_PUSHED');
+  assert.equal(branchPushedBatchBefore.delivery.checkpoint, 'BRANCH_PUSHED');
+  assert.equal(branchPushedJobBefore?.state, 'COMPLETED');
+
   const firstBatchId = await createSubmittedBatch(environment, 'first');
   const secondBatchId = await createSubmittedBatch(environment, 'second');
   const runningJob = environment.database.claimNextJob();
@@ -60,6 +80,19 @@ test('disabled Worker runtime leaves queued and running jobs untouched in API-on
   assert.equal(environment.database.getJob(runningJob.batchId)?.state, 'RUNNING');
   assert.equal(environment.batches.getBatch(queuedBatchId).state, 'QUEUED');
   assert.equal(environment.database.getJob(queuedBatchId)?.state, 'QUEUED');
+  const branchPushedBatchAfter = environment.batches.getBatch(branchPushedBatchId);
+  const branchPushedJobAfter = environment.database.getJob(branchPushedBatchId);
+  assert.equal(branchPushedBatchAfter.state, branchPushedBatchBefore.state);
+  assert.deepEqual(branchPushedBatchAfter.delivery, branchPushedBatchBefore.delivery);
+  assert.deepEqual(branchPushedJobAfter && {
+    state: branchPushedJobAfter.state,
+    attempt: branchPushedJobAfter.attempt,
+    error: branchPushedJobAfter.error,
+  }, branchPushedJobBefore && {
+    state: branchPushedJobBefore.state,
+    attempt: branchPushedJobBefore.attempt,
+    error: branchPushedJobBefore.error,
+  });
   runtime.close();
 });
 
@@ -69,9 +102,12 @@ test('enabled Worker runtime preserves topology preflight, recovery, and polling
   let resumeBranchPushedJobsCalls = 0;
   let workerConstructionCalls = 0;
   let processNextCalls = 0;
+  let releaseFirstPoll!: () => void;
+  let resolveFirstPollFinished!: () => void;
+  const firstPollFinished = new Promise<void>((resolve) => { resolveFirstPollFinished = resolve; });
   const runtime = await startWorkerRuntime({
     enabled: true,
-    pollIntervalMs: 1,
+    pollIntervalMs: 10,
     deliveryPhase: 'pull_request',
     recovery: {
       recoverInterruptedJobs: () => {
@@ -89,6 +125,10 @@ test('enabled Worker runtime preserves topology preflight, recovery, and polling
       return {
         processNext: async () => {
           processNextCalls += 1;
+          if (processNextCalls === 1) {
+            await new Promise<void>((resolve) => { releaseFirstPoll = resolve; });
+            resolveFirstPollFinished();
+          }
           return { processed: false };
         },
       };
@@ -98,9 +138,14 @@ test('enabled Worker runtime preserves topology preflight, recovery, and polling
 
   await waitFor(() => processNextCalls > 0);
   runtime.close();
+  releaseFirstPoll();
+  await firstPollFinished;
+  const callsAfterClose = processNextCalls;
+  await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(preflightCalls, 1);
   assert.equal(recoverInterruptedJobsCalls, 1);
   assert.equal(resumeBranchPushedJobsCalls, 1);
   assert.equal(workerConstructionCalls, 1);
-  assert.ok(processNextCalls >= 1);
+  assert.equal(callsAfterClose, 1);
+  assert.equal(processNextCalls, callsAfterClose);
 });
