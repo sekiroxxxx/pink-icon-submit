@@ -59,9 +59,9 @@ function svgFile(name: string): File {
 async function addOneSvgChange(user: ReturnType<typeof userEvent.setup>): Promise<void> {
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('new-icon.svg'));
-  await user.type(screen.getByLabelText(/^图标建议名称/), 'pink-new-icon');
+  await user.type(screen.getByLabelText(/^设计名称/), 'pink-new-icon');
   await user.type(screen.getByLabelText(/^用途说明/), '用于测试新增图标的设计稿。');
-  await screen.findByText(/最终名称：/);
+  await screen.findByText(/仓库最终名称预览：/);
   await user.click(screen.getByRole('button', { name: '加入新增队列' }));
 }
 
@@ -142,9 +142,9 @@ test('multiple SVG files stay in the pending queue until each is paired with a c
   expect(await screen.findByText('待处理 SVG')).toBeTruthy();
   expect(screen.getByRole('button', { name: '选择 one.svg' })).toBeTruthy();
   expect(screen.getByRole('button', { name: '选择 two.svg' })).toBeTruthy();
-  await user.type(screen.getByLabelText(/^图标建议名称/), 'pink-one');
+  await user.type(screen.getByLabelText(/^设计名称/), 'pink-one');
   await user.type(screen.getByLabelText(/^用途说明/), '第一个图标。');
-  await screen.findByText(/最终名称：/);
+  await screen.findByText(/仓库最终名称预览：/);
   await user.click(screen.getByRole('button', { name: '加入新增队列' }));
 
   expect(screen.getByText('本次变更 1 项')).toBeTruthy();
@@ -152,7 +152,7 @@ test('multiple SVG files stay in the pending queue until each is paired with a c
   expect(screen.getByRole('img', { name: 'one.svg 预览' })).toBeTruthy();
 });
 
-test('an add name collision returned by Stage 1 cannot be added to the batch', async () => {
+test('a repository name preview collision cannot be added to the batch', async () => {
   saveProfile();
   vi.stubGlobal('fetch', vi.fn((path: string) => {
     const url = new URL(path, 'http://localhost');
@@ -169,13 +169,113 @@ test('an add name collision returned by Stage 1 cannot be added to the batch', a
   render(<App />);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('collision.svg'));
-  await user.type(screen.getByLabelText(/^图标建议名称/), 'Existing');
+  await user.type(screen.getByLabelText(/^设计名称/), 'Existing');
   await user.type(screen.getByLabelText(/^用途说明/), '验证名称冲突。');
   await screen.findByText(/已与 existing/);
   await user.click(screen.getByRole('button', { name: '加入新增队列' }));
 
-  expect(screen.getByText(/最终名称 existing 已被 existing/)).toBeTruthy();
+  expect(screen.getByText(/仓库最终名称 existing 已被 existing/)).toBeTruthy();
   expect(screen.getByText('本次变更 0 项')).toBeTruthy();
+});
+
+test('name preview debounces to the final design name and uses the designer-facing labels', async () => {
+  saveProfile();
+  const fetchMock = mockNamePreview();
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+  render(<App />);
+
+  const nameInput = screen.getByLabelText(/^设计名称/);
+  await user.type(nameInput, 'first-name');
+  await user.clear(nameInput);
+  await user.type(nameInput, 'pink-one');
+
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/names/preview?name=pink-one', {}));
+  const previewCalls = fetchMock.mock.calls.filter(([path]) => String(path).startsWith('/api/names/preview?'));
+  expect(previewCalls).toHaveLength(1);
+  expect(await screen.findByText(/仓库最终名称预览：/)).toBeTruthy();
+  expect(screen.queryByText('图标建议名称')).toBeNull();
+});
+
+test('an explicitly invalid repository name preview cannot be added to the batch', async () => {
+  saveProfile();
+  vi.stubGlobal('fetch', vi.fn((path: string) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/names/preview') {
+      return Promise.resolve(jsonResponse({
+        ...namePreviewResponse(url.searchParams.get('name') ?? ''),
+        valid: false,
+        normalizedName: '',
+      }));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  }));
+  const user = userEvent.setup();
+  render(<App />);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('invalid.svg'));
+  await user.type(screen.getByLabelText(/^设计名称/), 'invalid-name');
+  await user.type(screen.getByLabelText(/^用途说明/), '验证明确无效的仓库名称预检。');
+  await screen.findByText(/仓库最终名称预览：/);
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+
+  expect(screen.getByText('仓库最终名称不符合图标仓库规则。')).toBeTruthy();
+  expect(screen.getByText('本次变更 0 项')).toBeTruthy();
+});
+
+test('a failed name preview still allows a change and defers confirmation to final validation', async () => {
+  saveProfile();
+  vi.stubGlobal('fetch', vi.fn((path: string) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/names/preview') return Promise.reject(new Error('preview unavailable'));
+    throw new Error(`Unexpected request: ${path}`);
+  }));
+  const user = userEvent.setup();
+  render(<App />);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('network.svg'));
+  await user.type(screen.getByLabelText(/^设计名称/), 'network-name');
+  await user.type(screen.getByLabelText(/^用途说明/), '验证网络失败不会阻止新增。');
+  await screen.findByText('名称预检暂不可用，可继续加入；最终校验会确认。');
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+
+  expect(screen.getByText('本次变更 1 项')).toBeTruthy();
+  expect(screen.getByText('名称预检暂不可用，将在最终校验时确认。')).toBeTruthy();
+});
+
+test('a pending name preview still allows a change and does not use an older result', async () => {
+  saveProfile();
+  let resolveOldPreview!: (response: Response) => void;
+  const fetchMock = vi.fn((path: string) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname !== '/api/names/preview') throw new Error(`Unexpected request: ${path}`);
+    const name = url.searchParams.get('name');
+    if (name === 'old-name') return new Promise<Response>((resolve) => { resolveOldPreview = resolve; });
+    return new Promise<Response>(() => undefined);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+  render(<App />);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('pending.svg'));
+  const nameInput = screen.getByLabelText(/^设计名称/);
+  await user.type(nameInput, 'old-name');
+  await user.type(screen.getByLabelText(/^用途说明/), '验证旧预检不能影响新输入。');
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/names/preview?name=old-name', {}));
+  await user.clear(nameInput);
+  await user.type(nameInput, 'new-name');
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/names/preview?name=new-name', {}));
+  expect(screen.getByText('正在加载仓库最终名称预览…')).toBeTruthy();
+  resolveOldPreview(jsonResponse({
+    ...namePreviewResponse('old-name'),
+    normalizedName: 'existing',
+    collision: { primaryName: 'existing', aliases: ['existing-alias'] },
+  }));
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+
+  expect(screen.getByText('本次变更 1 项')).toBeTruthy();
+  expect(screen.getByText('名称预检暂不可用，将在最终校验时确认。')).toBeTruthy();
+  expect(screen.queryByText(/仓库最终名称 existing 已被 existing/)).toBeNull();
 });
 
 test('delete only needs a target and design reason before it enters the queue', async () => {

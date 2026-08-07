@@ -129,9 +129,9 @@ function toItemInput(change: DraftChange): ItemInput {
 
 function localNameIssue(value: string): string | undefined {
   const trimmed = value.trim();
-  if (!trimmed) return '请填写图标建议名称。';
-  if (trimmed.length > limits.name) return `图标名称不能超过 ${limits.name} 个字符。`;
-  if (/\s/.test(value) || /[\\/]/.test(value)) return '图标名称不能包含空白或路径分隔符。';
+  if (!trimmed) return '请填写设计名称。';
+  if (trimmed.length > limits.name) return `设计名称不能超过 ${limits.name} 个字符。`;
+  if (/\s/.test(value) || /[\\/]/.test(value)) return '设计名称不能包含空白或路径分隔符。';
   return undefined;
 }
 
@@ -533,6 +533,7 @@ export function App() {
   const editable = !batch || batch.state === 'DRAFT';
   const needsCatalog = catalogOpen && editable && (action === 'replace' || action === 'delete');
   const activeSvg = useMemo(() => pendingSvgs.find((svg) => svg.id === activeSvgId), [activeSvgId, pendingSvgs]);
+  const currentNamePreview = namePreview?.input === addName.trim() ? namePreview : undefined;
   const usedTargets = useMemo(() => {
     const result = new Map<string, TargetUse>();
     changes.forEach((change, index) => {
@@ -583,11 +584,12 @@ export function App() {
       return undefined;
     }
     let cancelled = false;
+    const requestedName = addName.trim();
     setNamePreviewPending(true);
     setNamePreviewError(undefined);
     const timer = window.setTimeout(() => {
-      void api.previewName(addName.trim())
-        .then((response) => { if (!cancelled) setNamePreview(response); })
+      void api.previewName(requestedName)
+        .then((response) => { if (!cancelled && response.input === requestedName) setNamePreview(response); })
         .catch((error: unknown) => { if (!cancelled) setNamePreviewError(error instanceof Error ? error.message : '无法检查图标名称。'); })
         .finally(() => { if (!cancelled) setNamePreviewPending(false); });
     }, 220);
@@ -613,6 +615,14 @@ export function App() {
     setCatalogSelection('target');
     setCatalogOpen(false);
     setChangeErrors({});
+  };
+
+  const updateAddName = (value: string) => {
+    setAddName(value);
+    setNamePreview(undefined);
+    setNamePreviewPending(false);
+    setNamePreviewError(undefined);
+    setChangeErrors((current) => ({ ...current, designName: '' }));
   };
 
   const queueSvgs = (files: FileList | File[]) => {
@@ -708,15 +718,14 @@ export function App() {
 
   const addChange = () => {
     const errors: FieldErrors = {};
+    let namePreviewUnavailable = false;
     if (action !== 'delete' && !activeSvg) errors.svg = '请先拖入或选择 SVG 文件。';
     if (action === 'add') {
       const nameIssue = localNameIssue(addName);
       if (nameIssue) errors.designName = nameIssue;
-      else if (namePreviewPending) errors.designName = '正在根据图标仓库规则生成最终名称。';
-      else if (namePreviewError) errors.designName = `无法检查图标名称：${namePreviewError}`;
-      else if (!namePreview) errors.designName = '请等待名称规则检查完成。';
-      else if (!namePreview.valid) errors.designName = '该名称规范化后不符合图标仓库规则。';
-      else if (namePreview.collision) errors.designName = `最终名称 ${namePreview.normalizedName} 已被 ${namePreview.collision.primaryName}（含 alias）使用。`;
+      else if (currentNamePreview && !currentNamePreview.valid) errors.designName = '仓库最终名称不符合图标仓库规则。';
+      else if (currentNamePreview?.collision) errors.designName = `仓库最终名称 ${currentNamePreview.normalizedName} 已被 ${currentNamePreview.collision.primaryName}（含 alias）使用。`;
+      else if (namePreviewPending || namePreviewError || !currentNamePreview) namePreviewUnavailable = true;
       if (!addDescription.trim()) errors.description = '请填写用途说明。';
       else if (fieldLengthIssue(addDescription, '用途说明', limits.itemText)) errors.description = fieldLengthIssue(addDescription, '用途说明', limits.itemText)!;
     }
@@ -750,7 +759,9 @@ export function App() {
     setTarget(undefined);
     setAddName(''); setAddDescription(''); setReplaceDescription(''); setDeleteReason(''); setReplacement(undefined);
     setChangeErrors({});
-    setNotice(stale ? '变更已修改，需要重新校验。' : '已加入本次变更。其余 SVG 会继续保留在待处理队列。');
+    setNotice(namePreviewUnavailable
+      ? '名称预检暂不可用，将在最终校验时确认。'
+      : stale ? '变更已修改，需要重新校验。' : '已加入本次变更。其余 SVG 会继续保留在待处理队列。');
   };
 
   const removeChange = async (change: DraftChange) => {
@@ -904,7 +915,7 @@ export function App() {
             onClose={() => setCatalogOpen(false)}
           />}
 
-          {action === 'add' && <div className="form-field"><label htmlFor="add-name">图标建议名称<RequiredMark /></label><input id="add-name" maxLength={limits.name} value={addName} disabled={!editable || busy} onChange={(event) => setAddName(event.target.value)} placeholder="例如：pink-model-preview" /><FieldCounter value={addName} maximum={limits.name} />{namePreviewPending && <p className="field-hint">正在按图标仓库规则生成最终名称…</p>}{namePreview && <p className={`name-preview ${namePreview.collision ? 'collision' : ''}`}>建议名称：<strong>{namePreview.input}</strong> → 最终名称：<strong>{namePreview.normalizedName || '无效'}</strong>{namePreview.collision && <span> 已与 {namePreview.collision.primaryName}（{namePreview.collision.aliases.join('、')}）冲突。</span>}</p>}{namePreviewError && <p className="field-error">名称预览失败：{namePreviewError}</p>}<FieldError message={changeErrors.designName} /></div>}
+          {action === 'add' && <div className="form-field"><label htmlFor="add-name">设计名称<RequiredMark /></label><input id="add-name" maxLength={limits.name} value={addName} disabled={!editable || busy} onChange={(event) => updateAddName(event.target.value)} placeholder="例如：pink-model-preview" /><FieldCounter value={addName} maximum={limits.name} />{namePreviewPending && <p className="field-hint">正在加载仓库最终名称预览…</p>}{currentNamePreview && <p className={`name-preview ${currentNamePreview.collision ? 'collision' : ''}`}>仓库最终名称预览：<strong>{currentNamePreview.input}</strong> → 最终名称：<strong>{currentNamePreview.normalizedName || '无效'}</strong>{currentNamePreview.collision && <span> 已与 {currentNamePreview.collision.primaryName}（{currentNamePreview.collision.aliases.join('、')}）冲突。</span>}</p>}{namePreviewError && <p className="field-hint">名称预检暂不可用，可继续加入；最终校验会确认。</p>}<FieldError message={changeErrors.designName} /></div>}
           {action === 'add' && <div className="form-field"><label htmlFor="add-description">用途说明<RequiredMark /></label><textarea id="add-description" maxLength={limits.itemText} value={addDescription} disabled={!editable || busy} onChange={(event) => setAddDescription(event.target.value)} placeholder="说明图标表达的对象或操作。" /><FieldCounter value={addDescription} maximum={limits.itemText} /><FieldError message={changeErrors.description} /></div>}
           {action === 'replace' && <div className="form-field"><label htmlFor="replace-description">本次替换说明 <em>（可选）</em></label><textarea id="replace-description" maxLength={limits.itemText} value={replaceDescription} disabled={!editable || busy} onChange={(event) => setReplaceDescription(event.target.value)} placeholder="例如：与新的模型资产视觉语言保持一致。" /><FieldCounter value={replaceDescription} maximum={limits.itemText} /><FieldError message={changeErrors.description} /></div>}
           {action === 'delete' && <>
