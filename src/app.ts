@@ -148,6 +148,11 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return reply.status(201).send(batch);
   });
 
+  app.put('/api/batches/:batchId', async (request) => {
+    const { batchId } = request.params as { batchId: string };
+    return dependencies.batches.updateBatch(batchId, request.body as Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>);
+  });
+
   app.post('/api/batches/:batchId/items', async (request, reply) => {
     const { batchId } = request.params as { batchId: string };
     const { item, svg } = await readItemPayload(request);

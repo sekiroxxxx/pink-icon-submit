@@ -4,7 +4,7 @@ import test from 'node:test';
 import { draftPullRequestForBatch } from '../src/pull-request-template.js';
 import type { BatchDetails } from '../src/types.js';
 
-test('Draft PR template carries the machine marker, submitter, plan, warnings, and handoff boundary', () => {
+test('Draft PR template leads with designer-facing Chinese review content and retains its audit details', () => {
   const batch: BatchDetails = {
     id: 'ICON-20260806-ABCDEF12',
     title: '图标批量更新',
@@ -54,10 +54,16 @@ test('Draft PR template carries the machine marker, submitter, plan, warnings, a
 
   assert.equal(draft.title, 'chore(icons): 图标批量更新');
   assert.equal(draft.marker, '<!-- pink-icon-submit:batch=ICON-20260806-ABCDEF12 -->');
+  assert.match(draft.body, /## 变更摘要[\s\S]*## 设计说明[\s\S]*## 图标变更明细[\s\S]*## 开发审核提醒/);
+  assert.match(draft.body, /本次包含 3 项图标变更：新增 1 项、替换 1 项、删除 1 项。/);
+  assert.match(draft.body, /\| 新增 \| new-icon \| new-icon \| U\+C351 \| 新增图标 \|/);
+  assert.match(draft.body, /\| 替换 \| existing-icon \| existing-icon \| U\+C350 \| 替换 SVG \|/);
+  assert.match(draft.body, /\| 删除 \| old-icon \| old-icon \| U\+C352 \| 删除；建议替代：new-icon \|/);
+  assert.match(draft.body, /图标使用了描边：请确认字体渲染后的显示效果。/);
+  assert.match(draft.body, /<summary>技术详情与审计信息<\/summary>/);
   assert.match(draft.body, /提交人：设计师 <designer@example.invalid>（身份未经系统认证）/);
-  assert.match(draft.body, /\| add \| new-icon \| new-icon \| U\+C351 \| 新增图标 \|/);
-  assert.match(draft.body, /\| replace \| existing-icon \| existing-icon \| U\+C350 \| 替换 SVG \|/);
-  assert.match(draft.body, /\| delete \| old-icon \| old-icon \| U\+C352 \| 删除；建议替代：new-icon \|/);
+  assert.match(draft.body, /上游基线：`c{40}`/);
+  assert.match(draft.body, /机器人分支：`sud-icon-bot\/sekiroxxxx-pink-codicons-automation-test:bot\/ICON-20260806-ABCDEF12`/);
   assert.match(draft.body, /SVG_STROKE_PRESENT/);
   assert.match(draft.body, /平台不再 push 或修改该分支/);
 });

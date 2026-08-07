@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, ApiError, type ApiItem, type BatchDetails, type CatalogGroup, type CatalogPageIcon, type Diagnostic, type ItemAction, type ItemInput, type NamePreview, type Submitter } from './api';
+import { displayDiagnostic } from './diagnostics';
 
 interface DesignerProfile extends Submitter {
   version: 1;
@@ -87,6 +88,7 @@ function isEmail(value: string): boolean {
 }
 
 function isHttpUrl(value: string): boolean {
+  if (!/^https?:\/\//i.test(value)) return false;
   try {
     const url = new URL(value);
     return url.protocol === 'https:' || url.protocol === 'http:';
@@ -183,10 +185,6 @@ async function inspectSvg(file: File): Promise<{ content?: string; error?: strin
     content,
     ...(file.size > defaultUploadLimit ? { warning: '文件大于当前默认 1 MB 限制，上传接口可能拒绝它。' } : {}),
   };
-}
-
-function diagnosticLabel(diagnostic: Diagnostic): string {
-  return diagnostic.itemId ? `${diagnostic.code}（${diagnostic.itemId}）` : diagnostic.code;
 }
 
 function actionLabel(action: ItemAction): string {
@@ -435,9 +433,25 @@ function ChangeCard({ change, disabled, onRemove }: { change: DraftChange; disab
   );
 }
 
-function DiagnosticList({ title, diagnostics, tone }: { title: string; diagnostics: Diagnostic[]; tone: 'error' | 'warning' }) {
+function DiagnosticList({ title, diagnostics, tone, items }: { title: string; diagnostics: Diagnostic[]; tone: 'error' | 'warning'; items: ApiItem[] }) {
   if (diagnostics.length === 0) return null;
-  return <section className={`diagnostics ${tone}`} aria-label={title}><h2>{title}</h2><ul>{diagnostics.map((diagnostic, index) => <li key={`${diagnostic.code}-${diagnostic.itemId ?? index}`}><strong>{diagnosticLabel(diagnostic)}</strong><span>{diagnostic.message}</span></li>)}</ul></section>;
+  return (
+    <section className={`diagnostics ${tone}`} aria-label={title}>
+      <h2>{title}</h2>
+      <ul>{diagnostics.map((diagnostic, index) => {
+        const displayed = displayDiagnostic(diagnostic, items);
+        return (
+          <li key={`${diagnostic.code}-${diagnostic.itemId ?? index}`}>
+            <strong>{displayed.title}</strong>
+            {displayed.itemName && <span>对应图标：{displayed.itemName}</span>}
+            <span>{displayed.reason}</span>
+            <span>建议：{displayed.suggestion}</span>
+            <details><summary>技术详情</summary><p>规则：<code>{displayed.technical.code}</code></p><p>{displayed.technical.message}</p></details>
+          </li>
+        );
+      })}</ul>
+    </section>
+  );
 }
 
 function ReviewDrawer({
@@ -474,7 +488,7 @@ function ReviewDrawer({
         <section className="review-list" aria-label="本次变更清单"><h3>本次变更清单</h3>{changes.map((change) => <div key={change.clientId}><strong>{({ add: '新增', replace: '替换', delete: '删除' })[change.action]}</strong><span>{change.action === 'add' ? change.designName : change.target?.primaryName}{change.svg ? ` · ${change.svg.file.name}` : ''}</span></div>)}</section>
         <label className="confirm-check"><input type="checkbox" checked={confirmed} onChange={(event) => onConfirmedChange(event.target.checked)} /><span>我确认以上设计意图和 SVG 文件正确，并同意交由后续自动校验和开发审核。</span></label>
         <FieldError message={errors.confirmed} />
-        <div className="dialog-actions"><button className="button secondary" type="button" disabled={busy} onClick={onClose}>继续编辑</button><button className="button primary" type="button" disabled={busy} onClick={onSubmit}>{busy ? '处理中…' : '进入校验'}</button></div>
+        <div className="dialog-actions"><button className="button secondary" type="button" disabled={busy} onClick={onClose}>继续编辑</button><button className="button primary" type="button" disabled={busy} onClick={onSubmit}>{busy ? '正在重新校验…' : '进入校验'}</button></div>
       </section>
     </div>
   );
@@ -512,6 +526,8 @@ export function App() {
   const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string>();
+  const [validationInProgress, setValidationInProgress] = useState(false);
+  const [validatedAt, setValidatedAt] = useState<string>();
   const liveSvgDrafts = useRef(new Map<string, SvgDraft>());
 
   const editable = !batch || batch.state === 'DRAFT';
@@ -579,7 +595,11 @@ export function App() {
   }, [action, addName, editable]);
 
   useEffect(() => {
-    if (!batch || !['QUEUED', 'RUNNING', 'COMMIT_PREPARED', 'BRANCH_PUSHED', 'PR_CREATING'].includes(batch.state)) return undefined;
+    const requiresPolling = batch && (
+      ['QUEUED', 'RUNNING', 'COMMIT_PREPARED'].includes(batch.state)
+      || (batch.executionMode === 'remote' && ['BRANCH_PUSHED', 'PR_CREATING'].includes(batch.state))
+    );
+    if (!requiresPolling || !batch) return undefined;
     const timer = window.setInterval(() => {
       void api.getBatch(batch.id).then(setBatch).catch((error: unknown) => setNotice(error instanceof Error ? error.message : '无法刷新批次状态。'));
     }, 1_500);
@@ -669,10 +689,21 @@ export function App() {
     setChangeErrors((current) => ({ ...current, replacement: '' }));
   };
 
-  const clearStaleValidation = (): boolean => {
-    if (!batch?.validation) return false;
+  const invalidateCurrentValidation = (): boolean => {
+    const hadCurrentResult = Boolean(batch?.validation || validatedAt);
+    if (!hadCurrentResult) return false;
     setBatch((current) => current ? { ...current, validation: null } : current);
+    setValidatedAt(undefined);
+    setNotice(undefined);
     return true;
+  };
+
+  const updateBatchMetadata = (patch: Partial<typeof batchForm>) => {
+    const changed = (Object.keys(patch) as (keyof typeof batchForm)[]).some((key) => batchForm[key] !== patch[key]);
+    if (changed && invalidateCurrentValidation()) {
+      setNotice('批次信息已修改，需要重新校验。');
+    }
+    setBatchForm((current) => ({ ...current, ...patch }));
   };
 
   const addChange = () => {
@@ -714,7 +745,7 @@ export function App() {
       ...(action === 'add' ? { svg: activeSvg } : {}),
     };
     setChanges((current) => [...current, change]);
-    const stale = clearStaleValidation();
+    const stale = invalidateCurrentValidation();
     if (activeSvg) removePendingSvg(activeSvg.id, true);
     setTarget(undefined);
     setAddName(''); setAddDescription(''); setReplaceDescription(''); setDeleteReason(''); setReplacement(undefined);
@@ -737,7 +768,7 @@ export function App() {
     revokePreview(change.svg);
     if (change.svg) liveSvgDrafts.current.delete(change.svg.id);
     setChanges((current) => current.filter((candidate) => candidate.clientId !== change.clientId));
-    if (clearStaleValidation()) {
+    if (invalidateCurrentValidation()) {
       setNotice('变更已修改，需要重新校验。');
     }
   };
@@ -767,12 +798,18 @@ export function App() {
 
   const startValidation = async () => {
     if (!profile || !validateReview()) return;
+    const revalidating = Boolean(batch);
+    invalidateCurrentValidation();
     setBusy(true);
-    setNotice(undefined);
+    setValidationInProgress(true);
+    setNotice(revalidating ? '正在按最新修改重新校验…' : '正在校验本次提交内容…');
     try {
       let currentBatch = batch;
       if (!currentBatch) {
         currentBatch = await api.createBatch({ ...batchForm, submitter: { name: profile.name, email: profile.email } });
+        setBatch(currentBatch);
+      } else {
+        currentBatch = await api.updateBatch(currentBatch.id, batchForm);
         setBatch(currentBatch);
       }
       const saved = await syncChanges(currentBatch.id);
@@ -780,10 +817,17 @@ export function App() {
       const validated = await api.validateBatch(currentBatch.id);
       setBatch(validated);
       setReviewOpen(false);
-      setNotice(validated.validation?.valid ? '校验通过，可以生成本地修改。' : '发现需要修正的问题，请调整后再次校验。');
+      const completedAt = new Date().toISOString();
+      setValidatedAt(completedAt);
+      const resultNotice = validated.validation?.valid ? '校验通过，可以生成本地修改。' : '发现需要修正的问题，请调整后再次校验。';
+      setNotice(revalidating
+        ? `已按最新内容重新校验（${new Date(completedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}）。${resultNotice}`
+        : resultNotice);
     } catch (error) {
-      setNotice(error instanceof ApiError ? error.message : '校验请求失败。');
+      const message = error instanceof ApiError ? error.message : '无法完成本次校验请求。';
+      setNotice(`本次校验失败，未完成：${message}`);
     } finally {
+      setValidationInProgress(false);
       setBusy(false);
     }
   };
@@ -829,7 +873,8 @@ export function App() {
       <main className="page-shell">
         <header className="page-header"><h1>完成设计，交给开发</h1><p>选择现有图标或拖入新的 SVG，把本次设计变更一次提交给开发审核。</p></header>
 
-        {notice && <p className="notice">{notice}</p>}
+        {notice && <p className="notice" aria-live="polite">{notice}</p>}
+        {validatedAt && !validationInProgress && <p className="notice validation-time">最新校验完成时间：<time dateTime={validatedAt}>{new Date(validatedAt).toLocaleString('zh-CN')}</time></p>}
         {batch && <p className={`state-notice state-${batch.state.toLowerCase()}`}>批次状态：<strong>{stateLabel[batch.state]}</strong></p>}
 
         <section className="composer-card" aria-labelledby="composer-title">
@@ -873,15 +918,15 @@ export function App() {
 
         <section className="changes-card" aria-label="本次变更"><div><h2>本次变更 {changes.length} 项</h2><p>{changes.length === 0 ? '把一项操作加入队列后，会在这里同时显示所有待改动图标。' : '确认前可移除任何一项变更。'}</p></div><div className="change-list">{changes.map((change) => <ChangeCard key={change.clientId} change={change} disabled={!editable || busy} onRemove={() => void removeChange(change)} />)}</div><div className="changes-actions"><button className="button primary" type="button" disabled={!editable || busy || changes.length === 0} onClick={() => { setReviewErrors({}); setReviewOpen(true); }}>确认本次变更</button></div></section>
 
-        <DiagnosticList title="需要修正的问题" diagnostics={batch?.validation?.errors ?? []} tone="error" />
-        <DiagnosticList title="开发审核提醒" diagnostics={batch?.validation?.warnings ?? []} tone="warning" />
-        {batch?.error && <section className="diagnostics error"><h2>处理失败</h2><p><strong>{batch.error.code}</strong> {batch.error.message}</p></section>}
+        {!validationInProgress && <DiagnosticList title="需要修正的问题" diagnostics={batch?.validation?.errors ?? []} tone="error" items={batch?.items ?? []} />}
+        {!validationInProgress && <DiagnosticList title="开发审核提醒" diagnostics={batch?.validation?.warnings ?? []} tone="warning" items={batch?.items ?? []} />}
+        {batch?.error && <section className="diagnostics error"><h2>{batch.executionMode === 'remote' ? '远程交付未完成' : '本地修改生成失败'}</h2><p>{batch.executionMode === 'remote' ? '未创建或恢复 Draft PR；请修正问题后重试远程交付。' : '未能生成本地修改；请修正问题后重试。'}</p><details><summary>技术详情</summary><p>规则：<code>{batch.error.code}</code></p><p>{batch.error.message}</p></details></section>}
         {batch?.delivery?.pullRequest && <section className="result-card"><p className="eyebrow">Draft PR 已创建</p><h2>已交给开发审核和接管</h2><p><a href={batch.delivery.pullRequest.url} target="_blank" rel="noreferrer">打开 Draft PR #{batch.delivery.pullRequest.number}</a></p><p>平台已停止写入该机器人分支；后续调整请直接在 PR 中完成。</p></section>}
-        {batch?.localDiff && !batch.delivery?.pullRequest && <section className="result-card"><p className="eyebrow">修改已生成</p><h2>{batch.state === 'BRANCH_PUSHED' || batch.state === 'PR_CREATING' ? '正在创建 Draft PR' : '等待创建 Draft PR'}</h2><details><summary>查看技术详情</summary><ul>{batch.localDiff.changedFiles.map((file) => <li key={file}>{file}</li>)}</ul></details></section>}
-        <section className="post-validation-actions">{batch?.state === 'READY' && <button className="button primary" type="button" disabled={busy} onClick={() => void submit()}>生成本地修改</button>}{batch?.state === 'FAILED' && <button className="button primary" type="button" disabled={busy} onClick={() => void retry()}>重试</button>}</section>
+        {batch?.localDiff && !batch.delivery?.pullRequest && <section className="result-card"><p className="eyebrow">{batch.executionMode === 'local' ? '本地预览已完成' : batch.executionMode === null && batch.state === 'LOCAL_DIFF_READY' ? '历史本地结果已生成' : '修改已生成'}</p><h2>{batch.executionMode === 'local' ? '本地预览已完成，此模式不会创建 PR' : batch.executionMode === null && batch.state === 'LOCAL_DIFF_READY' ? '历史本地结果已生成，此批次不会自动创建 PR；如需自动提 PR，请新建批次。' : batch.executionMode === 'remote' && (batch.state === 'BRANCH_PUSHED' || batch.state === 'PR_CREATING') ? '正在创建 Draft PR' : '修改已生成'}</h2><details><summary>查看技术详情</summary><ul>{batch.localDiff.changedFiles.map((file) => <li key={file}>{file}</li>)}</ul></details></section>}
+        <section className="post-validation-actions">{batch?.state === 'READY' && <button className="button primary" type="button" disabled={busy} onClick={() => void submit()}>生成本地修改</button>}{batch?.state === 'FAILED' && <button className="button primary" type="button" disabled={busy} onClick={() => void retry()}>{batch.executionMode === 'remote' ? '重试远程交付' : '重试生成本地修改'}</button>}</section>
       </main>
       {identityOpen && <IdentityDialog profile={profile} onSave={saveProfile} onClose={profile ? () => setIdentityOpen(false) : undefined} />}
-      {reviewOpen && profile && <ReviewDrawer changes={changes} form={batchForm} profile={profile} errors={reviewErrors} confirmed={confirmed} busy={busy} onChange={(patch) => setBatchForm((current) => ({ ...current, ...patch }))} onConfirmedChange={setConfirmed} onClose={() => setReviewOpen(false)} onSubmit={() => void startValidation()} />}
+      {reviewOpen && profile && <ReviewDrawer changes={changes} form={batchForm} profile={profile} errors={reviewErrors} confirmed={confirmed} busy={busy} onChange={updateBatchMetadata} onConfirmedChange={setConfirmed} onClose={() => setReviewOpen(false)} onSubmit={() => void startValidation()} />}
     </div>
   );
 }

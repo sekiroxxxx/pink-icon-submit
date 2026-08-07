@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 
 import { BatchService } from '../src/batch-service.js';
@@ -39,6 +41,30 @@ class BlockingIconBatchCli extends IconBatchCli {
 
   finishValidation(): void {
     this.resolveValidation();
+  }
+}
+
+class CapturingIconBatchCli extends IconBatchCli {
+  readonly requests: Array<{ request: Record<string, unknown>; svg: string }> = [];
+
+  override async validate(_worktreePath: string, requestPath: string): Promise<IconBatchResult> {
+    const request = JSON.parse(await readFile(requestPath, 'utf8')) as Record<string, unknown>;
+    const items = request.items as Array<{ sourceFile?: string }>;
+    const svg = await readFile(join(dirname(requestPath), items[0]!.sourceFile!), 'utf8');
+    this.requests.push({ request, svg });
+    const valid = this.requests.length > 1;
+    return {
+      exitCode: 0,
+      payload: {
+        schemaVersion: 2,
+        valid,
+        requestSha256: valid ? 'b'.repeat(64) : 'a'.repeat(64),
+        baseCommit: 'c'.repeat(40),
+        summary: { errorCount: valid ? 0 : 1, warningCount: 0 },
+        errors: valid ? [] : [{ code: 'TEST_INVALID', message: 'Simulated first validation failure.' }],
+        warnings: [],
+      },
+    };
   }
 }
 
@@ -162,4 +188,51 @@ test('editing a DRAFT batch clears an obsolete validation result and acknowledge
   assert.equal(updated.validation, null);
   assert.equal(updated.warningsAcknowledged, false);
   assert.equal(updated.baseCommit, null);
+});
+
+test('editing DRAFT batch metadata clears validation and the next validation uses the latest metadata and SVG', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const iconBatch = new CapturingIconBatchCli();
+  const batches = new BatchService(
+    environment.database,
+    environment.batches.storage,
+    environment.batches.repository,
+    iconBatch,
+    environment.config.maxUploadBytes,
+    catalogOptionsFromConfig(environment.config),
+    environment.config.targetRepository,
+  );
+  const batchId = await createBatch(batches);
+  const item = await batches.addItem(batchId, {
+    action: 'add',
+    designName: 'metadata-recheck-icon',
+    description: 'Original description',
+  }, Buffer.from(environment.validSvg));
+
+  const first = await batches.validateBatch(batchId);
+  assert.equal(first.state, 'DRAFT');
+  assert.equal(first.validation !== null, true);
+
+  const updated = await batches.updateBatch(batchId, {
+    title: 'Updated metadata title',
+    description: 'Updated metadata description',
+    designUrl: 'https://design.example.invalid/updated',
+  });
+  assert.equal(updated.validation, null);
+  assert.equal(updated.warningsAcknowledged, false);
+  assert.equal(updated.baseCommit, null);
+
+  const updatedSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M1 1h1v1H1z"/></svg>';
+  await batches.updateItem(batchId, item.id, {
+    action: 'add',
+    designName: 'metadata-recheck-icon',
+    description: 'Updated item description',
+  }, Buffer.from(updatedSvg));
+  const second = await batches.validateBatch(batchId);
+  assert.equal(second.state, 'READY');
+  assert.equal(iconBatch.requests.length, 2);
+  assert.deepEqual(iconBatch.requests[1]?.request.title, 'Updated metadata title');
+  assert.deepEqual(iconBatch.requests[1]?.request.description, 'Updated metadata description');
+  assert.deepEqual(iconBatch.requests[1]?.request.designUrl, 'https://design.example.invalid/updated');
+  assert.equal(iconBatch.requests[1]?.svg, updatedSvg);
 });
