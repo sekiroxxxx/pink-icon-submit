@@ -47,6 +47,7 @@ test('Draft PR template carries the machine marker, submitter, plan, warnings, a
       { id: 'delete', batchId: 'ICON-20260806-ABCDEF12', action: 'delete', targetName: 'old-icon', reason: '已废弃', replacementName: 'new-icon', sourceFile: null, createdAt: '2026-08-06T00:00:00.000Z' },
     ],
     job: null,
+    failureHistory: [],
   };
 
   const draft = draftPullRequestForBatch(batch);

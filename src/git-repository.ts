@@ -3,7 +3,7 @@ import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-import { AppError } from './errors.js';
+import { AppError, sanitizeDiagnosticText } from './errors.js';
 import type { ExecutionMode } from './types.js';
 
 export interface GitCommitIdentity {
@@ -22,6 +22,13 @@ export interface GitRepositoryOptions {
   targetBranch?: string;
   remoteAuthentication?: GitHubTokenAuthentication;
   localTargetRef?: string;
+}
+
+function gitOperation(args: string[]): string {
+  const command = args.find((argument) => [
+    'fetch', 'rev-parse', 'remote', 'ls-remote', 'add', 'diff', 'commit', 'push', 'worktree', 'status',
+  ].includes(argument));
+  return `git ${command ?? 'command'}`;
 }
 
 export class GitRepository {
@@ -192,7 +199,10 @@ export class GitRepository {
     });
     if (result.exitCode !== 0) {
       throw new AppError('GIT_COMMAND_FAILED', 'Git command failed.', 502, {
+        operation: gitOperation(args),
+        command: sanitizeDiagnosticText(['git', ...args].join(' '), 1_000),
         exitCode: result.exitCode,
+        stderr: sanitizeDiagnosticText(result.stderr),
       });
     }
     return result.stdout;

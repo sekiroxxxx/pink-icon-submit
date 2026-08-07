@@ -63,6 +63,7 @@ test('migrates an existing database to the Stage 1 v2 batch protocol fields', as
   const inspection = new Database(databasePath, { readonly: true });
   const columns = inspection.prepare('PRAGMA table_info(batches)').all() as Array<{ name: string }>;
   const migrations = inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
+  const jobFailuresTable = inspection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'job_failures'").get();
   inspection.close();
   assert.deepEqual(columns.map((column) => column.name).filter((name) => name.endsWith('_json')).sort(), [
     'catalog_baseline_json',
@@ -98,7 +99,67 @@ test('migrates an existing database to the Stage 1 v2 batch protocol fields', as
     'push_branch_prefix',
     'push_repository',
   ]);
-  assert.deepEqual(migrations, [{ version: 1 }, { version: 2 }, { version: 3 }]);
+  assert.deepEqual(migrations, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+  assert.notEqual(jobFailuresTable, undefined);
+});
+
+test('retains redacted worker diagnostics after a retry clears the job error', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'pink-icon-submit-failure-history-'));
+  const databasePath = join(root, 'service.sqlite');
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const database = new BatchDatabase(databasePath);
+  const batchId = 'ICON-20260806-ABCDEF12';
+  database.createBatch(
+    batchId,
+    {
+      title: 'Failure diagnostics',
+      description: 'Persist a redacted command failure across retry.',
+      designUrl: 'https://design.example.invalid/failure-history',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+    {
+      packageName: '@pink/codicons',
+      requestedTag: 'beta',
+      version: '0.0.46-test.1',
+      integrity: 'sha512-test',
+      sourceRepository: 'sud-global/pink-codicons',
+      sourceCommit: 'a'.repeat(40),
+    },
+    { repository: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test', branch: 'main' },
+    { executionMode: 'remote', pushRepository: 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test', pushBranchPrefix: 'bot/' },
+  );
+  database.queueJob(batchId);
+  database.claimNextJob();
+  const token = 'gho_1234567890abcdefghij';
+  database.failJob(batchId, 'GIT_COMMAND_FAILED', `fetch failed with ${token}`, {
+    operation: 'git fetch',
+    command: `git fetch https://sud-icon-bot:${token}@github.com/example/repository.git`,
+    exitCode: 128,
+    stderr: `fatal: password=${token} was rejected`,
+  });
+
+  const failed = database.getDetails(batchId);
+  assert.equal(failed.failureHistory.length, 1);
+  assert.deepEqual(failed.failureHistory[0], {
+    id: 1,
+    batchId,
+    attempt: 1,
+    code: 'GIT_COMMAND_FAILED',
+    message: 'fetch failed with [REDACTED]',
+    operation: 'git fetch',
+    command: 'git fetch https://[REDACTED]@github.com/example/repository.git',
+    exitCode: 128,
+    stderr: 'fatal: password=[REDACTED] was rejected',
+    createdAt: failed.failureHistory[0]!.createdAt,
+  });
+
+  database.queueJob(batchId);
+  const retried = database.getDetails(batchId);
+  assert.equal(retried.job?.attempt, 2);
+  assert.equal(retried.job?.error, null);
+  assert.equal(retried.failureHistory.length, 1);
+  assert.doesNotMatch(JSON.stringify(retried.failureHistory), new RegExp(token));
+  database.close();
 });
 
 test('persists a remote batch delivery context without storing a credential', async (t) => {

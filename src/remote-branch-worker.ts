@@ -1,4 +1,4 @@
-import { AppError, isAppError } from './errors.js';
+import { AppError, failureDiagnosticFromError, isAppError } from './errors.js';
 import type { GitCommitIdentity, GitHubTokenAuthentication } from './git-repository.js';
 import type { GitHubPullRequestClient } from './github-client.js';
 import { draftPullRequestForBatch } from './pull-request-template.js';
@@ -132,7 +132,7 @@ export class RemoteBranchWorker {
       return { processed: true, batchId: job.batchId };
     } catch (error) {
       if (isAppError(error)) {
-        this.batches.database.failJob(job.batchId, error.code, error.message);
+        this.batches.database.failJob(job.batchId, error.code, error.message, failureDiagnosticFromError(error));
       } else {
         this.batches.database.failJob(job.batchId, 'WORKER_UNEXPECTED', error instanceof Error ? error.message : String(error));
       }

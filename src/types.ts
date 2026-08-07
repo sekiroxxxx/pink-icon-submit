@@ -82,9 +82,26 @@ export interface StoredJob {
   updatedAt: string;
 }
 
+export interface WorkerFailureDiagnostic {
+  operation?: string;
+  command?: string;
+  exitCode?: number;
+  stderr?: string;
+}
+
+export interface JobFailure extends WorkerFailureDiagnostic {
+  id: number;
+  batchId: string;
+  attempt: number;
+  code: string;
+  message: string;
+  createdAt: string;
+}
+
 export interface BatchDetails extends StoredBatch {
   items: StoredItem[];
   job: StoredJob | null;
+  failureHistory: JobFailure[];
 }
 
 export interface AppConfig {

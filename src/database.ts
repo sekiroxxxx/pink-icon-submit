@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-import { AppError } from './errors.js';
+import { AppError, sanitizeDiagnosticText } from './errors.js';
 import type {
   BatchExecutionContext,
   BatchDetails,
@@ -13,11 +13,13 @@ import type {
   DeliveryCheckpoint,
   ExecutionMode,
   JobState,
+  JobFailure,
   RemoteDeliveryState,
   StoredBatch,
   StoredItem,
   StoredJob,
   TargetRepository,
+  WorkerFailureDiagnostic,
 } from './types.js';
 
 interface BatchRow {
@@ -74,6 +76,19 @@ interface JobRow {
   error_message: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface JobFailureRow {
+  id: number;
+  batch_id: string;
+  attempt: number;
+  error_code: string;
+  error_message: string;
+  operation: string | null;
+  command_text: string | null;
+  exit_code: number | null;
+  stderr_summary: string | null;
+  created_at: string;
 }
 
 interface PullRequestRecord {
@@ -226,6 +241,42 @@ function toJob(row: JobRow): StoredJob {
   };
 }
 
+function toJobFailure(row: JobFailureRow): JobFailure {
+  return {
+    id: row.id,
+    batchId: row.batch_id,
+    attempt: row.attempt,
+    code: row.error_code,
+    message: row.error_message,
+    ...(row.operation ? { operation: row.operation } : {}),
+    ...(row.command_text ? { command: row.command_text } : {}),
+    ...(row.exit_code !== null ? { exitCode: row.exit_code } : {}),
+    ...(row.stderr_summary ? { stderr: row.stderr_summary } : {}),
+    createdAt: row.created_at,
+  };
+}
+
+function sanitizedFailureDiagnostic(diagnostic: WorkerFailureDiagnostic | undefined): WorkerFailureDiagnostic | undefined {
+  if (!diagnostic) {
+    return undefined;
+  }
+  const operation = typeof diagnostic.operation === 'string'
+    ? sanitizeDiagnosticText(diagnostic.operation, 120)
+    : undefined;
+  const command = typeof diagnostic.command === 'string'
+    ? sanitizeDiagnosticText(diagnostic.command, 1_000)
+    : undefined;
+  const exitCode = typeof diagnostic.exitCode === 'number' && Number.isInteger(diagnostic.exitCode)
+    ? diagnostic.exitCode
+    : undefined;
+  const stderr = typeof diagnostic.stderr === 'string'
+    ? sanitizeDiagnosticText(diagnostic.stderr)
+    : undefined;
+  return operation || command || exitCode !== undefined || stderr
+    ? { operation, command, exitCode, stderr }
+    : undefined;
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -323,11 +374,17 @@ export class BatchDatabase {
     const batch = this.getBatch(id);
     const items = (this.db.prepare('SELECT * FROM items WHERE batch_id = ? ORDER BY created_at, id').all(id) as ItemRow[]).map(toItem);
     const job = this.getJob(id);
-    return { ...batch, items, job };
+    return { ...batch, items, job, failureHistory: this.getFailureHistory(id) };
   }
 
   getItems(batchId: string): StoredItem[] {
     return (this.db.prepare('SELECT * FROM items WHERE batch_id = ? ORDER BY created_at, id').all(batchId) as ItemRow[]).map(toItem);
+  }
+
+  getFailureHistory(batchId: string): JobFailure[] {
+    return (this.db.prepare(`
+      SELECT * FROM job_failures WHERE batch_id = ? ORDER BY id
+    `).all(batchId) as JobFailureRow[]).map(toJobFailure);
   }
 
   countItems(batchId: string): number {
@@ -616,24 +673,48 @@ export class BatchDatabase {
     return resume();
   }
 
-  failJob(batchId: string, code: string, message: string): void {
-    const timestamp = now();
-    this.db.prepare(`
-      UPDATE jobs SET state = 'FAILED', error_code = ?, error_message = ?, updated_at = ? WHERE batch_id = ?
-    `).run(code, message, timestamp, batchId);
-    this.db.prepare(`
-      UPDATE batches SET state = 'FAILED', error_code = ?, error_message = ?, updated_at = ?
-      WHERE id = ? AND state <> 'PR_CREATED'
-    `).run(code, message, timestamp, batchId);
+  failJob(batchId: string, code: string, message: string, diagnostic?: WorkerFailureDiagnostic): void {
+    const failure = this.db.transaction(() => {
+      const timestamp = now();
+      const safeCode = sanitizeDiagnosticText(code, 120);
+      const safeMessage = sanitizeDiagnosticText(message, 1_000);
+      const safeDiagnostic = sanitizedFailureDiagnostic(diagnostic);
+      const job = this.db.prepare('SELECT attempt FROM jobs WHERE batch_id = ?').get(batchId) as Pick<JobRow, 'attempt'> | undefined;
+      if (job) {
+        this.db.prepare(`
+          INSERT INTO job_failures (
+            batch_id, attempt, error_code, error_message, operation, command_text, exit_code, stderr_summary, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          batchId,
+          job.attempt,
+          safeCode,
+          safeMessage,
+          safeDiagnostic?.operation ?? null,
+          safeDiagnostic?.command ?? null,
+          safeDiagnostic?.exitCode ?? null,
+          safeDiagnostic?.stderr ?? null,
+          timestamp,
+        );
+      }
+      this.db.prepare(`
+        UPDATE jobs SET state = 'FAILED', error_code = ?, error_message = ?, updated_at = ? WHERE batch_id = ?
+      `).run(safeCode, safeMessage, timestamp, batchId);
+      this.db.prepare(`
+        UPDATE batches SET state = 'FAILED', error_code = ?, error_message = ?, updated_at = ?
+        WHERE id = ? AND state <> 'PR_CREATED'
+      `).run(safeCode, safeMessage, timestamp, batchId);
+    });
+    failure();
   }
 
   recoverInterruptedJobs(): number {
     const recover = this.db.transaction(() => {
       const jobs = this.db.prepare(`
-        SELECT jobs.batch_id, batches.state AS batch_state
+        SELECT jobs.batch_id, jobs.attempt, batches.state AS batch_state
         FROM jobs JOIN batches ON batches.id = jobs.batch_id
         WHERE jobs.state = 'RUNNING'
-      `).all() as Array<Pick<JobRow, 'batch_id'> & { batch_state: BatchState }>;
+      `).all() as Array<Pick<JobRow, 'batch_id' | 'attempt'> & { batch_state: BatchState }>;
       if (jobs.length === 0) {
         return 0;
       }
@@ -646,6 +727,10 @@ export class BatchDatabase {
           `).run(timestamp, job.batch_id);
           continue;
         }
+        this.db.prepare(`
+          INSERT INTO job_failures (batch_id, attempt, error_code, error_message, created_at)
+          VALUES (?, ?, 'WORKER_INTERRUPTED', 'The worker stopped before this task finished.', ?)
+        `).run(job.batch_id, job.attempt, timestamp);
         this.db.prepare(`
           UPDATE jobs
           SET state = 'FAILED', error_code = 'WORKER_INTERRUPTED',
@@ -797,6 +882,23 @@ export class BatchDatabase {
       if (!columns.has('handoff_at')) {
         this.db.exec('ALTER TABLE batches ADD COLUMN handoff_at TEXT');
       }
+    });
+    this.applyMigration(4, () => {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS job_failures (
+          id INTEGER PRIMARY KEY,
+          batch_id TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+          attempt INTEGER NOT NULL,
+          error_code TEXT NOT NULL,
+          error_message TEXT NOT NULL,
+          operation TEXT,
+          command_text TEXT,
+          exit_code INTEGER,
+          stderr_summary TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS job_failures_batch_id_id ON job_failures(batch_id, id);
+      `);
     });
   }
 

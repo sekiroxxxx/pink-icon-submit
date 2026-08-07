@@ -144,6 +144,36 @@ test('branch delivery phase stops after a safe push without creating a Draft PR'
   assert.equal(github.created.length, 0);
 });
 
+test('remote worker retains a Git failure diagnostic when a retry replaces the active job error', async (t) => {
+  const { environment, batchId } = await createSubmittedRemoteBatch(t);
+  const repository = environment.batches.repository as unknown as { options: { targetRemote: string } };
+  repository.options.targetRemote = 'missing';
+
+  await workerFor(environment).processNext();
+  const failed = environment.database.getDetails(batchId);
+  assert.equal(failed.state, 'FAILED');
+  assert.equal(failed.failureHistory.length, 1);
+  assert.deepEqual(failed.failureHistory[0] && {
+    attempt: failed.failureHistory[0].attempt,
+    code: failed.failureHistory[0].code,
+    operation: failed.failureHistory[0].operation,
+    exitCode: failed.failureHistory[0].exitCode,
+  }, {
+    attempt: 1,
+    code: 'GIT_COMMAND_FAILED',
+    operation: 'git fetch',
+    exitCode: 128,
+  });
+  assert.match(failed.failureHistory[0]?.command ?? '', /git -C .* fetch missing$/);
+  assert.match(failed.failureHistory[0]?.stderr ?? '', /missing/);
+
+  environment.batches.retry(batchId);
+  const retried = environment.database.getDetails(batchId);
+  assert.equal(retried.job?.attempt, 2);
+  assert.equal(retried.job?.error, null);
+  assert.equal(retried.failureHistory.length, 1);
+});
+
 test('remote worker recovers a successful push when only the COMMIT_PREPARED checkpoint survived', async (t) => {
   const { environment, batchId } = await createSubmittedRemoteBatch(t);
   const github = new FakeGitHubPullRequestClient();
