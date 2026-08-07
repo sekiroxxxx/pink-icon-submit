@@ -13,6 +13,7 @@ test('explicit local mode resolves the published beta catalog without inferring 
   });
 
   assert.equal(config.executionMode, 'local');
+  assert.equal(config.workerEnabled, false);
   assert.equal(config.stage1SourcePath, 'C:\\workspace\\pink-codicons');
   assert.equal(config.localTargetRef, 'main');
   assert.deepEqual(config.targetRepository, {
@@ -46,6 +47,7 @@ test('remote mode requires the fixed P3 R2/R3 topology and explicit delivery set
   });
 
   assert.equal(config.executionMode, 'remote');
+  assert.equal(config.workerEnabled, false);
   assert.deepEqual(config.remoteDelivery && {
     targetRemote: config.remoteDelivery.targetRemote,
     pushRepository: config.remoteDelivery.pushRepository,
@@ -99,4 +101,19 @@ test('execution mode and Stage 1 v2 target repository must be explicit', () => {
     }),
     /PINK_ICON_TARGET_REPOSITORY/,
   );
+});
+
+test('worker execution is disabled by default and requires an explicit true value', () => {
+  const environment = {
+    PINK_CODICONS_DIR: 'C:\\workspace\\target-clone',
+    PINK_ICON_EXECUTION_MODE: 'local',
+    PINK_ICON_STAGE1_SOURCE_DIR: 'C:\\workspace\\pink-codicons',
+    PINK_ICON_LOCAL_TARGET_REF: 'main',
+    PINK_ICON_TARGET_REPOSITORY: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test',
+  };
+
+  assert.equal(configFromEnv(environment).workerEnabled, false);
+  assert.equal(configFromEnv({ ...environment, PINK_ICON_WORKER_ENABLED: 'true' }).workerEnabled, true);
+  assert.equal(configFromEnv({ ...environment, PINK_ICON_WORKER_ENABLED: 'false' }).workerEnabled, false);
+  assert.throws(() => configFromEnv({ ...environment, PINK_ICON_WORKER_ENABLED: '1' }), /PINK_ICON_WORKER_ENABLED/);
 });

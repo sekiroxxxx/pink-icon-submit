@@ -10,7 +10,7 @@ PinK 图标自动 Draft PR MVP 的独立编排服务。当前包含 Fastify、SQ
 - 目录展示基于 npm 发布物；名称预览、最终校验和本地 diff 基于目标 Git ref。`local` 模式只解析本地 ref，绝不执行 `git fetch`；本地 Stage 1 源码只提供 CLI 实现，不能替代 npm catalog 基线。
 - local Worker 只在临时 worktree 生成本地 diff；remote Worker 会在 R3 创建一个 `bot/<batchId>` commit、普通 push，并向 R2/main 创建一个 GitHub Draft PR。
 - 前端只负责批次表单、SVG 预览、目录选择和状态展示；不解析 mapping、不分配 codepoint、不持有 GitHub Token。
-- 本地批次状态为 `DRAFT → VALIDATING → READY → QUEUED → RUNNING → LOCAL_DIFF_READY`。远程交付依次经过 `COMMIT_PREPARED → BRANCH_PUSHED → PR_CREATING → PR_CREATED`；`PR_CREATED` 为开发接管终态，平台不再 push 或修改该分支。进程重启时遗留的 `VALIDATING` 批次会安全退回 `DRAFT`；遗留的 `RUNNING` job 会标记为 `FAILED/WORKER_INTERRUPTED`，但已 `PR_CREATED` 的交接不会被降级或重试。
+- 本地批次状态为 `DRAFT → VALIDATING → READY → QUEUED → RUNNING → LOCAL_DIFF_READY`。远程交付依次经过 `COMMIT_PREPARED → BRANCH_PUSHED → PR_CREATING → PR_CREATED`；`PR_CREATED` 为开发接管终态，平台不再 push 或修改该分支。进程重启时遗留的 `VALIDATING` 批次会安全退回 `DRAFT`；仅在 Worker 显式启用时，遗留的 `RUNNING` job 才会标记为 `FAILED/WORKER_INTERRUPTED`，且已 `PR_CREATED` 的交接不会被降级或重试。
 
 ## 配置
 
@@ -32,6 +32,7 @@ PINK_ICON_CATALOG_REGISTRY=http://creator-npm.cocos.org:7001 # 可选，默认 P
 PINK_ICON_CATALOG_AUTH_TOKEN=...                           # 私有 registry 需要时由部署环境注入
 PINK_ICON_CATALOG_SOURCE_REPOSITORY=sud-global/pink-codicons # 可选
 PINK_ICON_CATALOG_REFRESH_MS=60000                         # 可选，默认 60 秒
+PINK_ICON_WORKER_ENABLED=false                              # 可选，默认 false；仅 true 执行队列任务
 ```
 
 P3 开发期远程模式（创建 R3 的 `bot/<batchId>` 分支和 R2 的 Draft PR）：
@@ -45,14 +46,22 @@ PINK_ICON_TARGET_REMOTE=upstream
 PINK_ICON_PUSH_REPOSITORY=sud-icon-bot/sekiroxxxx-pink-codicons-automation-test
 PINK_ICON_PUSH_REMOTE=origin
 PINK_ICON_PUSH_BRANCH_PREFIX=bot/
+PINK_ICON_REMOTE_DELIVERY_PHASE=pull_request
 PINK_ICON_GITHUB_TOKEN=<deployment-secret>
 PINK_ICON_GIT_COMMITTER_NAME=PinK Icon Bot
 PINK_ICON_GIT_COMMITTER_EMAIL=<approved-bot-email>
+PINK_ICON_WORKER_ENABLED=false
 ```
 
 远程模式只允许上述 R2/R3 配对，启动时验证 target/push remote URL、R3 的直接 fork parent 和 `bot/` 前缀。Token 只用于后端 GitHub API Authorization header 和临时 `GIT_ASKPASS` 子进程；不写入 remote URL、数据库、前端、命令参数或错误消息。
 
 `local` 模式的 `PINK_CODICONS_DIR` 应是隔离的本地目标仓库 clone。Worker 从 `PINK_ICON_LOCAL_TARGET_REF` 创建临时 detached worktree，生成、应用和读取 diff 后删除该 worktree；不会 fetch、commit、push 或创建 PR。`PINK_ICON_STAGE1_SOURCE_DIR` 是当前 `codex/icon-automation-v2` 工作区，只用来执行 `scripts/icon-batch.mjs`；服务不会在其中安装依赖或修改文件。
+
+### Worker 启动开关
+
+服务默认以 API/UI-only 模式启动：`PINK_ICON_WORKER_ENABLED` 未设置或为 `false` 时，仍会恢复中断的 `VALIDATING` 批次，但不会执行 remote topology preflight、恢复或领取交付 job、构造 local/remote Worker，或启动轮询。只有显式设置为 `true` 才会执行这些操作。启动日志会显示 Worker 为 enabled 或 disabled，且不会输出 Token 或其他敏感配置。
+
+`PINK_ICON_EXECUTION_MODE=local` 只决定本地交付的实现方式，不是禁用 Worker 的开关；`PINK_ICON_REMOTE_DELIVERY_PHASE=branch` 只在安全 push 后停止创建 Draft PR，也不是禁用 Worker 的开关。`PINK_ICON_WORKER_POLL_MS` 只控制已启用 Worker 的轮询间隔，不能用 `0` 关闭 Worker。
 
 npm registry 暂时不可用时，服务会尝试使用本地已验证的 tag 解析记录、integrity 快照和原始 tarball；没有可验证的本地数据时，目录 API 或新批次创建会返回明确错误。迁移前创建、没有 `catalogBaseline` 与目标仓库上下文的旧批次不能用于 v2，必须重新创建。
 

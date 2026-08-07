@@ -226,6 +226,7 @@ export async function createTestEnvironment(t: TestContext, options: TestEnviron
     catalogSourceRepository: 'sud-global/pink-codicons',
     catalogCacheRoot: join(data, 'catalog-cache'),
     catalogRefreshIntervalMs: 60_000,
+    workerEnabled: false,
     workerPollIntervalMs: 10,
     maxUploadBytes: 1024 * 1024,
   };
