@@ -328,6 +328,24 @@ export class BatchDatabase {
     return this.getBatch(id);
   }
 
+  updateBatchMetadata(batchId: string, input: Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>): StoredBatch {
+    const update = this.db.transaction(() => {
+      this.requireDraftBatch(batchId);
+      const timestamp = now();
+      const result = this.db.prepare(`
+        UPDATE batches
+        SET title = ?, description = ?, design_url = ?
+        WHERE id = ? AND state = 'DRAFT'
+      `).run(input.title, input.description, input.designUrl, batchId);
+      if (result.changes !== 1) {
+        throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} is no longer editable.`, 409);
+      }
+      this.clearValidationAfterItemChange(batchId, timestamp);
+      return this.getBatch(batchId);
+    });
+    return update();
+  }
+
   insertItem(batchId: string, id: string, input: CreateItemInput, sourceFile: string | null): StoredItem {
     const insert = this.db.transaction(() => {
       const batch = this.db.prepare('SELECT state FROM batches WHERE id = ?').get(batchId) as Pick<BatchRow, 'state'> | undefined;

@@ -65,6 +65,27 @@ function baseCommitFrom(value: unknown): string | null {
   return isObject(value) && typeof value.baseCommit === 'string' ? value.baseCommit : null;
 }
 
+function batchMetadataFrom(value: unknown): Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'> {
+  const submitted: Record<string, unknown> = isObject(value) ? value : {};
+  const designUrl = requiredText(submitted.designUrl, 'designUrl', 2_000);
+  if (!/^https?:\/\//i.test(designUrl)) {
+    throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
+  }
+  try {
+    const parsed = new URL(designUrl);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new Error('unsupported scheme');
+    }
+  } catch {
+    throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
+  }
+  return {
+    title: requiredText(submitted.title, 'title', 200),
+    description: requiredText(submitted.description, 'description', 5_000),
+    designUrl,
+  };
+}
+
 export class BatchService {
   private readonly batchLocks = new Map<string, Promise<void>>();
   private readonly catalog: CatalogSnapshotCache;
@@ -93,10 +114,9 @@ export class BatchService {
   async createBatch(input: CreateBatchInput): Promise<BatchDetails> {
     const submitted: Record<string, unknown> = isObject(input) ? input : {};
     const submitter = isObject(submitted.submitter) ? submitted.submitter : {};
+    const metadata = batchMetadataFrom(submitted);
     const normalized: CreateBatchInput = {
-      title: requiredText(submitted.title, 'title', 200),
-      description: requiredText(submitted.description, 'description', 5_000),
-      designUrl: requiredText(submitted.designUrl, 'designUrl', 2_000),
+      ...metadata,
       submitter: {
         name: requiredText(submitter.name, 'submitter.name', 100),
         email: requiredText(submitter.email, 'submitter.email', 320),
@@ -105,17 +125,19 @@ export class BatchService {
     if (!/^\S+@\S+\.\S+$/.test(normalized.submitter.email)) {
       throw new AppError('REQUEST_INVALID', 'submitter.email must be a valid email address.');
     }
-    try {
-      const designUrl = new URL(normalized.designUrl);
-      if (!['http:', 'https:'].includes(designUrl.protocol)) {
-        throw new Error('unsupported scheme');
-      }
-    } catch {
-      throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
-    }
     const catalogBaseline = await this.catalog.baseline();
     const batch = this.database.createBatch(createBatchId(), normalized, catalogBaseline, this.targetRepository, this.executionContext);
     return this.database.getDetails(batch.id);
+  }
+
+  async updateBatch(batchId: string, input: Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>): Promise<BatchDetails> {
+    this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+    return this.withBatchLock(batchId, async () => {
+      this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+      const normalized = batchMetadataFrom(input);
+      this.database.updateBatchMetadata(batchId, normalized);
+      return this.database.getDetails(batchId);
+    });
   }
 
   async addItem(batchId: string, input: CreateItemInput, svg: Buffer | undefined): Promise<StoredItem> {

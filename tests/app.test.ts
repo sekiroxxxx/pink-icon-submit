@@ -107,6 +107,100 @@ test('DRAFT items can be updated and deleted', async (t) => {
   assert.deepEqual((batch.json() as { items: unknown[] }).items, []);
 });
 
+test('DRAFT batch metadata can be updated and clears obsolete validation, but READY batches remain immutable', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Original title',
+      description: 'Original description',
+      designUrl: 'https://design.example.invalid/original',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  const batchId = (created.json() as { id: string }).id;
+  environment.database.beginValidation(batchId);
+  environment.database.completeValidation(batchId, {
+    valid: false,
+    requestSha256: 'd'.repeat(64),
+    errors: [{ code: 'TEST_ERROR', message: 'Old validation result.' }],
+    warnings: [],
+  }, 'e'.repeat(40), false);
+
+  const updated = await app.inject({
+    method: 'PUT',
+    url: `/api/batches/${batchId}`,
+    payload: {
+      title: 'Updated title',
+      description: 'Updated description',
+      designUrl: 'https://design.example.invalid/updated',
+    },
+  });
+  assert.equal(updated.statusCode, 200);
+  const updatedBody = updated.json() as {
+    state: string;
+    title: string;
+    description: string;
+    designUrl: string;
+    validation: unknown;
+    warningsAcknowledged: boolean;
+    baseCommit: string | null;
+    localDiff: unknown;
+  };
+  assert.equal(updatedBody.state, 'DRAFT');
+  assert.equal(updatedBody.title, 'Updated title');
+  assert.equal(updatedBody.description, 'Updated description');
+  assert.equal(updatedBody.designUrl, 'https://design.example.invalid/updated');
+  assert.equal(updatedBody.validation, null);
+  assert.equal(updatedBody.warningsAcknowledged, false);
+  assert.equal(updatedBody.baseCommit, null);
+  assert.equal(updatedBody.localDiff, null);
+
+  const validated = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/validate` });
+  assert.equal(validated.statusCode, 409);
+  assert.equal((validated.json() as { error: { code: string } }).error.code, 'BATCH_EMPTY');
+
+  const readyBatch = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Ready title',
+      description: 'Ready description',
+      designUrl: 'https://design.example.invalid/ready',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  const readyBatchId = (readyBatch.json() as { id: string }).id;
+  await app.inject({
+    method: 'POST',
+    url: `/api/batches/${readyBatchId}/items`,
+    payload: {
+      action: 'add',
+      designName: 'ready-metadata-icon',
+      description: 'Makes the batch valid.',
+      svgBase64: Buffer.from(environment.validSvg).toString('base64'),
+    },
+  });
+  const validation = await app.inject({ method: 'POST', url: `/api/batches/${readyBatchId}/validate` });
+  assert.equal(validation.statusCode, 200);
+
+  const rejected = await app.inject({
+    method: 'PUT',
+    url: `/api/batches/${readyBatchId}`,
+    payload: {
+      title: 'Not allowed',
+      description: 'Not allowed',
+      designUrl: 'https://design.example.invalid/not-allowed',
+    },
+  });
+  assert.equal(rejected.statusCode, 409);
+  assert.equal((rejected.json() as { error: { code: string } }).error.code, 'BATCH_NOT_EDITABLE');
+});
+
 test('delete replacement must select a different existing catalog icon', async (t) => {
   const environment = await createTestEnvironment(t);
   const app = await buildApp({ batches: environment.batches });
@@ -304,6 +398,19 @@ test('batch creation rejects invalid designer email and design links', async (t)
   });
   assert.equal(invalidUrl.statusCode, 400);
   assert.equal((invalidUrl.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
+
+  const malformedHttps = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Malformed HTTPS link',
+      description: 'Validation',
+      designUrl: 'https:www.123.com',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  assert.equal(malformedHttps.statusCode, 400);
+  assert.equal((malformedHttps.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
 });
 
 test('oversized multipart SVG returns UPLOAD_TOO_LARGE', async (t) => {
