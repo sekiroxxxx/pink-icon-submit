@@ -4,7 +4,7 @@ import type { GitHubPullRequestClient } from './github-client.js';
 import { draftPullRequestForBatch } from './pull-request-template.js';
 import { branchForBatch } from './remote-preflight.js';
 import { BatchService } from './batch-service.js';
-import type { CommitterIdentity, StoredBatch, TargetRepository } from './types.js';
+import type { CommitterIdentity, RemoteDeliveryPhase, StoredBatch, TargetRepository } from './types.js';
 import type { WorkerResult } from './worker.js';
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -51,6 +51,7 @@ export interface RemoteBranchWorkerOptions {
   pushRemote: string;
   pushRepository: string;
   pushBranchPrefix: 'bot/';
+  deliveryPhase: RemoteDeliveryPhase;
   committer: CommitterIdentity;
   targetRepository: TargetRepository;
   github: GitHubPullRequestClient;
@@ -123,6 +124,10 @@ export class RemoteBranchWorker {
       this.batches.database.recordCommitPrepared(job.batchId, result.plan, result.baseCommit, result.localDiff, branch, result.commitSha);
       await this.pushOrRecoverBranch(branch, result.commitSha);
       this.batches.database.recordBranchPushed(job.batchId);
+      if (this.options.deliveryPhase === 'branch') {
+        this.batches.database.completeBranchPushedJob(job.batchId);
+        return { processed: true, batchId: job.batchId };
+      }
       await this.createOrRecoverDraftPullRequest(this.batches.database.getBatch(job.batchId));
       return { processed: true, batchId: job.batchId };
     } catch (error) {
@@ -175,6 +180,10 @@ export class RemoteBranchWorker {
     }
     if (batch.delivery.checkpoint === 'COMMIT_PREPARED') {
       this.batches.database.recordBranchPushed(batch.id);
+    }
+    if (this.options.deliveryPhase === 'branch') {
+      this.batches.database.completeBranchPushedJob(batch.id);
+      return true;
     }
     await this.createOrRecoverDraftPullRequest(this.batches.database.getBatch(batch.id));
     return true;

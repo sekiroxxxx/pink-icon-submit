@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 
-import type { AppConfig, ExecutionMode, NpmPackageCatalogOptions, RemoteDeliveryConfig, TargetRepository } from './types.js';
+import type { AppConfig, ExecutionMode, NpmPackageCatalogOptions, RemoteDeliveryConfig, RemoteDeliveryPhase, TargetRepository } from './types.js';
 
 const p3TargetRepository = 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test';
 const p3PushRepository = 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test';
@@ -53,6 +53,14 @@ function remoteName(environment: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
+function remoteDeliveryPhase(environment: NodeJS.ProcessEnv): RemoteDeliveryPhase {
+  const value = requiredEnvironmentValue(environment, 'PINK_ICON_REMOTE_DELIVERY_PHASE');
+  if (value === 'branch' || value === 'pull_request') {
+    return value;
+  }
+  throw new Error('PINK_ICON_REMOTE_DELIVERY_PHASE must be branch or pull_request.');
+}
+
 function remoteDeliveryFromEnv(environment: NodeJS.ProcessEnv, targetRepository: TargetRepository): RemoteDeliveryConfig {
   if (targetRepository.repository !== p3TargetRepository) {
     throw new Error(`P3 remote mode only permits PINK_ICON_TARGET_REPOSITORY=${p3TargetRepository}.`);
@@ -83,6 +91,7 @@ function remoteDeliveryFromEnv(environment: NodeJS.ProcessEnv, targetRepository:
     pushRepository,
     pushRemote,
     pushBranchPrefix: 'bot/',
+    deliveryPhase: remoteDeliveryPhase(environment),
     githubToken: requiredEnvironmentValue(environment, 'PINK_ICON_GITHUB_TOKEN'),
     committer: { name: committerName, email: committerEmail },
   };

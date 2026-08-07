@@ -50,7 +50,7 @@ const batches = new BatchService(
 );
 database.recoverInterruptedValidations();
 database.recoverInterruptedJobs();
-if (config.remoteDelivery) {
+if (config.remoteDelivery?.deliveryPhase === 'pull_request') {
   database.resumeBranchPushedJobs();
 }
 const worker = config.remoteDelivery
@@ -58,6 +58,7 @@ const worker = config.remoteDelivery
     pushRemote: config.remoteDelivery.pushRemote,
     pushRepository: config.remoteDelivery.pushRepository,
     pushBranchPrefix: config.remoteDelivery.pushBranchPrefix,
+    deliveryPhase: config.remoteDelivery.deliveryPhase,
     committer: config.remoteDelivery.committer,
     targetRepository: config.targetRepository,
     github: github!,

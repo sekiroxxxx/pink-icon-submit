@@ -510,6 +510,16 @@ export class BatchDatabase {
     }
   }
 
+  completeBranchPushedJob(batchId: string): void {
+    const result = this.db.prepare(`
+      UPDATE jobs SET state = 'COMPLETED', error_code = NULL, error_message = NULL, updated_at = ?
+      WHERE batch_id = ? AND state = 'RUNNING'
+    `).run(now(), batchId);
+    if (result.changes !== 1) {
+      throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} pushed-branch job cannot be completed.`, 409);
+    }
+  }
+
   beginPullRequestCreation(batchId: string): void {
     const begin = this.db.transaction(() => {
       const job = this.db.prepare('SELECT state FROM jobs WHERE batch_id = ?').get(batchId) as Pick<JobRow, 'state'> | undefined;

@@ -54,6 +54,7 @@ function workerFor(environment: TestEnvironment, github = new FakeGitHubPullRequ
     pushRemote: delivery.pushRemote,
     pushRepository: delivery.pushRepository,
     pushBranchPrefix: delivery.pushBranchPrefix,
+    deliveryPhase: delivery.deliveryPhase,
     committer: delivery.committer,
     targetRepository: environment.config.targetRepository,
     github,
@@ -114,6 +115,33 @@ test('remote worker creates one bot branch commit and one Draft PR without touch
   assert.equal(remoteHead(environment.pushRepositoryPath!, 'main'), environment.config.targetRepository.branch === 'main'
     ? execFileSync('git', ['-C', environment.config.repositoryPath, 'rev-parse', 'upstream/main'], { encoding: 'utf8' }).trim()
     : '');
+});
+
+test('branch delivery phase stops after a safe push without creating a Draft PR', async (t) => {
+  const { environment, batchId } = await createSubmittedRemoteBatch(t);
+  const github = new FakeGitHubPullRequestClient();
+  const delivery = environment.config.remoteDelivery!;
+  const worker = new RemoteBranchWorker(environment.batches, {
+    pushRemote: delivery.pushRemote,
+    pushRepository: delivery.pushRepository,
+    pushBranchPrefix: delivery.pushBranchPrefix,
+    deliveryPhase: 'branch',
+    committer: delivery.committer,
+    targetRepository: environment.config.targetRepository,
+    github,
+    authentication: {
+      username: delivery.pushRepository.split('/')[0],
+      token: delivery.githubToken,
+    },
+  });
+
+  await worker.processNext();
+  const pushed = environment.batches.getBatch(batchId);
+  assert.equal(pushed.state, 'BRANCH_PUSHED');
+  assert.equal(pushed.delivery.checkpoint, 'BRANCH_PUSHED');
+  assert.equal(pushed.job?.state, 'COMPLETED');
+  assert.equal(remoteHead(environment.pushRepositoryPath!, pushed.delivery.branch!), pushed.delivery.commitSha);
+  assert.equal(github.created.length, 0);
 });
 
 test('remote worker recovers a successful push when only the COMMIT_PREPARED checkpoint survived', async (t) => {

@@ -2,6 +2,8 @@ export type ItemAction = 'add' | 'replace' | 'delete';
 
 export type ExecutionMode = 'local' | 'remote';
 
+export type RemoteDeliveryPhase = 'branch' | 'pull_request';
+
 export type DeliveryCheckpoint =
   | 'NONE'
   | 'COMMIT_PREPARED'
@@ -146,6 +148,7 @@ export interface RemoteDeliveryConfig {
   pushRepository: string;
   pushRemote: string;
   pushBranchPrefix: 'bot/';
+  deliveryPhase: RemoteDeliveryPhase;
   githubToken: string;
   committer: CommitterIdentity;
 }

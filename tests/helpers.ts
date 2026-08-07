@@ -215,6 +215,7 @@ export async function createTestEnvironment(t: TestContext, options: TestEnviron
         pushRepository: 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test',
         pushRemote: 'origin',
         pushBranchPrefix: 'bot/' as const,
+        deliveryPhase: 'pull_request',
         githubToken: 'test-only-token',
         committer: { name: 'Test Bot', email: 'test-bot@example.invalid' },
       },
