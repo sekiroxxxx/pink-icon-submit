@@ -6,7 +6,7 @@ import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
-import type { BatchDetails, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
+import type { BatchDetails, BatchExecutionContext, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
 
 const maximumBatchItems = 100;
 
@@ -77,6 +77,11 @@ export class BatchService {
     private readonly maxUploadBytes: number,
     catalogOptions: NpmPackageCatalogOptions,
     private readonly targetRepository: TargetRepository,
+    private readonly executionContext: BatchExecutionContext = {
+      executionMode: 'local',
+      pushRepository: null,
+      pushBranchPrefix: null,
+    },
   ) {
     this.catalog = new CatalogSnapshotCache(repository, iconBatch, catalogOptions);
   }
@@ -109,7 +114,7 @@ export class BatchService {
       throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
     }
     const catalogBaseline = await this.catalog.baseline();
-    const batch = this.database.createBatch(createBatchId(), normalized, catalogBaseline, this.targetRepository);
+    const batch = this.database.createBatch(createBatchId(), normalized, catalogBaseline, this.targetRepository, this.executionContext);
     return this.database.getDetails(batch.id);
   }
 

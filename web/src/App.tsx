@@ -53,6 +53,10 @@ const stateLabel: Record<BatchDetails['state'], string> = {
   QUEUED: '等待生成本地修改',
   RUNNING: '正在生成本地修改',
   LOCAL_DIFF_READY: '本地修改已生成',
+  COMMIT_PREPARED: '正在准备机器人提交',
+  BRANCH_PUSHED: '机器人分支已创建',
+  PR_CREATING: '正在创建 Draft PR',
+  PR_CREATED: 'Draft PR 已创建',
   FAILED: '处理失败',
 };
 
@@ -575,7 +579,7 @@ export function App() {
   }, [action, addName, editable]);
 
   useEffect(() => {
-    if (!batch || !['QUEUED', 'RUNNING'].includes(batch.state)) return undefined;
+    if (!batch || !['QUEUED', 'RUNNING', 'COMMIT_PREPARED', 'BRANCH_PUSHED', 'PR_CREATING'].includes(batch.state)) return undefined;
     const timer = window.setInterval(() => {
       void api.getBatch(batch.id).then(setBatch).catch((error: unknown) => setNotice(error instanceof Error ? error.message : '无法刷新批次状态。'));
     }, 1_500);
@@ -872,7 +876,8 @@ export function App() {
         <DiagnosticList title="需要修正的问题" diagnostics={batch?.validation?.errors ?? []} tone="error" />
         <DiagnosticList title="开发审核提醒" diagnostics={batch?.validation?.warnings ?? []} tone="warning" />
         {batch?.error && <section className="diagnostics error"><h2>处理失败</h2><p><strong>{batch.error.code}</strong> {batch.error.message}</p></section>}
-        {batch?.localDiff && <section className="result-card"><p className="eyebrow">本地修改已就绪</p><h2>等待阶段 3 创建 Draft PR</h2><p>当前阶段只生成并保存可审阅的本地 diff，不会创建 GitHub 分支或 Pull Request。</p><details><summary>查看技术详情</summary><ul>{batch.localDiff.changedFiles.map((file) => <li key={file}>{file}</li>)}</ul></details></section>}
+        {batch?.delivery?.pullRequest && <section className="result-card"><p className="eyebrow">Draft PR 已创建</p><h2>已交给开发审核和接管</h2><p><a href={batch.delivery.pullRequest.url} target="_blank" rel="noreferrer">打开 Draft PR #{batch.delivery.pullRequest.number}</a></p><p>平台已停止写入该机器人分支；后续调整请直接在 PR 中完成。</p></section>}
+        {batch?.localDiff && !batch.delivery?.pullRequest && <section className="result-card"><p className="eyebrow">修改已生成</p><h2>{batch.state === 'BRANCH_PUSHED' || batch.state === 'PR_CREATING' ? '正在创建 Draft PR' : '等待创建 Draft PR'}</h2><details><summary>查看技术详情</summary><ul>{batch.localDiff.changedFiles.map((file) => <li key={file}>{file}</li>)}</ul></details></section>}
         <section className="post-validation-actions">{batch?.state === 'READY' && <button className="button primary" type="button" disabled={busy} onClick={() => void submit()}>生成本地修改</button>}{batch?.state === 'FAILED' && <button className="button primary" type="button" disabled={busy} onClick={() => void retry()}>重试</button>}</section>
       </main>
       {identityOpen && <IdentityDialog profile={profile} onSave={saveProfile} onClose={profile ? () => setIdentityOpen(false) : undefined} />}

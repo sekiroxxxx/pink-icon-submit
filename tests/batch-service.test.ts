@@ -102,11 +102,15 @@ test('interrupted RUNNING jobs become retryable failures on startup recovery', a
   assert.equal(failed.state, 'FAILED');
   assert.equal(failed.error?.code, 'WORKER_INTERRUPTED');
   assert.equal(failed.job?.state, 'FAILED');
+  assert.deepEqual(failed.failureHistory.map((failure) => ({ attempt: failure.attempt, code: failure.code })), [
+    { attempt: 1, code: 'WORKER_INTERRUPTED' },
+  ]);
 
   const retried = environment.batches.retry(batchId);
   assert.equal(retried.state, 'QUEUED');
   assert.equal(retried.job?.state, 'QUEUED');
   assert.equal(retried.job?.attempt, 2);
+  assert.equal(retried.failureHistory.length, 1);
 });
 
 test('interrupted VALIDATING batches return to DRAFT on startup recovery', async (t) => {

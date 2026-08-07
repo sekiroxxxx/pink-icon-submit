@@ -15,8 +15,6 @@ test('explicit local mode resolves the published beta catalog without inferring 
   assert.equal(config.executionMode, 'local');
   assert.equal(config.stage1SourcePath, 'C:\\workspace\\pink-codicons');
   assert.equal(config.localTargetRef, 'main');
-  assert.equal(config.upstreamRemote, 'origin');
-  assert.equal(config.upstreamBranch, 'main');
   assert.deepEqual(config.targetRepository, {
     repository: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test',
     branch: 'main',
@@ -29,6 +27,62 @@ test('explicit local mode resolves the published beta catalog without inferring 
     cacheRoot: config.catalogCacheRoot,
     refreshIntervalMs: 60_000,
   });
+});
+
+test('remote mode requires the fixed P3 R2/R3 topology and explicit delivery settings', () => {
+  const config = configFromEnv({
+    PINK_CODICONS_DIR: 'C:\\workspace\\target-clone',
+    PINK_ICON_EXECUTION_MODE: 'remote',
+    PINK_ICON_TARGET_REPOSITORY: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test',
+    PINK_ICON_TARGET_BRANCH: 'main',
+    PINK_ICON_TARGET_REMOTE: 'upstream',
+    PINK_ICON_PUSH_REPOSITORY: 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test',
+    PINK_ICON_PUSH_REMOTE: 'origin',
+    PINK_ICON_PUSH_BRANCH_PREFIX: 'bot/',
+    PINK_ICON_REMOTE_DELIVERY_PHASE: 'pull_request',
+    PINK_ICON_GITHUB_TOKEN: 'test-only-token',
+    PINK_ICON_GIT_COMMITTER_NAME: 'PinK Icon Bot',
+    PINK_ICON_GIT_COMMITTER_EMAIL: 'sud-icon-bot@users.noreply.github.com',
+  });
+
+  assert.equal(config.executionMode, 'remote');
+  assert.deepEqual(config.remoteDelivery && {
+    targetRemote: config.remoteDelivery.targetRemote,
+    pushRepository: config.remoteDelivery.pushRepository,
+    pushRemote: config.remoteDelivery.pushRemote,
+    pushBranchPrefix: config.remoteDelivery.pushBranchPrefix,
+    deliveryPhase: config.remoteDelivery.deliveryPhase,
+    committer: config.remoteDelivery.committer,
+  }, {
+    targetRemote: 'upstream',
+    pushRepository: 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test',
+    pushRemote: 'origin',
+    pushBranchPrefix: 'bot/',
+    deliveryPhase: 'pull_request',
+    committer: {
+      name: 'PinK Icon Bot',
+      email: 'sud-icon-bot@users.noreply.github.com',
+    },
+  });
+});
+
+test('remote mode rejects an implicit branch, production target, and an unsafe branch prefix', () => {
+  const common = {
+    PINK_CODICONS_DIR: 'C:\\workspace\\target-clone',
+    PINK_ICON_EXECUTION_MODE: 'remote',
+    PINK_ICON_TARGET_REPOSITORY: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test',
+    PINK_ICON_TARGET_REMOTE: 'upstream',
+    PINK_ICON_PUSH_REPOSITORY: 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test',
+    PINK_ICON_PUSH_REMOTE: 'origin',
+    PINK_ICON_PUSH_BRANCH_PREFIX: 'bot/',
+    PINK_ICON_REMOTE_DELIVERY_PHASE: 'pull_request',
+    PINK_ICON_GITHUB_TOKEN: 'test-only-token',
+    PINK_ICON_GIT_COMMITTER_NAME: 'PinK Icon Bot',
+    PINK_ICON_GIT_COMMITTER_EMAIL: 'sud-icon-bot@users.noreply.github.com',
+  };
+  assert.throws(() => configFromEnv(common), /PINK_ICON_TARGET_BRANCH/);
+  assert.throws(() => configFromEnv({ ...common, PINK_ICON_TARGET_BRANCH: 'main', PINK_ICON_TARGET_REPOSITORY: 'SUD-GLOBAL\/pink-codicons' }), /only permits/);
+  assert.throws(() => configFromEnv({ ...common, PINK_ICON_TARGET_BRANCH: 'main', PINK_ICON_PUSH_BRANCH_PREFIX: 'icon-request/' }), /must be bot/);
 });
 
 test('execution mode and Stage 1 v2 target repository must be explicit', () => {

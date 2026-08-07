@@ -42,11 +42,23 @@ export interface ValidationResult {
 
 export interface BatchDetails extends BatchInput {
   id: string;
-  state: 'DRAFT' | 'VALIDATING' | 'READY' | 'QUEUED' | 'RUNNING' | 'LOCAL_DIFF_READY' | 'FAILED';
+  state: 'DRAFT' | 'VALIDATING' | 'READY' | 'QUEUED' | 'RUNNING' | 'LOCAL_DIFF_READY' | 'COMMIT_PREPARED' | 'BRANCH_PUSHED' | 'PR_CREATING' | 'PR_CREATED' | 'FAILED';
   items: ApiItem[];
   validation: ValidationResult | null;
   warningsAcknowledged: boolean;
   localDiff: { changedFiles: string[]; patch: string } | null;
+  delivery: {
+    branch: string | null;
+    commitSha: string | null;
+    pullRequest: {
+      number: number;
+      url: string;
+      state: string;
+      isDraft: boolean;
+      createdAt: string | null;
+    } | null;
+    handoffAt: string | null;
+  };
   error: { code: string; message: string } | null;
 }
 

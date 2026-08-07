@@ -94,6 +94,11 @@ export interface TestEnvironment {
   batches: BatchService;
   validSvg: string;
   registryRequests: { metadata: number; tarball: number };
+  pushRepositoryPath?: string;
+}
+
+export interface TestEnvironmentOptions {
+  executionMode?: 'local' | 'remote';
 }
 
 async function createNpmCatalogFixture(t: TestContext, root: string): Promise<{ registryUrl: string; registryRequests: { metadata: number; tarball: number } }> {
@@ -152,10 +157,12 @@ async function createNpmCatalogFixture(t: TestContext, root: string): Promise<{ 
   return { registryUrl: `http://127.0.0.1:${address.port}`, registryRequests };
 }
 
-export async function createTestEnvironment(t: TestContext): Promise<TestEnvironment> {
+export async function createTestEnvironment(t: TestContext, options: TestEnvironmentOptions = {}): Promise<TestEnvironment> {
+  const executionMode = options.executionMode ?? 'local';
   const root = await mkdtemp(join(tmpdir(), 'pink-icon-submit-'));
   const upstream = join(root, 'upstream');
   const checkout = join(root, 'checkout');
+  const pushRepositoryPath = join(root, 'push.git');
   const data = join(root, 'data');
   const npmCatalog = await createNpmCatalogFixture(t, root);
   await mkdir(join(upstream, 'src/icons'), { recursive: true });
@@ -188,6 +195,10 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
   execFileSync('git', ['-C', upstream, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'initial']);
   execFileSync('git', ['clone', '-q', upstream, checkout]);
   execFileSync('git', ['-C', checkout, 'remote', 'rename', 'origin', 'upstream']);
+  if (executionMode === 'remote') {
+    execFileSync('git', ['clone', '-q', '--bare', upstream, pushRepositoryPath]);
+    execFileSync('git', ['-C', checkout, 'remote', 'add', 'origin', pushRepositoryPath]);
+  }
   execFileSync('git', ['-C', checkout, 'config', 'core.autocrlf', 'false']);
 
   const config: AppConfig = {
@@ -195,11 +206,20 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     storageRoot: join(data, 'batches'),
     temporaryRoot: join(data, 'worktrees'),
     repositoryPath: checkout,
-    executionMode: 'local',
-    localTargetRef: 'main',
-    upstreamRemote: 'upstream',
-    upstreamBranch: 'main',
+    executionMode,
+    ...(executionMode === 'local' ? { localTargetRef: 'main' } : {}),
     targetRepository: { repository: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test', branch: 'main' },
+    ...(executionMode === 'remote' ? {
+      remoteDelivery: {
+        targetRemote: 'upstream',
+        pushRepository: 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test',
+        pushRemote: 'origin',
+        pushBranchPrefix: 'bot/' as const,
+        deliveryPhase: 'pull_request',
+        githubToken: 'test-only-token',
+        committer: { name: 'Test Bot', email: 'test-bot@example.invalid' },
+      },
+    } : {}),
     catalogPackageName: '@pink/codicons',
     catalogTag: 'beta',
     catalogRegistryUrl: npmCatalog.registryUrl,
@@ -219,14 +239,25 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     new BatchStorage(config.storageRoot),
     new GitRepository(config.repositoryPath, config.temporaryRoot, {
       mode: config.executionMode,
-      localTargetRef: config.localTargetRef,
-      upstreamRemote: config.upstreamRemote,
-      upstreamBranch: config.upstreamBranch,
+      ...(config.localTargetRef ? { localTargetRef: config.localTargetRef } : {}),
+      ...(config.remoteDelivery ? {
+        targetRemote: config.remoteDelivery.targetRemote,
+        targetBranch: config.targetRepository.branch,
+        remoteAuthentication: {
+          username: config.remoteDelivery.pushRepository.split('/')[0],
+          token: config.remoteDelivery.githubToken,
+        },
+      } : {}),
     }),
     new IconBatchCli(),
     config.maxUploadBytes,
     catalogOptionsFromConfig(config),
     config.targetRepository,
+    {
+      executionMode: config.executionMode,
+      pushRepository: config.remoteDelivery?.pushRepository ?? null,
+      pushBranchPrefix: config.remoteDelivery?.pushBranchPrefix ?? null,
+    },
   );
   return {
     config,
@@ -234,5 +265,6 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     batches,
     validSvg,
     registryRequests: npmCatalog.registryRequests,
+    ...(executionMode === 'remote' ? { pushRepositoryPath } : {}),
   };
 }

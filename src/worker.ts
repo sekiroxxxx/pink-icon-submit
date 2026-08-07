@@ -1,4 +1,4 @@
-import { AppError, isAppError } from './errors.js';
+import { AppError, failureDiagnosticFromError, isAppError } from './errors.js';
 import { BatchService } from './batch-service.js';
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -75,7 +75,7 @@ export class LocalDiffWorker {
       return { processed: true, batchId: job.batchId };
     } catch (error) {
       if (isAppError(error)) {
-        this.batches.database.failJob(job.batchId, error.code, error.message);
+        this.batches.database.failJob(job.batchId, error.code, error.message, failureDiagnosticFromError(error));
       } else {
         this.batches.database.failJob(job.batchId, 'WORKER_UNEXPECTED', error instanceof Error ? error.message : String(error));
       }

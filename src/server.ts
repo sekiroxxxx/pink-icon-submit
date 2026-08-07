@@ -6,26 +6,68 @@ import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
 import { LocalDiffWorker } from './worker.js';
+import { GitHubApiClient } from './github-client.js';
+import { RemoteTopologyPreflight } from './remote-preflight.js';
+import { RemoteBranchWorker } from './remote-branch-worker.js';
 
 const config = configFromEnv();
+const repository = new GitRepository(config.repositoryPath, config.temporaryRoot, {
+  mode: config.executionMode,
+  ...(config.localTargetRef ? { localTargetRef: config.localTargetRef } : {}),
+  ...(config.remoteDelivery ? {
+    targetRemote: config.remoteDelivery.targetRemote,
+    targetBranch: config.targetRepository.branch,
+    remoteAuthentication: {
+      username: config.remoteDelivery.pushRepository.split('/')[0],
+      token: config.remoteDelivery.githubToken,
+    },
+  } : {}),
+});
+const github = config.remoteDelivery ? new GitHubApiClient(config.remoteDelivery.githubToken) : undefined;
+if (config.remoteDelivery && github) {
+  await new RemoteTopologyPreflight(
+    repository,
+    github,
+    config.targetRepository,
+    config.remoteDelivery,
+  ).verify();
+}
+
 const database = new BatchDatabase(config.databasePath);
 const batches = new BatchService(
   database,
   new BatchStorage(config.storageRoot),
-  new GitRepository(config.repositoryPath, config.temporaryRoot, {
-    mode: config.executionMode,
-    upstreamRemote: config.upstreamRemote,
-    upstreamBranch: config.upstreamBranch,
-    ...(config.localTargetRef ? { localTargetRef: config.localTargetRef } : {}),
-  }),
+  repository,
   new IconBatchCli(config.stage1SourcePath ? { sourceDirectory: config.stage1SourcePath } : {}),
   config.maxUploadBytes,
   catalogOptionsFromConfig(config),
   config.targetRepository,
+  {
+    executionMode: config.executionMode,
+    pushRepository: config.remoteDelivery?.pushRepository ?? null,
+    pushBranchPrefix: config.remoteDelivery?.pushBranchPrefix ?? null,
+  },
 );
 database.recoverInterruptedValidations();
 database.recoverInterruptedJobs();
-const worker = new LocalDiffWorker(batches);
+if (config.remoteDelivery?.deliveryPhase === 'pull_request') {
+  database.resumeBranchPushedJobs();
+}
+const worker = config.remoteDelivery
+  ? new RemoteBranchWorker(batches, {
+    pushRemote: config.remoteDelivery.pushRemote,
+    pushRepository: config.remoteDelivery.pushRepository,
+    pushBranchPrefix: config.remoteDelivery.pushBranchPrefix,
+    deliveryPhase: config.remoteDelivery.deliveryPhase,
+    committer: config.remoteDelivery.committer,
+    targetRepository: config.targetRepository,
+    github: github!,
+    authentication: {
+      username: config.remoteDelivery.pushRepository.split('/')[0],
+      token: config.remoteDelivery.githubToken,
+    },
+  })
+  : new LocalDiffWorker(batches);
 const app = await buildApp({ batches });
 
 let workerRunning = false;
