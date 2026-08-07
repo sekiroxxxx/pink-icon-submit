@@ -9,6 +9,7 @@ import { LocalDiffWorker } from './worker.js';
 import { GitHubApiClient } from './github-client.js';
 import { RemoteTopologyPreflight } from './remote-preflight.js';
 import { RemoteBranchWorker } from './remote-branch-worker.js';
+import { startWorkerRuntime } from './worker-runtime.js';
 
 const config = configFromEnv();
 const repository = new GitRepository(config.repositoryPath, config.temporaryRoot, {
@@ -23,15 +24,6 @@ const repository = new GitRepository(config.repositoryPath, config.temporaryRoot
     },
   } : {}),
 });
-const github = config.remoteDelivery ? new GitHubApiClient(config.remoteDelivery.githubToken) : undefined;
-if (config.remoteDelivery && github) {
-  await new RemoteTopologyPreflight(
-    repository,
-    github,
-    config.targetRepository,
-    config.remoteDelivery,
-  ).verify();
-}
 
 const database = new BatchDatabase(config.databasePath);
 const batches = new BatchService(
@@ -49,48 +41,50 @@ const batches = new BatchService(
   },
 );
 database.recoverInterruptedValidations();
-database.recoverInterruptedJobs();
-if (config.remoteDelivery?.deliveryPhase === 'pull_request') {
-  database.resumeBranchPushedJobs();
-}
-const worker = config.remoteDelivery
-  ? new RemoteBranchWorker(batches, {
-    pushRemote: config.remoteDelivery.pushRemote,
-    pushRepository: config.remoteDelivery.pushRepository,
-    pushBranchPrefix: config.remoteDelivery.pushBranchPrefix,
-    deliveryPhase: config.remoteDelivery.deliveryPhase,
-    committer: config.remoteDelivery.committer,
-    targetRepository: config.targetRepository,
-    github: github!,
-    authentication: {
-      username: config.remoteDelivery.pushRepository.split('/')[0],
-      token: config.remoteDelivery.githubToken,
-    },
-  })
-  : new LocalDiffWorker(batches);
 const app = await buildApp({ batches });
-
-let workerRunning = false;
-const pollWorker = async (): Promise<void> => {
-  if (workerRunning) {
-    return;
+let github: GitHubApiClient | undefined;
+const remoteGithub = (): GitHubApiClient => {
+  if (!config.remoteDelivery) {
+    throw new Error('Remote GitHub client requested without remote delivery configuration.');
   }
-  workerRunning = true;
-  try {
-    await worker.processNext();
-  } catch (error) {
-    app.log.error(error);
-  } finally {
-    workerRunning = false;
-  }
+  github ??= new GitHubApiClient(config.remoteDelivery.githubToken);
+  return github;
 };
 
-const workerTimer = setInterval(() => {
-  void pollWorker();
-}, config.workerPollIntervalMs);
+const workerRuntime = await startWorkerRuntime({
+  enabled: config.workerEnabled,
+  pollIntervalMs: config.workerPollIntervalMs,
+  ...(config.remoteDelivery ? {
+    deliveryPhase: config.remoteDelivery.deliveryPhase,
+    preflight: async () => new RemoteTopologyPreflight(
+      repository,
+      remoteGithub(),
+      config.targetRepository,
+      config.remoteDelivery!,
+    ).verify(),
+  } : {}),
+  recovery: database,
+  createWorker: () => config.remoteDelivery
+    ? new RemoteBranchWorker(batches, {
+      pushRemote: config.remoteDelivery.pushRemote,
+      pushRepository: config.remoteDelivery.pushRepository,
+      pushBranchPrefix: config.remoteDelivery.pushBranchPrefix,
+      deliveryPhase: config.remoteDelivery.deliveryPhase,
+      committer: config.remoteDelivery.committer,
+      targetRepository: config.targetRepository,
+      github: remoteGithub(),
+      authentication: {
+        username: config.remoteDelivery.pushRepository.split('/')[0],
+        token: config.remoteDelivery.githubToken,
+      },
+    })
+    : new LocalDiffWorker(batches),
+  onError: (error) => app.log.error(error),
+});
+console.info(`PinK Icon Worker ${config.workerEnabled ? 'enabled' : 'disabled (API-only mode)'}.`);
 
 app.addHook('onClose', async () => {
-  clearInterval(workerTimer);
+  workerRuntime.close();
   database.close();
 });
 

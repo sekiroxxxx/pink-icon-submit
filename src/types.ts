@@ -121,6 +121,7 @@ export interface AppConfig {
   catalogSourceRepository: string;
   catalogCacheRoot: string;
   catalogRefreshIntervalMs: number;
+  workerEnabled: boolean;
   workerPollIntervalMs: number;
   maxUploadBytes: number;
 }

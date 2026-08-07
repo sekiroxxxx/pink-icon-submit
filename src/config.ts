@@ -16,6 +16,16 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
+function workerEnabled(value: string | undefined): boolean {
+  if (value === undefined || value.trim() === '' || value.trim() === 'false') {
+    return false;
+  }
+  if (value.trim() === 'true') {
+    return true;
+  }
+  throw new Error('PINK_ICON_WORKER_ENABLED must be true or false.');
+}
+
 function executionMode(value: string | undefined): ExecutionMode {
   if (value === 'local' || value === 'remote') {
     return value;
@@ -133,6 +143,7 @@ export function configFromEnv(environment = process.env): AppConfig {
     catalogSourceRepository: environment.PINK_ICON_CATALOG_SOURCE_REPOSITORY ?? 'sud-global/pink-codicons',
     catalogCacheRoot: resolve(dataRoot, 'catalog-cache'),
     catalogRefreshIntervalMs: positiveInteger(environment.PINK_ICON_CATALOG_REFRESH_MS, 60_000),
+    workerEnabled: workerEnabled(environment.PINK_ICON_WORKER_ENABLED),
     workerPollIntervalMs: positiveInteger(environment.PINK_ICON_WORKER_POLL_MS, 1_000),
     maxUploadBytes: positiveInteger(environment.PINK_ICON_MAX_UPLOAD_BYTES, 1024 * 1024),
   };
