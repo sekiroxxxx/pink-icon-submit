@@ -275,8 +275,11 @@ test('revalidation hides stale diagnostics and syncs latest batch metadata befor
 
   await screen.findByText('图标包含多种颜色');
   expect(screen.getByText('对应图标：新增图标：pink-new-icon')).toBeTruthy();
+  expect(await screen.findByText(/最新校验完成时间：/)).toBeTruthy();
   await user.click(screen.getByRole('button', { name: '确认本次变更' }));
   await user.clear(screen.getByLabelText(/^本次变更标题/));
+  expect(screen.queryByText(/最新校验完成时间：/)).toBeNull();
+  expect(screen.getByText('批次信息已修改，需要重新校验。')).toBeTruthy();
   await user.type(screen.getByLabelText(/^本次变更标题/), '更新后的标题');
   await user.clear(screen.getByLabelText(/^整体需求说明/));
   await user.type(screen.getByLabelText(/^整体需求说明/), '已根据错误更新设计说明。');
@@ -308,6 +311,97 @@ test('revalidation hides stale diagnostics and syncs latest batch metadata befor
   }));
   await screen.findByText(/已按最新内容重新校验/);
   expect(screen.getByText(/最新校验完成时间：/)).toBeTruthy();
+});
+
+test('editing a DRAFT item invalidates the completed validation result and time', async () => {
+  saveProfile();
+  const item = { id: 'item-1', batchId: 'ICON-ITEM-EDIT', action: 'add', designName: 'pink-new-icon', description: '用于测试新增图标的设计稿。', sourceFile: 'items/item-1.svg' };
+  const draft = { id: 'ICON-ITEM-EDIT', executionMode: 'local', state: 'DRAFT', items: [item], validation: null, warningsAcknowledged: false, localDiff: null, delivery: { branch: null, commitSha: null, pullRequest: null, handoffAt: null }, error: null };
+  const fetchMock = vi.fn((path: string, options?: RequestInit) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
+    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ ...draft, items: [] }));
+    if (url.pathname === '/api/batches/ICON-ITEM-EDIT/items') return Promise.resolve(jsonResponse(item));
+    if (url.pathname === '/api/batches/ICON-ITEM-EDIT/items/item-1') {
+      return Promise.resolve(options?.method === 'DELETE' ? new Response(null, { status: 204 }) : jsonResponse(item));
+    }
+    if (url.pathname === '/api/batches/ICON-ITEM-EDIT/validate') {
+      return Promise.resolve(jsonResponse({
+        ...draft,
+        validation: { valid: false, errors: [{ code: 'SVG_MULTIPLE_COLORS', message: 'SVG contains more than one literal paint color.', itemId: 'item-1' }], warnings: [] },
+      }));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await addOneSvgChange(user);
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await user.type(screen.getByLabelText(/^本次变更标题/), '修改现有变更');
+  await user.type(screen.getByLabelText(/^整体需求说明/), '先校验，再移除图标变更。');
+  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/item-edit');
+  await user.click(screen.getByRole('checkbox'));
+  await user.click(screen.getByRole('button', { name: '进入校验' }));
+
+  await screen.findByText('图标包含多种颜色');
+  expect(await screen.findByText(/最新校验完成时间：/)).toBeTruthy();
+  await user.click(screen.getByRole('button', { name: '移除 pink-new-icon' }));
+
+  await screen.findByText('变更已修改，需要重新校验。');
+  expect(screen.queryByText(/最新校验完成时间：/)).toBeNull();
+  expect(screen.queryByText('图标包含多种颜色')).toBeNull();
+});
+
+test('a failed revalidation does not retain the previous completion time', async () => {
+  saveProfile();
+  let resolveSecondValidation!: (response: Response) => void;
+  let validationCount = 0;
+  const item = { id: 'item-1', batchId: 'ICON-VALIDATION-FAILURE', action: 'add', designName: 'pink-new-icon', description: '用于测试新增图标的设计稿。', sourceFile: 'items/item-1.svg' };
+  const draft = { id: 'ICON-VALIDATION-FAILURE', executionMode: 'local', state: 'DRAFT', items: [item], validation: null, warningsAcknowledged: false, localDiff: null, delivery: { branch: null, commitSha: null, pullRequest: null, handoffAt: null }, error: null };
+  const fetchMock = vi.fn((path: string) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
+    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ ...draft, items: [] }));
+    if (url.pathname === '/api/batches/ICON-VALIDATION-FAILURE') return Promise.resolve(jsonResponse(draft));
+    if (url.pathname === '/api/batches/ICON-VALIDATION-FAILURE/items' || url.pathname === '/api/batches/ICON-VALIDATION-FAILURE/items/item-1') return Promise.resolve(jsonResponse(item));
+    if (url.pathname === '/api/batches/ICON-VALIDATION-FAILURE/validate') {
+      validationCount += 1;
+      if (validationCount === 1) {
+        return Promise.resolve(jsonResponse({
+          ...draft,
+          validation: { valid: false, errors: [{ code: 'SVG_MULTIPLE_COLORS', message: 'SVG contains more than one literal paint color.', itemId: 'item-1' }], warnings: [] },
+        }));
+      }
+      return new Promise<Response>((resolve) => { resolveSecondValidation = resolve; });
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await addOneSvgChange(user);
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await user.type(screen.getByLabelText(/^本次变更标题/), '重新校验失败');
+  await user.type(screen.getByLabelText(/^整体需求说明/), '验证失败不能保留旧完成时间。');
+  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/revalidation-failure');
+  await user.click(screen.getByRole('checkbox'));
+  await user.click(screen.getByRole('button', { name: '进入校验' }));
+
+  await screen.findByText('图标包含多种颜色');
+  expect(await screen.findByText(/最新校验完成时间：/)).toBeTruthy();
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await user.click(screen.getByRole('button', { name: '进入校验' }));
+
+  await waitFor(() => expect(validationCount).toBe(2));
+  expect(screen.getByText('正在按最新修改重新校验…')).toBeTruthy();
+  expect(screen.queryByText(/最新校验完成时间：/)).toBeNull();
+  resolveSecondValidation(jsonResponse({ error: { code: 'TEST_VALIDATION_FAILURE', message: '本地模拟失败。' } }, 500));
+
+  await screen.findByText('本次校验失败，未完成：本地模拟失败。');
+  expect(screen.queryByText(/最新校验完成时间：/)).toBeNull();
 });
 
 test('a confirmed change creates a batch, uploads its SVG, and starts validation', async () => {
@@ -471,6 +565,37 @@ test('a completed local preview never promises a Draft PR', async () => {
   await user.click(screen.getByRole('button', { name: '生成本地修改' }));
 
   await screen.findByText('本地预览已完成，此模式不会创建 PR');
+  expect(screen.queryByText('等待创建 Draft PR')).toBeNull();
+  expect(screen.queryByText('正在创建 Draft PR')).toBeNull();
+});
+
+test('a historical local result without an execution mode never promises a Draft PR', async () => {
+  saveProfile();
+  const delivery = { branch: null, commitSha: null, pullRequest: null, handoffAt: null };
+  const fetchMock = vi.fn((path: string) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
+    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ id: 'ICON-LEGACY-LOCAL', executionMode: null, state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, delivery, error: null }));
+    if (url.pathname === '/api/batches/ICON-LEGACY-LOCAL/items') return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-LEGACY-LOCAL', action: 'add', sourceFile: 'items/item-1.svg' }));
+    if (url.pathname === '/api/batches/ICON-LEGACY-LOCAL/validate') return Promise.resolve(jsonResponse({ id: 'ICON-LEGACY-LOCAL', executionMode: null, state: 'READY', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: null, delivery, error: null }));
+    if (url.pathname === '/api/batches/ICON-LEGACY-LOCAL/submit') return Promise.resolve(jsonResponse({ id: 'ICON-LEGACY-LOCAL', executionMode: null, state: 'LOCAL_DIFF_READY', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: { changedFiles: ['src/icons/pink-new-icon.svg'], patch: '' }, delivery, error: null }));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await addOneSvgChange(user);
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await user.type(screen.getByLabelText(/^本次变更标题/), '历史本地结果');
+  await user.type(screen.getByLabelText(/^整体需求说明/), '验证历史本地批次不会自动提 PR。');
+  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/legacy-local');
+  await user.click(screen.getByRole('checkbox'));
+  await user.click(screen.getByRole('button', { name: '进入校验' }));
+  await screen.findByText('校验通过，可以生成本地修改。');
+  await user.click(screen.getByRole('button', { name: '生成本地修改' }));
+
+  await screen.findByText('历史本地结果已生成，此批次不会自动创建 PR；如需自动提 PR，请新建批次。');
   expect(screen.queryByText('等待创建 Draft PR')).toBeNull();
   expect(screen.queryByText('正在创建 Draft PR')).toBeNull();
 });
