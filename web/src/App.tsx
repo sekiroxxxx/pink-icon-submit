@@ -833,7 +833,10 @@ export function App() {
   const [repeatedSubmissionConfirmation, setRepeatedSubmissionConfirmation] = useState(false);
   const liveSvgDrafts = useRef(new Map<string, SvgDraft>());
   const previousView = useRef<AppView>(view);
-  const activeRestoreVersion = useRef(0);
+  const workbenchHydrationVersion = useRef(0);
+  const lastReconciledWorkbenchPath = useRef<string | undefined>(undefined);
+  const skipNextWorkbenchHydrationPath = useRef<string | undefined>(undefined);
+  const initialActiveRestoreStarted = useRef(false);
 
   const resetWorkbenchTransientState = useCallback(() => {
     liveSvgDrafts.current.forEach(revokePreview);
@@ -876,6 +879,8 @@ export function App() {
   const navigate = useCallback((next: AppRoute, replace = false) => {
     const nextPath = routePath(next);
     if (`${window.location.pathname}${window.location.search}` !== nextPath) {
+      workbenchHydrationVersion.current += 1;
+      lastReconciledWorkbenchPath.current = undefined;
       window.history[replace ? 'replaceState' : 'pushState']({}, '', nextPath);
     }
     setRoute(next);
@@ -892,6 +897,31 @@ export function App() {
       setBatchSummariesLoading(false);
     }
   }, []);
+
+  const hydrateWorkbenchFromDetails = useCallback((restored: BatchDetails, nextNotice?: string) => {
+    resetWorkbenchTransientState();
+    setBatch(restored);
+    setChanges(draftChangesFromBatch(restored));
+    setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
+    setNotice(nextNotice);
+  }, [resetWorkbenchTransientState]);
+
+  const hydrateWorkbenchBatch = useCallback(async (
+    batchId: string,
+    options: { notice?: string; busy?: boolean } = {},
+  ): Promise<BatchDetails | undefined> => {
+    const hydrationVersion = workbenchHydrationVersion.current + 1;
+    workbenchHydrationVersion.current = hydrationVersion;
+    if (options.busy) setBusy(true);
+    try {
+      const restored = await api.getBatch(batchId);
+      if (workbenchHydrationVersion.current !== hydrationVersion) return undefined;
+      hydrateWorkbenchFromDetails(restored, options.notice);
+      return restored;
+    } finally {
+      if (options.busy && workbenchHydrationVersion.current === hydrationVersion) setBusy(false);
+    }
+  }, [hydrateWorkbenchFromDetails]);
 
   const viewingActiveBatch = Boolean(batch && activeBatchId === batch.id && isActiveBatch(batch));
   const editable = !batch || (batch.state === 'DRAFT' && viewingActiveBatch);
@@ -925,41 +955,45 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const onPopState = () => setRoute(routeFromLocation());
+    const onPopState = () => {
+      workbenchHydrationVersion.current += 1;
+      lastReconciledWorkbenchPath.current = undefined;
+      setRoute(routeFromLocation());
+    };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
   useEffect(() => {
+    if (initialActiveRestoreStarted.current) return undefined;
+    initialActiveRestoreStarted.current = true;
     const batchId = activeBatchId;
     if (!batchId) {
       setRestoringActiveBatch(false);
       return undefined;
     }
     let cancelled = false;
-    const restoreVersion = activeRestoreVersion.current + 1;
-    activeRestoreVersion.current = restoreVersion;
-    void api.getBatch(batchId)
+    void hydrateWorkbenchBatch(batchId, { notice: '已恢复本次交付状态。' })
       .then((restored) => {
-        if (cancelled || activeRestoreVersion.current !== restoreVersion) return;
-        setBatch(restored);
-        if (isActiveBatch(restored)) {
-          setChanges(draftChangesFromBatch(restored));
-          setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
+        if (cancelled || !restored) return;
+        const restoredRoute = routeFromLocation();
+        if (restoredRoute.view === 'workbench' && (!restoredRoute.batchId || restoredRoute.batchId === batchId)) {
+          lastReconciledWorkbenchPath.current = routePath(restoredRoute);
         }
-        setNotice('已恢复本次交付状态。');
+        if (!isActiveBatch(restored)) {
+          setBrowserActiveBatch(undefined);
+          void refreshBatchSummaries();
+        }
         setRestoringActiveBatch(false);
       })
       .catch(() => {
-        if (!cancelled && activeRestoreVersion.current === restoreVersion) {
+        if (!cancelled) {
           setBrowserActiveBatch(undefined);
           setRestoringActiveBatch(false);
         }
       });
     return () => { cancelled = true; };
-  // Only the browser-restored ID should initiate this recovery request.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [activeBatchId, hydrateWorkbenchBatch, refreshBatchSummaries, setBrowserActiveBatch]);
 
   useEffect(() => {
     void refreshBatchSummaries();
@@ -984,33 +1018,53 @@ export function App() {
 
   useEffect(() => {
     const requestedBatchId = route.view === 'workbench' ? route.batchId : undefined;
-    if (!requestedBatchId || restoringActiveBatch) return;
-    if (activeBatchId && activeBatchId !== requestedBatchId) {
+    if (route.view !== 'workbench' || restoringActiveBatch) return undefined;
+    const currentPath = routePath(route);
+    if (skipNextWorkbenchHydrationPath.current === currentPath) {
+      skipNextWorkbenchHydrationPath.current = undefined;
+      lastReconciledWorkbenchPath.current = currentPath;
+      return undefined;
+    }
+    if (lastReconciledWorkbenchPath.current === currentPath) return undefined;
+    lastReconciledWorkbenchPath.current = currentPath;
+    if (!requestedBatchId && !activeBatchId) {
+      workbenchHydrationVersion.current += 1;
+      resetWorkbenchTransientState();
+      setBatch(undefined);
+      setNotice(undefined);
+      return undefined;
+    }
+    const batchId = requestedBatchId ?? activeBatchId!;
+    if (requestedBatchId && activeBatchId && activeBatchId !== requestedBatchId) {
       setNotice('请先完成当前批次。');
       navigate({ view: 'home' }, true);
-      return;
+      return undefined;
     }
-    if (batch?.id === requestedBatchId) return;
     let cancelled = false;
-    setBusy(true);
-    void api.getBatch(requestedBatchId)
+    const openingHistory = Boolean(requestedBatchId && activeBatchId !== requestedBatchId);
+    void hydrateWorkbenchBatch(batchId, {
+      busy: true,
+      notice: openingHistory ? '正在查看历史批次。' : '已恢复本次交付状态。',
+    })
       .then((restored) => {
-        if (cancelled) return;
-        resetWorkbenchTransientState();
-        setBatch(restored);
-        setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
-        setChanges(draftChangesFromBatch(restored));
-        setNotice('正在查看历史批次。');
+        if (cancelled || !restored) return;
+        if (!isActiveBatch(restored) && activeBatchId === batchId) {
+          setBrowserActiveBatch(undefined);
+          void refreshBatchSummaries();
+          if (restored.state === 'PR_CREATED') {
+            setNotice('已提交开发审核。');
+            navigate({ view: 'home' });
+          }
+        }
       })
       .catch((error: unknown) => {
         if (cancelled) return;
-        if (activeBatchId === requestedBatchId) setBrowserActiveBatch(undefined);
+        if (activeBatchId === batchId) setBrowserActiveBatch(undefined);
         setNotice(error instanceof Error ? `无法打开批次：${error.message}` : '无法打开批次。');
         navigate({ view: 'home' }, true);
       })
-      .finally(() => { if (!cancelled) setBusy(false); });
     return () => { cancelled = true; };
-  }, [activeBatchId, batch?.id, navigate, resetWorkbenchTransientState, restoringActiveBatch, route, setBrowserActiveBatch]);
+  }, [activeBatchId, hydrateWorkbenchBatch, navigate, refreshBatchSummaries, resetWorkbenchTransientState, restoringActiveBatch, route, setBrowserActiveBatch]);
 
   useEffect(() => {
     if (!needsCatalog) return undefined;
@@ -1275,18 +1329,17 @@ export function App() {
     }
   };
 
-  const returnToEdit = async () => {
-    if (!batch || !viewingActiveBatch) return;
+  const returnToEdit = async (): Promise<boolean> => {
+    if (!batch || !viewingActiveBatch) return false;
     setBusy(true);
     try {
       const restored = await api.returnToEdit(batch.id);
-      setBatch(restored);
-      setChanges(draftChangesFromBatch(restored));
-      setRepeatedSubmissionConfirmation(false);
-      setNotice('已返回编辑。请修正内容后再次确认提交。');
+      hydrateWorkbenchFromDetails(restored, '已返回编辑。请修正内容后再次确认提交。');
       void refreshBatchSummaries();
+      return true;
     } catch (error) {
       setNotice(error instanceof Error ? `无法返回编辑：${error.message}` : '无法返回编辑。');
+      return false;
     } finally {
       setBusy(false);
     }
@@ -1319,14 +1372,14 @@ export function App() {
       navigate({ view: 'workbench' });
       return;
     }
-    activeRestoreVersion.current += 1;
+    workbenchHydrationVersion.current += 1;
     resetWorkbenchTransientState();
     setBatch(undefined);
     setNotice(undefined);
     navigate({ view: 'workbench' });
   };
 
-  const openBatchWorkbench = async (batchId: string) => {
+  const openBatchWorkbench = (batchId: string) => {
     if (activeBatchId && activeBatchId !== batchId) {
       setNotice('请先完成当前批次。');
       return;
@@ -1335,29 +1388,15 @@ export function App() {
       navigate({ view: 'workbench' });
       return;
     }
-    activeRestoreVersion.current += 1;
-    setBusy(true);
     setNotice('正在打开批次…');
-    try {
-      const restored = await api.getBatch(batchId);
-      resetWorkbenchTransientState();
-      setBatch(restored);
-      setChanges(draftChangesFromBatch(restored));
-      setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
-      setRepeatedSubmissionConfirmation(false);
-      navigate({ view: 'workbench', batchId: restored.id });
-      setNotice('正在查看历史批次。');
-    } catch (error) {
-      setNotice(error instanceof Error ? `无法打开批次：${error.message}` : '无法打开批次。');
-    } finally {
-      setBusy(false);
-    }
+    navigate({ view: 'workbench', batchId });
   };
 
   const returnActiveBatchToEdit = async () => {
     if (!batch || !viewingActiveBatch) return;
+    if (!await returnToEdit()) return;
+    skipNextWorkbenchHydrationPath.current = routePath({ view: 'workbench' });
     navigate({ view: 'workbench' });
-    await returnToEdit();
     void refreshBatchSummaries();
   };
 
