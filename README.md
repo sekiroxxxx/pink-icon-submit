@@ -10,6 +10,7 @@ PinK 图标自动 Draft PR MVP 的独立编排服务。当前包含 Fastify、SQ
 - 目录展示基于 npm 发布物；名称预览、最终校验和本地 diff 基于目标 Git ref。`local` 模式只解析本地 ref，绝不执行 `git fetch`；本地 Stage 1 源码只提供 CLI 实现，不能替代 npm catalog 基线。
 - local Worker 只在临时 worktree 生成本地 diff；remote Worker 会在 R3 创建一个 `bot/<batchId>` commit、普通 push，并向 R2/main 创建一个 GitHub Draft PR。
 - 前端只负责批次表单、SVG 预览、目录选择和状态展示；不解析 mapping、不分配 codepoint、不持有 GitHub Token。
+- 首页显示当前浏览器的一个活动批次及最近 20 条批次摘要；活动批次 ID 只存于浏览器 localStorage，不代表后端全局锁或跨设备同步。`GET /api/batches?limit=20` 是当前单部署内部 MVP 的只读列表，没有认证或按设计师隔离，部署时不应将其作为多用户历史记录产品使用。
 - 本地批次状态为 `DRAFT → VALIDATING → READY → QUEUED → RUNNING → LOCAL_DIFF_READY`。远程交付依次经过 `COMMIT_PREPARED → BRANCH_PUSHED → PR_CREATING → PR_CREATED`；`PR_CREATED` 为开发接管终态，平台不再 push 或修改该分支。进程重启时遗留的 `VALIDATING` 批次会安全退回 `DRAFT`；仅在 Worker 显式启用时，遗留的 `RUNNING` job 才会标记为 `FAILED/WORKER_INTERRUPTED`，且已 `PR_CREATED` 的交接不会被降级或重试。
 
 ## 配置
@@ -100,4 +101,4 @@ $env:PINK_ICON_STAGE1_SOURCE_DIR = 'C:\path\to\pink-codicons'
 npm.cmd run test:integration
 ```
 
-当前 API：`GET /api/catalog`、`GET /api/catalog/page`、`GET /api/catalog/icons/:name/svg`、`GET /api/names/preview`、`POST /api/batches`、`POST /api/batches/:id/items`、`PUT /api/batches/:id/items/:itemId`、`DELETE /api/batches/:id/items/:itemId`、`POST /api/batches/:id/validate`、`POST /api/batches/:id/submit`、`POST /api/batches/:id/warnings/acknowledge`、`GET /api/batches/:id`、`POST /api/batches/:id/retry`。
+当前 API：`GET /api/catalog`、`GET /api/catalog/page`、`GET /api/catalog/icons/:name/svg`、`GET /api/names/preview`、`GET /api/batches?limit=20`、`POST /api/batches`、`POST /api/batches/:id/items`、`PUT /api/batches/:id/items/:itemId`、`DELETE /api/batches/:id/items/:itemId`、`POST /api/batches/:id/validate`、`POST /api/batches/:id/submit`、`POST /api/batches/:id/warnings/acknowledge`、`GET /api/batches/:id`、`POST /api/batches/:id/retry`。

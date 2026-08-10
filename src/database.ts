@@ -3,9 +3,11 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import { AppError, sanitizeDiagnosticText } from './errors.js';
+import { userStatusForBatch } from './batch-lifecycle.js';
 import type {
   BatchExecutionContext,
   BatchDetails,
+  BatchSummary,
   BatchState,
   CatalogBaseline,
   CreateBatchInput,
@@ -66,6 +68,29 @@ interface ItemRow {
   replacement_name: string | null;
   source_file: string | null;
   created_at: string;
+}
+
+interface BatchSummaryRow {
+  id: string;
+  title: string;
+  state: BatchState;
+  execution_mode: ExecutionMode | null;
+  delivery_checkpoint: DeliveryCheckpoint;
+  delivery_branch: string | null;
+  delivery_commit_sha: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  pr_state: string | null;
+  pr_is_draft: number | null;
+  pr_created_at: string | null;
+  validation_json: string | null;
+  base_commit: string | null;
+  error_code: string | null;
+  created_at: string;
+  item_count: number;
+  add_count: number;
+  replace_count: number;
+  delete_count: number;
 }
 
 interface JobRow {
@@ -208,6 +233,40 @@ function toBatch(row: BatchRow): StoredBatch {
     error: row.error_code && row.error_message ? { code: row.error_code, message: row.error_message } : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function toBatchSummary(row: BatchSummaryRow): BatchSummary {
+  const validation = parseJson(row.validation_json);
+  return {
+    id: row.id,
+    title: row.title,
+    userStatus: userStatusForBatch({
+      state: row.state,
+      executionMode: storedExecutionMode(row.execution_mode),
+      baseCommit: row.base_commit,
+      validation,
+      errorCode: row.error_code,
+      delivery: {
+        checkpoint: storedDeliveryCheckpoint(row.delivery_checkpoint),
+        branch: row.delivery_branch,
+        commitSha: row.delivery_commit_sha,
+        pullRequest: row.pr_number === null ? null : {
+          number: row.pr_number,
+          url: row.pr_url ?? '',
+          state: row.pr_state ?? '',
+          isDraft: row.pr_is_draft === 1,
+          createdAt: row.pr_created_at,
+        },
+      },
+    }),
+    createdAt: row.created_at,
+    itemCounts: {
+      total: row.item_count,
+      add: row.add_count,
+      replace: row.replace_count,
+      delete: row.delete_count,
+    },
   };
 }
 
@@ -393,6 +452,37 @@ export class BatchDatabase {
     const items = (this.db.prepare('SELECT * FROM items WHERE batch_id = ? ORDER BY created_at, id').all(id) as ItemRow[]).map(toItem);
     const job = this.getJob(id);
     return { ...batch, items, job, failureHistory: this.getFailureHistory(id) };
+  }
+
+  listBatchSummaries(limit: number): BatchSummary[] {
+    return (this.db.prepare(`
+      SELECT
+        batches.id,
+        batches.title,
+        batches.state,
+        batches.execution_mode,
+        batches.delivery_checkpoint,
+        batches.delivery_branch,
+        batches.delivery_commit_sha,
+        batches.pr_number,
+        batches.pr_url,
+        batches.pr_state,
+        batches.pr_is_draft,
+        batches.pr_created_at,
+        batches.validation_json,
+        batches.base_commit,
+        batches.error_code,
+        batches.created_at,
+        COUNT(items.id) AS item_count,
+        COALESCE(SUM(CASE WHEN items.action = 'add' THEN 1 ELSE 0 END), 0) AS add_count,
+        COALESCE(SUM(CASE WHEN items.action = 'replace' THEN 1 ELSE 0 END), 0) AS replace_count,
+        COALESCE(SUM(CASE WHEN items.action = 'delete' THEN 1 ELSE 0 END), 0) AS delete_count
+      FROM batches
+      LEFT JOIN items ON items.batch_id = batches.id
+      GROUP BY batches.id
+      ORDER BY batches.created_at DESC, batches.id DESC
+      LIMIT ?
+    `).all(limit) as BatchSummaryRow[]).map(toBatchSummary);
   }
 
   getItems(batchId: string): StoredItem[] {

@@ -1,12 +1,20 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render as renderBase, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
 import { afterEach, expect, test, vi } from 'vitest';
 
 import { App } from './App';
-import type { BatchDetails } from './api';
+import type { BatchDetails, BatchSummary } from './api';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => { resolve = nextResolve; reject = nextReject; });
+  return { promise, resolve, reject };
 }
 
 function saveProfile(): void {
@@ -48,6 +56,35 @@ function batch(overrides: Partial<BatchDetails> = {}): BatchDetails {
     localDiff: null,
     delivery: delivery(),
     error: null,
+    createdAt: '2026-08-10T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function stubFetch(handler: (path: string, options?: RequestInit) => unknown, summaries: BatchSummary[] = []): void {
+  vi.stubGlobal('fetch', vi.fn((path: string, options?: RequestInit) => {
+    if (path === '/api/batches?limit=20') {
+      return Promise.resolve(jsonResponse(summaries));
+    }
+    return handler(path, options);
+  }));
+}
+
+function render(ui: ReactElement) {
+  return renderBase(ui);
+}
+
+async function openNewWorkbench(user: ReturnType<typeof userEvent.setup>): Promise<void> {
+  await user.click(await screen.findByRole('button', { name: '新建图标变更' }));
+}
+
+function summary(overrides: Partial<BatchSummary> = {}): BatchSummary {
+  return {
+    id: 'ICON-SUMMARY',
+    title: '最近图标变更',
+    userStatus: 'draft',
+    createdAt: '2026-08-10T00:00:00.000Z',
+    itemCounts: { total: 1, add: 1, replace: 0, delete: 0 },
     ...overrides,
   };
 }
@@ -69,14 +106,21 @@ async function openReview(user: ReturnType<typeof userEvent.setup>, designUrl?: 
   await user.click(screen.getByRole('checkbox'));
 }
 
+async function openActiveWorkbench(user: ReturnType<typeof userEvent.setup>, label: string): Promise<void> {
+  const buttons = await screen.findAllByRole('button', { name: label });
+  await user.click(buttons.at(-1)!);
+}
+
 afterEach(() => {
   window.localStorage.clear();
+  window.history.replaceState({}, '', '/');
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 test('first use asks for a local designer profile and stores it in this browser', async () => {
   const fetchMock = vi.fn();
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
@@ -93,10 +137,11 @@ test('first use asks for a local designer profile and stores it in this browser'
 test('the expected icon name uses only local checks and never performs a name preview request', async () => {
   saveProfile();
   const fetchMock = vi.fn();
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   await addOneSvgChange(user);
 
   expect(screen.getByLabelText(/^期望图标名称/)).toBeTruthy();
@@ -108,10 +153,11 @@ test('the expected icon name uses only local checks and never performs a name pr
 test('an expected icon name with path characters is rejected locally without a network check', async () => {
   saveProfile();
   const fetchMock = vi.fn();
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('invalid.svg'));
   await screen.findByRole('button', { name: '选择 invalid.svg' });
@@ -137,10 +183,11 @@ test('replace opens the frozen catalog only when the designer asks for it', asyn
       svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>',
     }],
   }));
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   await user.click(screen.getByRole('tab', { name: '替换图标' }));
   expect(fetchMock).not.toHaveBeenCalled();
   await user.click(screen.getByRole('button', { name: '选择图标' }));
@@ -153,13 +200,14 @@ test('replace opens the frozen catalog only when the designer asks for it', asyn
 
 test('a replace target becomes unavailable after it is added to the same batch', async () => {
   saveProfile();
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+  stubFetch(vi.fn().mockResolvedValue(jsonResponse({
     baseCommit: 'a'.repeat(40), page: 1, pageSize: 24, total: 1,
     icons: [{ primaryName: 'existing', aliases: ['existing-alias'], group: 'common', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>' }],
   })));
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   await user.click(screen.getByRole('tab', { name: '替换图标' }));
   await user.click(screen.getByRole('button', { name: '选择图标' }));
   await screen.findByText('existing');
@@ -176,10 +224,11 @@ test('a replace target becomes unavailable after it is added to the same batch',
 
 test('multiple SVG files stay in the local queue until each is paired with a change', async () => {
   saveProfile();
-  vi.stubGlobal('fetch', vi.fn());
+  stubFetch(vi.fn());
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, [svgFile('one.svg'), svgFile('two.svg')]);
   await screen.findByRole('button', { name: '选择 one.svg' });
@@ -194,13 +243,14 @@ test('multiple SVG files stay in the local queue until each is paired with a cha
 
 test('delete only needs a catalog target and a design reason before it enters the queue', async () => {
   saveProfile();
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+  stubFetch(vi.fn().mockResolvedValue(jsonResponse({
     baseCommit: 'a'.repeat(40), page: 1, pageSize: 24, total: 1,
     icons: [{ primaryName: 'existing', aliases: ['existing-alias'], group: 'common', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>' }],
   })));
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   await user.click(screen.getByRole('tab', { name: '删除图标' }));
   await user.click(screen.getByRole('button', { name: '选择图标' }));
   await screen.findByText('existing');
@@ -214,10 +264,11 @@ test('delete only needs a catalog target and a design reason before it enters th
 test('review requires local batch fields but design link is optional', async () => {
   saveProfile();
   const fetchMock = vi.fn();
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   await addOneSvgChange(user);
   await user.click(screen.getByRole('button', { name: '确认本次变更' }));
   await user.click(screen.getByRole('button', { name: '确认提交' }));
@@ -232,10 +283,11 @@ test('review requires local batch fields but design link is optional', async () 
 test('review rejects a malformed optional design link before it creates a batch', async () => {
   saveProfile();
   const fetchMock = vi.fn();
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   await addOneSvgChange(user);
   await openReview(user, 'https:www.123.com');
   await user.click(screen.getByRole('button', { name: '确认提交' }));
@@ -256,10 +308,11 @@ test('confirmation closes review, queues a DRAFT batch, and makes no preview or 
     if (url.pathname === `/api/batches/${draft.id}/submit`) return Promise.resolve(jsonResponse(queued));
     throw new Error(`Unexpected request: ${path}`);
   });
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   await addOneSvgChange(user);
   await openReview(user);
   await user.click(screen.getByRole('button', { name: '确认提交' }));
@@ -293,13 +346,11 @@ test('a final validation failure shows Chinese diagnostics and can return to edi
     if (path === '/api/batches/ICON-INVALID/return-to-edit') return Promise.resolve(jsonResponse(draft));
     throw new Error(`Unexpected request: ${path}`);
   });
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
-  await screen.findByRole('heading', { name: '需要修改' });
-  expect(screen.getByText('图标包含多种颜色')).toBeTruthy();
-  await user.click(screen.getByRole('button', { name: '返回编辑并修正' }));
+  await openActiveWorkbench(user, '返回修改');
 
   await screen.findByRole('heading', { name: '本次交付尚未提交' });
   expect(screen.getByText('本次变更 1 项')).toBeTruthy();
@@ -324,10 +375,11 @@ test('a refreshed DRAFT batch restores server items as removable changes', async
     if (path === '/api/batches/ICON-RESTORE/items/item-restore' && options?.method === 'DELETE') return Promise.resolve(jsonResponse(undefined, 204));
     throw new Error(`Unexpected request: ${path}`);
   });
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openActiveWorkbench(user, '继续编辑');
 
   await screen.findByText('本次变更 1 项');
   expect(screen.getByText('已上传：item-restore.svg')).toBeTruthy();
@@ -354,10 +406,11 @@ test('an infrastructure failure offers a manual delivery retry without exposing 
     if (path === '/api/batches/ICON-RETRY/retry') return Promise.resolve(jsonResponse(queued));
     throw new Error(`Unexpected request: ${path}`);
   });
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openActiveWorkbench(user, '恢复交付');
   await screen.findByRole('heading', { name: '交付失败' });
   expect(screen.getByText('本次交付没有完成。请在确认技术问题后，手动重新尝试交付。')).toBeTruthy();
   await user.click(screen.getByRole('button', { name: '重新尝试交付' }));
@@ -383,10 +436,11 @@ test('a refreshed pushed branch failure offers a Draft PR-only retry', async () 
     if (path === '/api/batches/ICON-PR-RETRY/retry') return Promise.resolve(jsonResponse(queued));
     throw new Error(`Unexpected request: ${path}`);
   });
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openActiveWorkbench(user, '恢复交付');
 
   await screen.findByRole('heading', { name: '分支已推送，Draft PR 创建失败' });
   expect(screen.getByText('图标变更已安全推送。你可以仅重新尝试创建 Draft PR，不会重新提交图标变更。')).toBeTruthy();
@@ -405,7 +459,7 @@ test.each([
   'WORKER_UNEXPECTED',
 ])('a refreshed non-recoverable post-push failure %s requires developer handling', async (errorCode) => {
   saveProfile();
-  window.localStorage.setItem('pink-icon-submit.active-batch.v1', `ICON-NO-RETRY-${errorCode}`);
+  window.history.replaceState({}, '', `/workbench?batch=ICON-NO-RETRY-${errorCode}`);
   const failed = batch({
     id: `ICON-NO-RETRY-${errorCode}`,
     executionMode: 'remote',
@@ -415,8 +469,7 @@ test.each([
     error: { code: errorCode, message: `Non-recoverable ${errorCode}.` },
   });
   const fetchMock = vi.fn().mockResolvedValue(jsonResponse(failed));
-  vi.stubGlobal('fetch', fetchMock);
-
+  stubFetch(fetchMock);
   render(<App />);
 
   await screen.findByRole('heading', { name: 'Draft PR 创建无法自动恢复' });
@@ -429,7 +482,7 @@ test.each([
 
 test('a refreshed post-push failure with missing recovery evidence requires developer handling', async () => {
   saveProfile();
-  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-NO-EVIDENCE');
+  window.history.replaceState({}, '', '/workbench?batch=ICON-NO-EVIDENCE');
   const failed = batch({
     id: 'ICON-NO-EVIDENCE',
     executionMode: 'remote',
@@ -438,8 +491,7 @@ test('a refreshed post-push failure with missing recovery evidence requires deve
     delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: 'bot/ICON-NO-EVIDENCE', commitSha: 'a'.repeat(40) }),
     error: { code: 'GIT_COMMAND_FAILED', message: 'Target fetch failed before Draft PR creation.' },
   });
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(failed)));
-
+  stubFetch(vi.fn().mockResolvedValue(jsonResponse(failed)));
   render(<App />);
 
   await screen.findByRole('heading', { name: 'Draft PR 创建无法自动恢复' });
@@ -466,10 +518,11 @@ test('unchanged final-validation failures need an explicit confirmation before r
     }
     throw new Error(`Unexpected request: ${path}`);
   });
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   await addOneSvgChange(user);
   await openReview(user);
   await user.click(screen.getByRole('button', { name: '确认提交' }));
@@ -528,10 +581,11 @@ test('partial item sync reconciles server items before retrying without duplicat
     if (url.pathname === `/api/batches/${batchId}/submit` && options?.method === 'POST') return Promise.resolve(jsonResponse(snapshot('QUEUED')));
     throw new Error(`Unexpected request: ${path}`);
   });
-  vi.stubGlobal('fetch', fetchMock);
+  stubFetch(fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await openNewWorkbench(user);
   await addOneSvgChange(user);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('second-icon.svg'));
@@ -558,14 +612,13 @@ test('partial item sync reconciles server items before retrying without duplicat
 
 test('a restored local result never promises a Draft PR', async () => {
   saveProfile();
-  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-LOCAL');
+  window.history.replaceState({}, '', '/workbench?batch=ICON-LOCAL');
   const local = batch({
     id: 'ICON-LOCAL',
     state: 'LOCAL_DIFF_READY',
     localDiff: { changedFiles: ['src/icons/pink-new-icon.svg'], patch: '' },
   });
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(local)));
-
+  stubFetch(vi.fn().mockResolvedValue(jsonResponse(local)));
   render(<App />);
 
   await screen.findByRole('heading', { name: '本地预览已完成' });
@@ -583,9 +636,11 @@ test('a restored remote branch checkpoint reports delivery progress without expo
     validation: { valid: true, errors: [], warnings: [] },
     delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: 'bot/ICON-BRANCH', commitSha: 'a'.repeat(40) }),
   });
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(inProgress)));
+  stubFetch(vi.fn(() => Promise.resolve(jsonResponse(inProgress))));
+  const user = userEvent.setup();
 
   render(<App />);
+  await openActiveWorkbench(user, '查看处理中');
 
   await screen.findByRole('heading', { name: '正在交付' });
   expect(screen.queryByText(/bot\/ICON-BRANCH/)).toBeNull();
@@ -593,7 +648,7 @@ test('a restored remote branch checkpoint reports delivery progress without expo
 
 test('a restored PR-created batch shows the Draft PR handoff link', async () => {
   saveProfile();
-  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-PR');
+  window.history.replaceState({}, '', '/workbench?batch=ICON-PR');
   const completed = batch({
     id: 'ICON-PR',
     executionMode: 'remote',
@@ -605,11 +660,528 @@ test('a restored PR-created batch shows the Draft PR handoff link', async () => 
     }),
   });
   const fetchMock = vi.fn().mockResolvedValue(jsonResponse(completed));
+  stubFetch(fetchMock);
+  render(<App />);
+
+  const link = await screen.findByRole('link', { name: '打开开发审核记录' });
+  expect(link.getAttribute('href')).toBe('https://github.example.invalid/pull/42');
+  expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-PR', {});
+});
+
+test('home lists internal recent batches with user-facing status and action counts', async () => {
+  saveProfile();
+  stubFetch(vi.fn(), [
+    summary({ id: 'ICON-DRAFT', title: '草稿图标', userStatus: 'draft', itemCounts: { total: 1, add: 1, replace: 0, delete: 0 } }),
+    summary({ id: 'ICON-RUNNING', title: '处理中图标', userStatus: 'processing', itemCounts: { total: 1, add: 0, replace: 1, delete: 0 } }),
+    summary({ id: 'ICON-VALIDATION', title: '需要修改图标', userStatus: 'needs_changes' }),
+    summary({ id: 'ICON-RETRY', title: '可恢复交付', userStatus: 'delivery_retryable' }),
+    summary({ id: 'ICON-DEVELOPER', title: '开发处理', userStatus: 'developer_attention' }),
+    summary({ id: 'ICON-PR', title: '已交开发审核', userStatus: 'submitted_review', itemCounts: { total: 2, add: 1, replace: 0, delete: 1 } }),
+  ]);
+
+  renderBase(<App />);
+
+  await screen.findByRole('heading', { name: '最近 20 条批次' });
+  expect(screen.queryByText(/不按设计师账号隔离/)).toBeNull();
+  expect(screen.getAllByText(/新增 1/).length).toBeGreaterThan(0);
+  expect(screen.getByText(/替换 1/)).toBeTruthy();
+  expect(screen.getByText('需要修改')).toBeTruthy();
+  expect(screen.getByText('交付暂时失败')).toBeTruthy();
+  expect(screen.getByText('需要开发处理')).toBeTruthy();
+  expect(screen.getByText('已提交开发审核')).toBeTruthy();
+  expect(screen.queryByText(/bot\/ICON/)).toBeNull();
+});
+
+test.each([
+  ['草稿', batch({ state: 'DRAFT' }), '继续编辑'],
+  ['排队中', batch({ state: 'QUEUED' }), '查看处理中'],
+  ['运行中', batch({ state: 'RUNNING' }), '查看处理中'],
+  ['提交准备中', batch({ state: 'COMMIT_PREPARED' }), '查看处理中'],
+  ['分支交付中', batch({ executionMode: 'remote', state: 'BRANCH_PUSHED', delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: 'bot/ICON-TEST', commitSha: 'a'.repeat(40) }) }), '查看处理中'],
+  ['最终校验待修改', batch({ state: 'FAILED', validation: { valid: false, errors: [], warnings: [] } }), '返回修改'],
+  ['可人工恢复的失败', batch({ state: 'FAILED', error: { code: 'GIT_COMMAND_FAILED', message: 'Retry manually.' } }), '恢复交付'],
+])('an active %s batch replaces the new-work entry without clearing its browser lock', async (_name, active, actionLabel) => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', active.id);
+  const fetchMock = vi.fn((path: string) => {
+    if (path === `/api/batches/${active.id}`) return Promise.resolve(jsonResponse(active));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock);
+
+  render(<App />);
+
+  await screen.findAllByRole('button', { name: actionLabel });
+  expect(screen.queryByRole('button', { name: '新建图标变更' })).toBeNull();
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBe(active.id);
+});
+
+test('an active batch blocks a different history record but can reopen itself', async () => {
+  saveProfile();
+  const active = batch({ id: 'ICON-ACTIVE-LOCK', title: '当前草稿' });
+  const historical = batch({ id: 'ICON-HISTORY-OTHER', title: '其他历史', state: 'PR_CREATED', delivery: delivery({ checkpoint: 'PR_CREATED' }) });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', active.id);
+  const fetchMock = vi.fn((path: string) => {
+    if (path === `/api/batches/${active.id}`) return Promise.resolve(jsonResponse(active));
+    if (path === `/api/batches/${historical.id}`) return Promise.resolve(jsonResponse(historical));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock, [summary({ id: active.id, title: active.title }), summary({ id: historical.id, title: historical.title, userStatus: 'submitted_review' })]);
+  const user = userEvent.setup();
+
+  render(<App />);
+  const historyButtons = await screen.findAllByRole('button', { name: '查看' });
+  await user.click(historyButtons[1]!);
+  expect(screen.getByRole('status').textContent).toBe('请先完成当前批次。');
+  expect(fetchMock).not.toHaveBeenCalledWith(`/api/batches/${historical.id}`, {});
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBe(active.id);
+
+  await user.click(historyButtons[0]!);
+  await screen.findByRole('heading', { name: '完成设计，交给开发' });
+});
+
+test('a historical DRAFT record is read-only and never becomes the browser active batch', async () => {
+  saveProfile();
+  const historical = batch({ id: 'ICON-HISTORY-DRAFT', title: '历史草稿' });
+  const fetchMock = vi.fn((path: string) => {
+    if (path === `/api/batches/${historical.id}`) return Promise.resolve(jsonResponse(historical));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock, [summary({ id: historical.id, title: historical.title })]);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await user.click(await screen.findByRole('button', { name: '查看' }));
+
+  await screen.findByText('这是历史批次，仅供查看。');
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBeNull();
+  expect((screen.getByLabelText(/^期望图标名称/) as HTMLInputElement).disabled).toBe(true);
+  expect((screen.getByRole('button', { name: '确认本次变更' }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+test('leaving a workbench clears local SVG and catalog selection state before a legal new batch', async () => {
+  saveProfile();
+  const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+    baseCommit: 'a'.repeat(40), page: 1, pageSize: 24, total: 1,
+    icons: [{ primaryName: 'existing', aliases: [], group: 'common', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>' }],
+  }));
+  stubFetch(fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await openNewWorkbench(user);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('transient.svg'));
+  await screen.findByRole('button', { name: '选择 transient.svg' });
+  await user.click(screen.getByRole('tab', { name: '替换图标' }));
+  await user.click(screen.getByRole('button', { name: '选择图标' }));
+  await user.click(await screen.findByRole('button', { name: '选择 existing' }));
+  await user.click(screen.getByRole('button', { name: '返回首页' }));
+  await screen.findByRole('heading', { name: '把图标设计交给开发审核' });
+  await openNewWorkbench(user);
+
+  expect(screen.queryByRole('button', { name: '选择 transient.svg' })).toBeNull();
+  await user.click(screen.getByRole('tab', { name: '替换图标' }));
+  expect(screen.getByRole('button', { name: '选择图标' })).toBeTruthy();
+  expect(screen.queryByText(/已选择 existing/)).toBeNull();
+});
+
+test('an invalid workbench URL falls back home and a URL history record cannot replace an active batch', async () => {
+  saveProfile();
+  const active = batch({ id: 'ICON-URL-ACTIVE', title: 'URL 当前批次' });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', active.id);
+  window.history.replaceState({}, '', '/workbench?batch=ICON-URL-HISTORY');
+  const fetchMock = vi.fn((path: string) => {
+    if (path === `/api/batches/${active.id}`) return Promise.resolve(jsonResponse(active));
+    if (path === '/api/batches/ICON-URL-HISTORY') throw new Error('The active batch must block this history read.');
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock);
+
+  render(<App />);
+  await screen.findByText('请先完成当前批次。');
+  expect(`${window.location.pathname}${window.location.search}`).toBe('/');
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBe(active.id);
+  expect(fetchMock).not.toHaveBeenCalledWith('/api/batches/ICON-URL-HISTORY', {});
+});
+
+test('an invalid workbench batch URL clears a matching stale browser activity id and returns home', async () => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-MISSING');
+  window.history.replaceState({}, '', '/workbench?batch=ICON-MISSING');
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches/ICON-MISSING') {
+      return Promise.resolve(jsonResponse({ error: { code: 'BATCH_NOT_FOUND', message: 'Unknown batch.' } }, 404));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock);
+
+  render(<App />);
+
+  await screen.findByRole('heading', { name: '把图标设计交给开发审核' });
+  expect(`${window.location.pathname}${window.location.search}`).toBe('/');
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBeNull();
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test('a stale initial active success ends restoration and lets the current workbench hydration win', async () => {
+  saveProfile();
+  const activeId = 'ICON-INITIAL-SLOW-SUCCESS';
+  const oldResponse = deferred<Response>();
+  const stale = batch({
+    id: activeId,
+    items: [{ id: 'item-initial-stale', batchId: activeId, action: 'add', designName: 'pink-initial-stale', description: '过期响应。', sourceFile: 'items/item-initial-stale.svg' }],
+  });
+  const current = batch({
+    id: activeId,
+    items: [{ id: 'item-initial-current', batchId: activeId, action: 'add', designName: 'pink-initial-current', description: '当前路由恢复。', sourceFile: 'items/item-initial-current.svg' }],
+  });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', activeId);
+  let batchReads = 0;
+  const fetchMock = vi.fn((path: string) => {
+    if (path === `/api/batches/${activeId}`) {
+      batchReads += 1;
+      return batchReads === 1 ? oldResponse.promise : Promise.resolve(jsonResponse(current));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock);
+
+  render(<App />);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(`/api/batches/${activeId}`, {}));
+  window.history.replaceState({}, '', '/workbench');
+  fireEvent.popState(window);
+  oldResponse.resolve(jsonResponse(stale));
+
+  await screen.findByText(/pink-initial-current/);
+  expect(screen.queryByText(/pink-initial-stale/)).toBeNull();
+  expect(batchReads).toBe(2);
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBe(activeId);
+});
+
+test('a stale initial active failure does not clear the valid active batch and still reconciles the workbench', async () => {
+  saveProfile();
+  const activeId = 'ICON-INITIAL-SLOW-FAILURE';
+  const oldResponse = deferred<Response>();
+  const current = batch({
+    id: activeId,
+    items: [{ id: 'item-initial-failure-current', batchId: activeId, action: 'add', designName: 'pink-initial-failure-current', description: '当前路由恢复。', sourceFile: 'items/item-initial-failure-current.svg' }],
+  });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', activeId);
+  let batchReads = 0;
+  const fetchMock = vi.fn((path: string) => {
+    if (path === `/api/batches/${activeId}`) {
+      batchReads += 1;
+      return batchReads === 1 ? oldResponse.promise : Promise.resolve(jsonResponse(current));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock);
+
+  render(<App />);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(`/api/batches/${activeId}`, {}));
+  window.history.replaceState({}, '', '/workbench');
+  fireEvent.popState(window);
+  oldResponse.reject(new Error('Initial request failed after navigation.'));
+
+  await screen.findByText(/pink-initial-failure-current/);
+  expect(batchReads).toBe(2);
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBe(activeId);
+  expect(screen.queryByText(/无法打开批次/)).toBeNull();
+});
+
+test('browser popstate switches between home and a blank workbench without replacing an activity id', async () => {
+  saveProfile();
+  stubFetch(vi.fn());
+  const user = userEvent.setup();
+
+  render(<App />);
+  await openNewWorkbench(user);
+  expect(window.location.pathname).toBe('/workbench');
+
+  window.history.replaceState({}, '', '/');
+  fireEvent.popState(window);
+  await screen.findByRole('heading', { name: '把图标设计交给开发审核' });
+
+  window.history.replaceState({}, '', '/workbench');
+  fireEvent.popState(window);
+  await screen.findByRole('heading', { name: '完成设计，交给开发' });
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBeNull();
+});
+
+test('a home-screen active delivery polls to PR_CREATED, refreshes summaries, and clears the browser lock', async () => {
+  saveProfile();
+  const queued = batch({ id: 'ICON-HOME-POLL', title: '后台轮询', executionMode: 'remote', state: 'QUEUED' });
+  const handedOff = batch({
+    ...queued,
+    state: 'PR_CREATED',
+    delivery: delivery({ checkpoint: 'PR_CREATED', pullRequest: { number: 5, url: 'https://github.example.invalid/pull/5', state: 'open', isDraft: true, createdAt: '2026-08-10T00:00:00.000Z' } }),
+  });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', queued.id);
+  let reads = 0;
+  let summaryReads = 0;
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches?limit=20') {
+      summaryReads += 1;
+      return Promise.resolve(jsonResponse([summary({ id: queued.id, title: queued.title, userStatus: 'processing' })]));
+    }
+    if (path === `/api/batches/${queued.id}`) {
+      reads += 1;
+      return Promise.resolve(jsonResponse(reads === 1 ? queued : handedOff));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+
+  render(<App />);
+  await screen.findAllByRole('button', { name: '查看处理中' });
+  await waitFor(() => expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBeNull(), { timeout: 3_000 });
+  expect(screen.getByRole('heading', { name: '把图标设计交给开发审核' })).toBeTruthy();
+  expect(summaryReads).toBeGreaterThanOrEqual(2);
+});
+
+test('home restores one active DRAFT batch and continues editing it in the workbench', async () => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-ACTIVE-DRAFT');
+  const active = batch({ id: 'ICON-ACTIVE-DRAFT', title: '继续修改的图标', items: [{
+    id: 'item-active', batchId: 'ICON-ACTIVE-DRAFT', action: 'add', designName: 'pink-active', description: 'Restored work.', sourceFile: 'items/item-active.svg',
+  }] });
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches/ICON-ACTIVE-DRAFT') return Promise.resolve(jsonResponse(active));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock, [summary({ id: active.id, title: active.title })]);
+  const user = userEvent.setup();
+
+  renderBase(<App />);
+
+  await screen.findAllByRole('button', { name: '继续编辑' });
+  await openActiveWorkbench(user, '继续编辑');
+  expect(screen.getByText('本次变更 1 项')).toBeTruthy();
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBe('ICON-ACTIVE-DRAFT');
+  expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-ACTIVE-DRAFT', {});
+});
+
+test('returning a final-validation failure restores saved metadata and server items after going home and continuing', async () => {
+  saveProfile();
+  const item = {
+    id: 'item-return-edit', batchId: 'ICON-RETURN-EDIT', action: 'add' as const,
+    designName: 'pink-return-edit', description: '修正后仍需保留的图标。', sourceFile: 'items/item-return-edit.svg',
+  };
+  const failed = batch({
+    id: 'ICON-RETURN-EDIT', title: '修正单色图标', description: '请将图标修改为单色。', designUrl: 'https://figma.example.invalid/return-edit',
+    state: 'FAILED', items: [item], validation: { valid: false, errors: [], warnings: [] },
+    error: { code: 'FINAL_VALIDATION_FAILED', message: 'Final validation failed.' },
+  });
+  const draft = batch({ ...failed, state: 'DRAFT', validation: null, error: null });
+  let current = failed;
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', current.id);
+  const fetchMock = vi.fn((path: string, options?: RequestInit) => {
+    if (path === `/api/batches/${current.id}`) return Promise.resolve(jsonResponse(current));
+    if (path === `/api/batches/${current.id}/return-to-edit` && options?.method === 'POST') {
+      current = draft;
+      return Promise.resolve(jsonResponse(draft));
+    }
+    if (path === `/api/batches/${current.id}/items/${item.id}` && options?.method === 'DELETE') return Promise.resolve(jsonResponse(undefined, 204));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock, [summary({ id: current.id, title: current.title, userStatus: 'needs_changes' })]);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await openActiveWorkbench(user, '返回修改');
+  await screen.findByRole('heading', { name: '本次交付尚未提交' });
+  expect(screen.getByText('已上传：item-return-edit.svg')).toBeTruthy();
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(draft.title);
+  expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(draft.description);
+  expect((screen.getByLabelText(/^设计稿链接/) as HTMLInputElement).value).toBe(draft.designUrl);
+  await user.click(screen.getByRole('button', { name: '关闭' }));
+
+  await user.click(screen.getByRole('button', { name: '返回首页' }));
+  await screen.findByRole('heading', { name: '把图标设计交给开发审核' });
+  await openActiveWorkbench(user, '继续编辑');
+  await screen.findByText('已上传：item-return-edit.svg');
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(draft.title);
+  expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(draft.description);
+  expect((screen.getByLabelText(/^设计稿链接/) as HTMLInputElement).value).toBe(draft.designUrl);
+  await user.click(screen.getByRole('button', { name: '关闭' }));
+  await user.click(screen.getByRole('button', { name: '移除 pink-return-edit' }));
+  expect(fetchMock).toHaveBeenCalledWith(`/api/batches/${draft.id}/items/${item.id}`, { method: 'DELETE' });
+});
+
+test('an active DRAFT restores its saved form and items after a home round trip', async () => {
+  saveProfile();
+  const active = batch({
+    id: 'ICON-DRAFT-ROUND-TRIP', title: '已保存的草稿标题', description: '已保存的草稿说明。', designUrl: 'https://figma.example.invalid/draft-round-trip',
+    items: [{ id: 'item-draft-round-trip', batchId: 'ICON-DRAFT-ROUND-TRIP', action: 'add', designName: 'pink-draft-round-trip', description: '已保存的图标项。', sourceFile: 'items/item-draft-round-trip.svg' }],
+  });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', active.id);
+  stubFetch(vi.fn((path: string) => {
+    if (path === `/api/batches/${active.id}`) return Promise.resolve(jsonResponse(active));
+    throw new Error(`Unexpected request: ${path}`);
+  }), [summary({ id: active.id, title: active.title })]);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await openActiveWorkbench(user, '继续编辑');
+  await screen.findByText('已上传：item-draft-round-trip.svg');
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(active.title);
+  expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(active.description);
+  expect((screen.getByLabelText(/^设计稿链接/) as HTMLInputElement).value).toBe(active.designUrl);
+  await user.click(screen.getByRole('button', { name: '关闭' }));
+
+  await user.click(screen.getByRole('button', { name: '返回首页' }));
+  await screen.findByRole('heading', { name: '把图标设计交给开发审核' });
+  await openActiveWorkbench(user, '继续编辑');
+  await screen.findByText('已上传：item-draft-round-trip.svg');
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(active.title);
+  expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(active.description);
+  expect((screen.getByLabelText(/^设计稿链接/) as HTMLInputElement).value).toBe(active.designUrl);
+});
+
+test('popstate from a historical query to a blank workbench clears the historical details', async () => {
+  saveProfile();
+  const historical = batch({
+    id: 'ICON-HISTORY-BACK', title: '只读历史批次', state: 'PR_CREATED',
+    delivery: delivery({ checkpoint: 'PR_CREATED' }),
+  });
+  window.history.replaceState({}, '', `/workbench?batch=${historical.id}`);
+  stubFetch(vi.fn((path: string) => {
+    if (path === `/api/batches/${historical.id}`) return Promise.resolve(jsonResponse(historical));
+    throw new Error(`Unexpected request: ${path}`);
+  }));
+
+  render(<App />);
+  await screen.findByText('这是历史批次，仅供查看。');
+  window.history.replaceState({}, '', '/workbench');
+  fireEvent.popState(window);
+
+  await waitFor(() => expect(screen.queryByText('这是历史批次，仅供查看。')).toBeNull());
+  expect(screen.getByText('本次变更 0 项')).toBeTruthy();
+  expect(screen.queryByRole('heading', { name: 'Draft PR 已创建' })).toBeNull();
+  expect(`${window.location.pathname}${window.location.search}`).toBe('/workbench');
+});
+
+test('a direct blank workbench route restores the active batch from this browser', async () => {
+  saveProfile();
+  const active = batch({
+    id: 'ICON-DIRECT-ACTIVE', title: '直接恢复的草稿', description: '直接进入工作台时恢复。', designUrl: 'https://figma.example.invalid/direct-active',
+    items: [{ id: 'item-direct-active', batchId: 'ICON-DIRECT-ACTIVE', action: 'add', designName: 'pink-direct-active', description: '直接恢复的项目。', sourceFile: 'items/item-direct-active.svg' }],
+  });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', active.id);
+  window.history.replaceState({}, '', '/workbench');
+  stubFetch(vi.fn((path: string) => {
+    if (path === `/api/batches/${active.id}`) return Promise.resolve(jsonResponse(active));
+    throw new Error(`Unexpected request: ${path}`);
+  }), [summary({ id: active.id, title: active.title })]);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await screen.findByText('已上传：item-direct-active.svg');
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(active.title);
+  expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(active.description);
+  expect((screen.getByLabelText(/^设计稿链接/) as HTMLInputElement).value).toBe(active.designUrl);
+});
+
+test('an initial PR_CREATED active batch immediately returns a direct workbench refresh to home', async () => {
+  saveProfile();
+  const completed = batch({
+    id: 'ICON-INITIAL-PR-CREATED', title: '已完成的开发审核', executionMode: 'remote', state: 'PR_CREATED',
+    delivery: delivery({ checkpoint: 'PR_CREATED', pullRequest: { number: 55, url: 'https://github.example.invalid/pull/55', state: 'open', isDraft: true, createdAt: '2026-08-10T00:00:00.000Z' } }),
+  });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', completed.id);
+  window.history.replaceState({}, '', '/workbench');
+  let summaryReads = 0;
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches?limit=20') {
+      summaryReads += 1;
+      return Promise.resolve(jsonResponse([summary({ id: completed.id, title: completed.title, userStatus: 'submitted_review' })]));
+    }
+    if (path === `/api/batches/${completed.id}`) return Promise.resolve(jsonResponse(completed));
+    throw new Error(`Unexpected request: ${path}`);
+  });
   vi.stubGlobal('fetch', fetchMock);
 
   render(<App />);
 
-  const link = await screen.findByRole('link', { name: '打开 Draft PR #42' });
-  expect(link.getAttribute('href')).toBe('https://github.example.invalid/pull/42');
-  expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-PR', {});
+  await screen.findByRole('heading', { name: '把图标设计交给开发审核' });
+  await waitFor(() => expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBeNull());
+  await waitFor(() => expect(summaryReads).toBeGreaterThanOrEqual(2));
+  expect(screen.queryByRole('heading', { name: '完成设计，交给开发' })).toBeNull();
+  expect(screen.getAllByRole('status').map((node) => node.textContent)).toEqual(['已提交开发审核。']);
+  expect(`${window.location.pathname}${window.location.search}`).toBe('/');
+});
+
+test('a stale historical hydration cannot overwrite the batch reopened by forward navigation', async () => {
+  saveProfile();
+  const oldBatch = batch({
+    id: 'ICON-HISTORY-OLD', title: '旧历史批次', state: 'PR_CREATED', delivery: delivery({ checkpoint: 'PR_CREATED' }),
+    items: [{ id: 'item-history-old', batchId: 'ICON-HISTORY-OLD', action: 'add', designName: 'pink-history-old', description: '旧响应。', sourceFile: 'items/item-history-old.svg' }],
+  });
+  const newBatch = batch({
+    id: 'ICON-HISTORY-NEW', title: '新历史批次', state: 'PR_CREATED', delivery: delivery({ checkpoint: 'PR_CREATED' }),
+    items: [{ id: 'item-history-new', batchId: 'ICON-HISTORY-NEW', action: 'add', designName: 'pink-history-new', description: '新响应。', sourceFile: 'items/item-history-new.svg' }],
+  });
+  const oldResponse = deferred<Response>();
+  const newResponse = deferred<Response>();
+  window.history.replaceState({}, '', `/workbench?batch=${oldBatch.id}`);
+  const fetchMock = vi.fn((path: string) => {
+    if (path === `/api/batches/${oldBatch.id}`) return oldResponse.promise;
+    if (path === `/api/batches/${newBatch.id}`) return newResponse.promise;
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock);
+
+  render(<App />);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(`/api/batches/${oldBatch.id}`, {}));
+  window.history.replaceState({}, '', '/workbench');
+  fireEvent.popState(window);
+  await waitFor(() => expect(screen.getByText('本次变更 0 项')).toBeTruthy());
+  window.history.replaceState({}, '', `/workbench?batch=${newBatch.id}`);
+  fireEvent.popState(window);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(`/api/batches/${newBatch.id}`, {}));
+
+  newResponse.resolve(jsonResponse(newBatch));
+  await screen.findByText(/pink-history-new/);
+  oldResponse.resolve(jsonResponse(oldBatch));
+  await waitFor(() => expect(screen.getByText(/pink-history-new/)).toBeTruthy());
+  expect(screen.queryByText(/pink-history-old/)).toBeNull();
+  expect(`${window.location.pathname}${window.location.search}`).toBe(`/workbench?batch=${newBatch.id}`);
+});
+
+test('a completed Draft PR returns the current workbench to home and keeps its result available', async () => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-HANDOFF');
+  const queued = batch({ id: 'ICON-HANDOFF', title: '等待开发审核', executionMode: 'remote', state: 'QUEUED' });
+  const handedOff = batch({
+    id: queued.id,
+    title: queued.title,
+    executionMode: 'remote',
+    state: 'PR_CREATED',
+    delivery: delivery({ checkpoint: 'PR_CREATED', pullRequest: { number: 8, url: 'https://github.example.invalid/pull/8', state: 'open', isDraft: true, createdAt: '2026-08-10T00:00:00.000Z' } }),
+  });
+  let reads = 0;
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches/ICON-HANDOFF') {
+      reads += 1;
+      return Promise.resolve(jsonResponse(reads === 1 ? queued : handedOff));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock, [summary({ id: queued.id, title: queued.title, userStatus: 'processing' })]);
+  const user = userEvent.setup();
+
+  renderBase(<App />);
+  await openActiveWorkbench(user, '查看处理中');
+  await screen.findByRole('heading', { name: '把图标设计交给开发审核' }, { timeout: 3_000 });
+  expect(screen.getByRole('status').textContent).toBe('已提交开发审核。');
+  fireEvent.click(screen.getByRole('button', { name: '查看' }));
+  const link = await screen.findByRole('link', { name: '打开开发审核记录' });
+  expect(link.getAttribute('href')).toBe('https://github.example.invalid/pull/8');
 });

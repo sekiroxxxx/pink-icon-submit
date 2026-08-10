@@ -63,7 +63,30 @@ export interface BatchDetails extends BatchInput {
     handoffAt: string | null;
   };
   error: { code: string; message: string } | null;
+  createdAt: string;
 }
+
+export interface BatchSummary {
+  id: string;
+  title: string;
+  userStatus: UserBatchStatus;
+  createdAt: string;
+  itemCounts: {
+    total: number;
+    add: number;
+    replace: number;
+    delete: number;
+  };
+}
+
+export type UserBatchStatus =
+  | 'draft'
+  | 'processing'
+  | 'needs_changes'
+  | 'delivery_retryable'
+  | 'developer_attention'
+  | 'submitted_review'
+  | 'local_complete';
 
 export interface NamePreview {
   schemaVersion: 1;
@@ -177,4 +200,5 @@ export const api = {
   returnToEdit: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/return-to-edit`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
+  getBatches: () => request<BatchSummary[]>('/api/batches?limit=20'),
 };

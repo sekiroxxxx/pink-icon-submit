@@ -6,7 +6,8 @@ import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
-import type { BatchDetails, BatchExecutionContext, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredBatch, StoredItem, TargetRepository } from './types.js';
+import { canRetryBatch, hasPostPushPullRequestRecoveryEvidence, isFinalValidationFailure, isPostPushCheckpoint, isRetryablePostPushInfrastructureFailure, lifecycleSnapshot } from './batch-lifecycle.js';
+import type { BatchDetails, BatchExecutionContext, BatchSummary, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
 
 const maximumBatchItems = 100;
 
@@ -59,22 +60,6 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function validationIsValid(value: unknown): boolean {
   return isObject(value) && value.valid === true;
-}
-
-function isRetryablePostPushInfrastructureFailure(errorCode: string | undefined): boolean {
-  return errorCode !== undefined && [
-    'GIT_COMMAND_FAILED',
-    'GITHUB_API_REQUEST_FAILED',
-    'GITHUB_API_RESPONSE_INVALID',
-    'WORKER_INTERRUPTED',
-  ].includes(errorCode);
-}
-
-function hasPostPushPullRequestRecoveryEvidence(batch: Pick<StoredBatch, 'executionMode' | 'baseCommit' | 'delivery'>): boolean {
-  return batch.executionMode === 'remote'
-    && Boolean(batch.baseCommit?.trim())
-    && Boolean(batch.delivery.branch?.trim())
-    && Boolean(batch.delivery.commitSha?.trim());
 }
 
 function baseCommitFrom(value: unknown): string | null {
@@ -284,23 +269,27 @@ export class BatchService {
 
   retry(batchId: string): BatchDetails {
     const batch = this.database.getBatch(batchId);
+    const failureCode = batch.error?.code ?? this.database.getDetails(batchId).job?.error?.code ?? null;
+    const retrySnapshot = { ...lifecycleSnapshot(batch), errorCode: failureCode };
     if (batch.state !== 'FAILED') {
       throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is ${batch.state}.`, 409);
     }
-    if (batch.delivery.checkpoint === 'NONE' && isObject(batch.validation) && batch.validation.valid === false) {
+    if (isFinalValidationFailure(retrySnapshot)) {
       throw new AppError('BATCH_RETURN_TO_EDIT_REQUIRED', 'A final validation failure must be corrected in the editor before delivery can be retried.', 409);
     }
     if (!['NONE', 'COMMIT_PREPARED', 'BRANCH_PUSHED', 'PR_CREATING'].includes(batch.delivery.checkpoint)) {
       throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is already handed off.`, 409);
     }
-    if (batch.delivery.checkpoint === 'BRANCH_PUSHED' || batch.delivery.checkpoint === 'PR_CREATING') {
-      const failureCode = batch.error?.code ?? this.database.getDetails(batchId).job?.error?.code;
+    if (isPostPushCheckpoint(batch.delivery.checkpoint)) {
       if (!isRetryablePostPushInfrastructureFailure(failureCode)) {
         throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} cannot retry Draft PR creation after ${failureCode ?? 'an unknown failure'}.`, 409);
       }
-      if (!hasPostPushPullRequestRecoveryEvidence(batch)) {
+      if (!hasPostPushPullRequestRecoveryEvidence(retrySnapshot)) {
         throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is missing the persisted branch, commit, or base evidence required to recover its Draft PR.`, 409);
       }
+    }
+    if (!canRetryBatch(retrySnapshot)) {
+      throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} cannot be retried from its current delivery state.`, 409);
     }
     this.database.queueJob(batchId);
     return this.database.getDetails(batchId);
@@ -308,6 +297,10 @@ export class BatchService {
 
   getBatch(batchId: string): BatchDetails {
     return this.database.getDetails(batchId);
+  }
+
+  listBatches(limit: number): BatchSummary[] {
+    return this.database.listBatchSummaries(limit);
   }
 
   private assertLocallySubmittable(batchId: string): void {

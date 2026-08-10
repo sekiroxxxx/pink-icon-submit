@@ -98,6 +98,11 @@ function catalogPageInput(query: unknown): CatalogPageInput {
   };
 }
 
+function batchListLimit(query: unknown): number {
+  const parameters = isObject(query) ? query : {};
+  return positiveQueryInteger(parameters.limit, 'limit', 20, 20);
+}
+
 function submitConfirmation(body: unknown): boolean {
   if (body === undefined || body === null) {
     return false;
@@ -152,6 +157,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const svg = await dependencies.batches.getCatalogIconSvg(name);
     return reply.type('image/svg+xml; charset=utf-8').send(svg);
   });
+
+  app.get('/api/batches', async (request) => dependencies.batches.listBatches(batchListLimit(request.query)));
 
   app.post('/api/batches', async (request, reply) => {
     const batch = await dependencies.batches.createBatch(request.body as CreateBatchInput);

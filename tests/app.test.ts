@@ -516,3 +516,96 @@ test('DRAFT API delivery accepts an optional design link and queues without the 
   assert.equal((queued.json() as { state: string; validation: unknown }).state, 'QUEUED');
   assert.equal((queued.json() as { validation: unknown }).validation, null);
 });
+
+test('batch list returns user-only summaries with stable bounds, ordering, and recovery status', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+
+  const seed = await environment.batches.createBatch({
+    title: 'Seed batch',
+    description: 'Supplies the frozen protocol context for direct fixture rows.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  const localContext = {
+    executionMode: seed.executionMode ?? 'local' as const,
+    pushRepository: seed.pushRepository,
+    pushBranchPrefix: seed.pushBranchPrefix,
+  };
+  const create = (id: string, title: string, context = localContext) => environment.database.createBatch(id, {
+    title,
+    description: `${title} description`,
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  }, seed.catalogBaseline!, seed.targetRepository!, context);
+  for (let index = 0; index < 21; index += 1) {
+    create(`ICON-HOME-${String(index).padStart(2, '0')}`, `Batch ${index}`);
+  }
+
+  const remoteContext = {
+    executionMode: 'remote' as const,
+    pushRepository: 'sud-icon-bot/example-icon-repository',
+    pushBranchPrefix: 'bot/',
+  };
+  create('ICON-HOME-Z-RETRY', 'Recoverable Draft PR', remoteContext);
+  environment.database.insertItem('ICON-HOME-Z-RETRY', 'item-add', {
+    action: 'add', designName: 'summary-add', description: 'An added icon.',
+  }, 'items/item-add.svg');
+  environment.database.insertItem('ICON-HOME-Z-RETRY', 'item-replace', {
+    action: 'replace', targetName: 'existing', description: 'A replacement.',
+  }, 'items/item-replace.svg');
+  environment.database.insertItem('ICON-HOME-Z-RETRY', 'item-delete', {
+    action: 'delete', targetName: 'retired', reason: 'No longer needed.',
+  }, null);
+  environment.database.queueJob('ICON-HOME-Z-RETRY');
+  environment.database.claimNextJob();
+  environment.database.recordCommitPrepared('ICON-HOME-Z-RETRY', { items: [] }, 'a'.repeat(40), { changedFiles: [] }, 'bot/ICON-HOME-Z-RETRY', 'b'.repeat(40));
+  environment.database.recordBranchPushed('ICON-HOME-Z-RETRY');
+  environment.database.failJob('ICON-HOME-Z-RETRY', 'GIT_COMMAND_FAILED', 'Internal command and diagnostics must not appear in a summary.');
+
+  create('ICON-HOME-Z-MISSING', 'Incomplete Draft PR evidence', remoteContext);
+  environment.database.queueJob('ICON-HOME-Z-MISSING');
+  environment.database.claimNextJob();
+  environment.database.recordCommitPrepared('ICON-HOME-Z-MISSING', { items: [] }, 'c'.repeat(40), { changedFiles: [] }, 'bot/ICON-HOME-Z-MISSING', 'd'.repeat(40));
+  environment.database.recordBranchPushed('ICON-HOME-Z-MISSING');
+  environment.database.failJob('ICON-HOME-Z-MISSING', 'GIT_COMMAND_FAILED', 'Missing persisted base must require developer handling.');
+  const inspection = new (await import('better-sqlite3')).default(environment.config.databasePath);
+  inspection.prepare('UPDATE batches SET base_commit = NULL WHERE id = ?').run('ICON-HOME-Z-MISSING');
+  inspection.close();
+
+  const response = await app.inject({ method: 'GET', url: '/api/batches' });
+  assert.equal(response.statusCode, 200);
+  const summaries = response.json() as Array<{
+    id: string;
+    title: string;
+    userStatus: string;
+    createdAt: string;
+    itemCounts: { total: number; add: number; replace: number; delete: number };
+  }>;
+  assert.equal(summaries.length, 20);
+  assert.deepEqual(summaries.find((summary) => summary.id === 'ICON-HOME-Z-RETRY')?.itemCounts, { total: 3, add: 1, replace: 1, delete: 1 });
+  assert.equal(summaries.find((summary) => summary.id === 'ICON-HOME-Z-RETRY')?.userStatus, 'delivery_retryable');
+  assert.equal(summaries.find((summary) => summary.id === 'ICON-HOME-Z-MISSING')?.userStatus, 'developer_attention');
+  for (let index = 1; index < summaries.length; index += 1) {
+    const earlier = summaries[index - 1]!;
+    const later = summaries[index]!;
+    assert.ok(earlier.createdAt > later.createdAt || (earlier.createdAt === later.createdAt && earlier.id > later.id));
+  }
+  assert.deepEqual(Object.keys(summaries[0]!).sort(), ['createdAt', 'id', 'itemCounts', 'title', 'userStatus']);
+  const serialized = JSON.stringify(summaries);
+  for (const internalField of ['failureHistory', 'errorCode', 'deliveryCheckpoint', 'state', 'baseCommit', 'branch', 'commitSha', 'targetRepository', 'pushRepository', 'pullRequest']) {
+    assert.equal(serialized.includes(internalField), false);
+  }
+
+  const one = await app.inject({ method: 'GET', url: '/api/batches?limit=1' });
+  assert.equal(one.statusCode, 200);
+  assert.equal((one.json() as unknown[]).length, 1);
+  assert.equal((one.json() as Array<{ id: string }>)[0]?.id, summaries[0]?.id);
+  const twenty = await app.inject({ method: 'GET', url: '/api/batches?limit=20' });
+  assert.equal(twenty.statusCode, 200);
+  assert.equal((twenty.json() as unknown[]).length, 20);
+  for (const invalid of ['0', 'nope', '21']) {
+    const invalidLimit = await app.inject({ method: 'GET', url: `/api/batches?limit=${invalid}` });
+    assert.equal(invalidLimit.statusCode, 400);
+    assert.equal((invalidLimit.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
+  }
+});
