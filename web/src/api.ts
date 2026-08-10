@@ -9,7 +9,7 @@ export interface Submitter {
 export interface BatchInput {
   title: string;
   description: string;
-  designUrl: string;
+  designUrl?: string;
   submitter: Submitter;
 }
 
@@ -49,6 +49,7 @@ export interface BatchDetails extends BatchInput {
   warningsAcknowledged: boolean;
   localDiff: { changedFiles: string[]; patch: string } | null;
   delivery: {
+    checkpoint: 'NONE' | 'COMMIT_PREPARED' | 'BRANCH_PUSHED' | 'PR_CREATING' | 'PR_CREATED';
     branch: string | null;
     commitSha: string | null;
     pullRequest: {
@@ -165,7 +166,14 @@ export const api = {
   },
   deleteItem: (batchId: string, itemId: string) => request<void>(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}`, { method: 'DELETE' }),
   validateBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/validate`, { method: 'POST' }),
-  submitBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/submit`, { method: 'POST' }),
+  submitBatch: (batchId: string, confirmRepeatedSubmission = false) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/submit`, {
+    method: 'POST',
+    ...(confirmRepeatedSubmission ? {
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ confirmRepeatedSubmission: true }),
+    } : {}),
+  }),
+  returnToEdit: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/return-to-edit`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
 };

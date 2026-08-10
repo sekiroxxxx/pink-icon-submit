@@ -130,7 +130,7 @@ export function draftPullRequestForBatch(batch: BatchDetails): PullRequestDraft 
       `**${inline(batch.title)}**`,
       '',
       `本次包含 ${batch.items.length} 项图标变更：${changeSummary(batch.items)}。`,
-      `- 设计稿：<${batch.designUrl}>`,
+      ...(batch.designUrl ? [`- 设计稿：<${batch.designUrl}>`] : []),
       '',
       '## 设计说明',
       '',

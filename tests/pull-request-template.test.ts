@@ -67,3 +67,32 @@ test('Draft PR template leads with designer-facing Chinese review content and re
   assert.match(draft.body, /SVG_STROKE_PRESENT/);
   assert.match(draft.body, /平台不再 push 或修改该分支/);
 });
+
+test('Draft PR template omits an optional design link when the batch has none', () => {
+  const batch: BatchDetails = {
+    id: 'ICON-20260806-NODESIGN',
+    title: '无设计稿链接',
+    description: '设计稿链接选填。',
+    submitter: { name: '设计师', email: 'designer@example.invalid' },
+    catalogBaseline: null,
+    targetRepository: { repository: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test', branch: 'main' },
+    executionMode: 'remote',
+    pushRepository: 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test',
+    pushBranchPrefix: 'bot/',
+    delivery: { checkpoint: 'PR_CREATING', branch: 'bot/ICON-20260806-NODESIGN', commitSha: 'a'.repeat(40), pullRequest: null, handoffAt: null },
+    state: 'PR_CREATING',
+    validation: { requestSha256: 'b'.repeat(64), warnings: [] },
+    warningsAcknowledged: false,
+    plan: { items: [{ id: 'add', plannedName: 'new-icon', codepoint: 50001 }] },
+    baseCommit: 'c'.repeat(40),
+    localDiff: null,
+    error: null,
+    createdAt: '2026-08-06T00:00:00.000Z',
+    updatedAt: '2026-08-06T00:00:00.000Z',
+    items: [{ id: 'add', batchId: 'ICON-20260806-NODESIGN', action: 'add', designName: 'new-icon', description: '新增图标', sourceFile: 'items/add.svg', createdAt: '2026-08-06T00:00:00.000Z' }],
+    job: null,
+    failureHistory: [],
+  };
+
+  assert.doesNotMatch(draftPullRequestForBatch(batch).body, /设计稿：/);
+});

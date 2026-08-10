@@ -28,7 +28,7 @@ export class BatchStorage {
       targetRepository: batch.targetRepository,
       title: batch.title,
       description: batch.description,
-      designUrl: batch.designUrl,
+      ...(batch.designUrl ? { designUrl: batch.designUrl } : {}),
       submitter: batch.submitter,
       items: items.map((item) => this.toRequestItem(item)),
     };
