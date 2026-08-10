@@ -90,6 +90,33 @@ function workerFor(environment: TestEnvironment, github = new FakeGitHubPullRequ
   });
 }
 
+function trackDeliveryOperations(environment: TestEnvironment): { validate: number; plan: number; apply: number; push: number } {
+  const operations = { validate: 0, plan: 0, apply: 0, push: 0 };
+  const iconBatch = environment.batches.iconBatch;
+  const repository = environment.batches.repository;
+  const validate = iconBatch.validate.bind(iconBatch);
+  const plan = iconBatch.plan.bind(iconBatch);
+  const apply = iconBatch.apply.bind(iconBatch);
+  const push = repository.pushCommit.bind(repository);
+  iconBatch.validate = async (...args) => {
+    operations.validate += 1;
+    return validate(...args);
+  };
+  iconBatch.plan = async (...args) => {
+    operations.plan += 1;
+    return plan(...args);
+  };
+  iconBatch.apply = async (...args) => {
+    operations.apply += 1;
+    return apply(...args);
+  };
+  repository.pushCommit = async (...args) => {
+    operations.push += 1;
+    return push(...args);
+  };
+  return operations;
+}
+
 async function createSubmittedRemoteBatch(t: test.TestContext): Promise<{ environment: TestEnvironment; batchId: string }> {
   const environment = await createTestEnvironment(t, { executionMode: 'remote' });
   const batch = await environment.batches.createBatch({
@@ -230,6 +257,62 @@ test('remote worker recovers BRANCH_PUSHED without repeating final validation, p
   assert.equal(github.created.length, 1);
 });
 
+test('manual retry after a post-push target fetch failure only recovers the Draft PR', async (t) => {
+  const { environment, batchId } = await createSubmittedRemoteBatch(t);
+  const github = new FakeGitHubPullRequestClient();
+  const operations = trackDeliveryOperations(environment);
+  const repository = environment.batches.repository as unknown as { options: { targetRemote: string } };
+  const targetRemote = repository.options.targetRemote;
+  const findPullRequest = github.findPullRequest.bind(github);
+  let failPostPushFetch = true;
+  github.findPullRequest = async (...args) => {
+    const lookup = await findPullRequest(...args);
+    if (failPostPushFetch) {
+      repository.options.targetRemote = 'missing';
+    }
+    return lookup;
+  };
+
+  await workerFor(environment, github).processNext();
+
+  const failed = environment.batches.getBatch(batchId);
+  assert.equal(failed.state, 'FAILED');
+  assert.equal(failed.delivery.checkpoint, 'BRANCH_PUSHED');
+  assert.equal(failed.job?.state, 'FAILED');
+  assert.equal(failed.job?.attempt, 1);
+  assert.equal(failed.error?.code, 'GIT_COMMAND_FAILED');
+  assert.equal(failed.failureHistory.at(-1)?.operation, 'git fetch');
+  assert.ok(failed.baseCommit);
+  assert.ok(failed.delivery.branch);
+  assert.ok(failed.delivery.commitSha);
+  const branchHead = remoteHead(environment.pushRepositoryPath!, failed.delivery.branch!);
+  assert.equal(branchHead, failed.delivery.commitSha);
+  assert.deepEqual(operations, { validate: 1, plan: 1, apply: 1, push: 1 });
+
+  repository.options.targetRemote = targetRemote;
+  failPostPushFetch = false;
+  const retried = environment.batches.retry(batchId);
+  assert.equal(retried.state, 'QUEUED');
+  assert.equal(retried.delivery.checkpoint, 'BRANCH_PUSHED');
+  assert.equal(retried.job?.attempt, 2);
+  assert.equal(retried.delivery.branch, failed.delivery.branch);
+  assert.equal(retried.delivery.commitSha, failed.delivery.commitSha);
+  assert.equal(retried.baseCommit, failed.baseCommit);
+
+  await workerFor(environment, github).processNext();
+
+  const recovered = environment.batches.getBatch(batchId);
+  assert.equal(recovered.state, 'PR_CREATED');
+  assert.equal(recovered.delivery.checkpoint, 'PR_CREATED');
+  assert.equal(recovered.job?.state, 'COMPLETED');
+  assert.equal(recovered.job?.attempt, 2);
+  assert.equal(remoteHead(environment.pushRepositoryPath!, recovered.delivery.branch!), branchHead);
+  assert.deepEqual(operations, { validate: 1, plan: 1, apply: 1, push: 1 });
+  assert.equal(github.created.length, 1);
+  assert.equal((await workerFor(environment, github).processNext()).processed, false);
+  assert.equal(github.created.length, 1);
+});
+
 test('remote worker refuses Draft PR creation after the target base advances without changing the bot branch', async (t) => {
   const { environment, batchId } = await createSubmittedRemoteBatch(t);
   const github = new FakeGitHubPullRequestClient();
@@ -356,6 +439,80 @@ test('remote worker recovers a successful Draft PR when only PR_CREATING survive
   assert.equal(recovered.delivery.pullRequest?.number, 1);
   assert.equal(github.created.length, 1);
   assert.equal(recovered.job?.state, 'COMPLETED');
+});
+
+test('manual retry records an already-created Draft PR after its create response is lost', async (t) => {
+  const { environment, batchId } = await createSubmittedRemoteBatch(t);
+  const github = new FakeGitHubPullRequestClient();
+  const createDraftPullRequest = github.createDraftPullRequest.bind(github);
+  let loseResponse = true;
+  github.createDraftPullRequest = async (...args) => {
+    const created = await createDraftPullRequest(...args);
+    if (loseResponse) {
+      loseResponse = false;
+      throw new AppError('GITHUB_API_REQUEST_FAILED', 'Simulated Draft PR response loss.', 502);
+    }
+    return created;
+  };
+
+  await workerFor(environment, github).processNext();
+
+  const failed = environment.batches.getBatch(batchId);
+  assert.equal(failed.state, 'FAILED');
+  assert.equal(failed.delivery.checkpoint, 'PR_CREATING');
+  assert.equal(failed.job?.state, 'FAILED');
+  assert.equal(failed.job?.attempt, 1);
+  assert.equal(github.created.length, 1);
+  assert.equal(github.created[0]?.head, `sud-icon-bot:${failed.delivery.branch}`);
+  assert.equal(remoteHead(environment.pushRepositoryPath!, failed.delivery.branch!), failed.delivery.commitSha);
+
+  const retried = environment.batches.retry(batchId);
+  assert.equal(retried.job?.attempt, 2);
+  await workerFor(environment, github).processNext();
+
+  const recovered = environment.batches.getBatch(batchId);
+  assert.equal(recovered.state, 'PR_CREATED');
+  assert.equal(recovered.delivery.checkpoint, 'PR_CREATED');
+  assert.equal(recovered.delivery.pullRequest?.number, 1);
+  assert.equal(recovered.job?.state, 'COMPLETED');
+  assert.equal(github.created.length, 1);
+  assert.equal(remoteHead(environment.pushRepositoryPath!, recovered.delivery.branch!), recovered.delivery.commitSha);
+});
+
+test('post-push Draft PR retries reject business failures and incomplete persisted evidence', async (t) => {
+  const environment = await createTestEnvironment(t, { executionMode: 'remote' });
+  const batch = await environment.batches.createBatch({
+    title: 'Post-push retry guard',
+    description: 'Only complete infrastructure failures may resume Draft PR delivery.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  environment.database.queueJob(batch.id);
+  environment.database.claimNextJob();
+  environment.database.recordCommitPrepared(
+    batch.id,
+    { baseCommit: 'a'.repeat(40), allowedFiles: ['src/icons/retry-guard.svg'], items: [] },
+    'a'.repeat(40),
+    { changedFiles: ['src/icons/retry-guard.svg'], patch: '' },
+    `bot/${batch.id}`,
+    'b'.repeat(40),
+  );
+  environment.database.recordBranchPushed(batch.id);
+  environment.database.failJob(batch.id, 'FINAL_VALIDATION_FAILED', 'Business validation failure must return to editing.');
+
+  assert.throws(() => environment.batches.retry(batch.id), { code: 'BATCH_NOT_RETRYABLE' });
+  assert.equal(environment.batches.getBatch(batch.id).job?.attempt, 1);
+
+  environment.database.failJob(batch.id, 'GIT_COMMAND_FAILED', 'Simulated temporary Draft PR infrastructure failure.');
+  const inspection = new (await import('better-sqlite3')).default(environment.config.databasePath);
+  inspection.prepare('UPDATE batches SET base_commit = NULL WHERE id = ?').run(batch.id);
+  inspection.close();
+
+  assert.throws(() => environment.batches.retry(batch.id), { code: 'BATCH_NOT_RETRYABLE' });
+  const rejected = environment.batches.getBatch(batch.id);
+  assert.equal(rejected.state, 'FAILED');
+  assert.equal(rejected.delivery.checkpoint, 'BRANCH_PUSHED');
+  assert.equal(rejected.job?.state, 'FAILED');
+  assert.equal(rejected.job?.attempt, 1);
 });
 
 test('remote worker refuses to create a duplicate PR when the bot branch already has an unmarked PR', async (t) => {

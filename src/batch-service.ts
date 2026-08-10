@@ -6,7 +6,7 @@ import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
-import type { BatchDetails, BatchExecutionContext, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
+import type { BatchDetails, BatchExecutionContext, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredBatch, StoredItem, TargetRepository } from './types.js';
 
 const maximumBatchItems = 100;
 
@@ -59,6 +59,23 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function validationIsValid(value: unknown): boolean {
   return isObject(value) && value.valid === true;
+}
+
+function isRetryablePostPushInfrastructureFailure(errorCode: string | undefined): boolean {
+  return errorCode !== undefined && [
+    'GIT_COMMAND_FAILED',
+    'GITHUB_API_REQUEST_FAILED',
+    'GITHUB_API_RESPONSE_INVALID',
+    'WORKER_INTERRUPTED',
+    'WORKER_UNEXPECTED',
+  ].includes(errorCode);
+}
+
+function hasPostPushPullRequestRecoveryEvidence(batch: Pick<StoredBatch, 'executionMode' | 'baseCommit' | 'delivery'>): boolean {
+  return batch.executionMode === 'remote'
+    && batch.baseCommit !== null
+    && batch.delivery.branch !== null
+    && batch.delivery.commitSha !== null;
 }
 
 function baseCommitFrom(value: unknown): string | null {
@@ -276,6 +293,15 @@ export class BatchService {
     }
     if (!['NONE', 'COMMIT_PREPARED', 'BRANCH_PUSHED', 'PR_CREATING'].includes(batch.delivery.checkpoint)) {
       throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is already handed off.`, 409);
+    }
+    if (batch.delivery.checkpoint === 'BRANCH_PUSHED' || batch.delivery.checkpoint === 'PR_CREATING') {
+      const failureCode = batch.error?.code ?? this.database.getDetails(batchId).job?.error?.code;
+      if (!isRetryablePostPushInfrastructureFailure(failureCode)) {
+        throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} cannot retry Draft PR creation after ${failureCode ?? 'an unknown failure'}.`, 409);
+      }
+      if (!hasPostPushPullRequestRecoveryEvidence(batch)) {
+        throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is missing the persisted branch, commit, or base evidence required to recover its Draft PR.`, 409);
+      }
     }
     this.database.queueJob(batchId);
     return this.database.getDetails(batchId);
