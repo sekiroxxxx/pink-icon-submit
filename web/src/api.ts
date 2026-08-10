@@ -49,6 +49,7 @@ export interface BatchDetails extends BatchInput {
   warningsAcknowledged: boolean;
   localDiff: { changedFiles: string[]; patch: string } | null;
   delivery: {
+    checkpoint: 'NONE' | 'COMMIT_PREPARED' | 'BRANCH_PUSHED' | 'PR_CREATING' | 'PR_CREATED';
     branch: string | null;
     commitSha: string | null;
     pullRequest: {

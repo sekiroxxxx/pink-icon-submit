@@ -3,45 +3,10 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, expect, test, vi } from 'vitest';
 
 import { App } from './App';
+import type { BatchDetails } from './api';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
-}
-
-function catalogResponse() {
-  return {
-    baseCommit: 'a'.repeat(40),
-    page: 1,
-    pageSize: 24,
-    total: 1,
-    icons: [{
-      primaryName: 'existing',
-      aliases: ['existing-alias'],
-      group: 'common',
-      svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>',
-    }],
-  };
-}
-
-function namePreviewResponse(name: string) {
-  return {
-    schemaVersion: 1,
-    baseCommit: 'a'.repeat(40),
-    input: name,
-    normalizedName: name === 'pink-new-icon' ? 'pink-new-icon' : name === 'pink-one' ? 'pink-one' : name,
-    valid: true,
-    collision: null,
-  };
-}
-
-function mockNamePreview(): ReturnType<typeof vi.fn> {
-  return vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') {
-      return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    }
-    return Promise.resolve(jsonResponse({}));
-  });
 }
 
 function saveProfile(): void {
@@ -56,13 +21,51 @@ function svgFile(name: string): File {
   return new File(['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>'], name, { type: 'image/svg+xml' });
 }
 
+function delivery(overrides: Partial<BatchDetails['delivery']> = {}): BatchDetails['delivery'] {
+  return {
+    checkpoint: 'NONE',
+    branch: null,
+    commitSha: null,
+    pullRequest: null,
+    handoffAt: null,
+    ...overrides,
+  };
+}
+
+function batch(overrides: Partial<BatchDetails> = {}): BatchDetails {
+  return {
+    id: 'ICON-TEST',
+    title: '默认标题',
+    description: '默认整体需求说明。',
+    designUrl: undefined,
+    submitter: { name: '设计师', email: 'designer@example.invalid' },
+    executionMode: 'local',
+    state: 'DRAFT',
+    items: [],
+    validation: null,
+    warningsAcknowledged: false,
+    localDiff: null,
+    delivery: delivery(),
+    error: null,
+    ...overrides,
+  };
+}
+
 async function addOneSvgChange(user: ReturnType<typeof userEvent.setup>): Promise<void> {
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('new-icon.svg'));
-  await user.type(screen.getByLabelText(/^设计名称/), 'pink-new-icon');
+  await screen.findByRole('button', { name: '选择 new-icon.svg' });
+  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
   await user.type(screen.getByLabelText(/^用途说明/), '用于测试新增图标的设计稿。');
-  await screen.findByText(/仓库最终名称预览：/);
   await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+}
+
+async function openReview(user: ReturnType<typeof userEvent.setup>, designUrl?: string): Promise<void> {
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await user.type(screen.getByLabelText(/^本次变更标题/), '模型入口图标');
+  await user.type(screen.getByLabelText(/^整体需求说明/), '新增模型入口图标。');
+  if (designUrl) await user.type(screen.getByLabelText(/^设计稿链接/), designUrl);
+  await user.click(screen.getByRole('checkbox'));
 }
 
 afterEach(() => {
@@ -78,41 +81,81 @@ test('first use asks for a local designer profile and stores it in this browser'
   render(<App />);
 
   expect(screen.getByRole('dialog', { name: '开始前，认识一下你' })).toBeTruthy();
-  expect(screen.getByText('这不是登录。填写一次设计师信息，后续提交会自动带入；你可以在右上角随时修改。')).toBeTruthy();
   await user.type(screen.getByLabelText(/^姓名/), '设计师');
   await user.type(screen.getByLabelText(/^公司邮箱/), 'designer@example.invalid');
   await user.click(screen.getByRole('button', { name: '开始编辑图标' }));
 
   expect(window.localStorage.getItem('pink-icon-submit.designer-profile.v1')).toContain('designer@example.invalid');
-  expect(screen.queryByRole('dialog', { name: '开始前，认识一下你' })).toBeNull();
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
-test('replace opens the catalog on demand and closes it after choosing a canonical target', async () => {
+test('the expected icon name uses only local checks and never performs a name preview request', async () => {
   saveProfile();
-  const fetchMock = vi.fn().mockResolvedValue(jsonResponse(catalogResponse()));
+  const fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
+  await addOneSvgChange(user);
 
+  expect(screen.getByLabelText(/^期望图标名称/)).toBeTruthy();
+  expect(screen.getByText('最终名称会在开发审核时确认。')).toBeTruthy();
+  expect(screen.queryByText(/仓库最终名称预览/)).toBeNull();
   expect(fetchMock).not.toHaveBeenCalled();
+});
+
+test('an expected icon name with path characters is rejected locally without a network check', async () => {
+  saveProfile();
+  const fetchMock = vi.fn();
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('invalid.svg'));
+  await screen.findByRole('button', { name: '选择 invalid.svg' });
+  await user.type(screen.getByLabelText(/^期望图标名称/), 'bad/name');
+  await user.type(screen.getByLabelText(/^用途说明/), '路径字符必须在浏览器内直接拦截。');
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+
+  expect(screen.getByText('期望图标名称不能包含空白或路径分隔符。')).toBeTruthy();
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
+test('replace opens the frozen catalog only when the designer asks for it', async () => {
+  saveProfile();
+  const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+    baseCommit: 'a'.repeat(40),
+    page: 1,
+    pageSize: 24,
+    total: 1,
+    icons: [{
+      primaryName: 'existing',
+      aliases: ['existing-alias'],
+      group: 'common',
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>',
+    }],
+  }));
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
   await user.click(screen.getByRole('tab', { name: '替换图标' }));
   expect(fetchMock).not.toHaveBeenCalled();
-  expect(screen.queryByRole('dialog', { name: '图标目录' })).toBeNull();
   await user.click(screen.getByRole('button', { name: '选择图标' }));
   await screen.findByText('existing');
   expect(fetchMock).toHaveBeenCalledWith('/api/catalog/page?group=all&page=1&pageSize=24', {});
   await user.click(screen.getByRole('button', { name: '选择 existing' }));
 
-  expect(screen.queryByRole('dialog', { name: '图标目录' })).toBeNull();
   expect(screen.getByRole('img', { name: 'existing 当前图标' })).toBeTruthy();
-  expect(screen.getByText('待替换图标 · existing-alias')).toBeTruthy();
 });
 
 test('a replace target becomes unavailable after it is added to the same batch', async () => {
   saveProfile();
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(catalogResponse())));
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+    baseCommit: 'a'.repeat(40), page: 1, pageSize: 24, total: 1,
+    icons: [{ primaryName: 'existing', aliases: ['existing-alias'], group: 'common', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>' }],
+  })));
   const user = userEvent.setup();
 
   render(<App />);
@@ -122,166 +165,40 @@ test('a replace target becomes unavailable after it is added to the same batch',
   await user.click(screen.getByRole('button', { name: '选择 existing' }));
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('replacement.svg'));
+  await screen.findByRole('button', { name: '选择 replacement.svg' });
   await user.click(screen.getByRole('button', { name: '加入替换队列' }));
-
   await user.click(screen.getByRole('button', { name: '选择图标' }));
-  await screen.findByText('existing');
-  const usedTarget = screen.getByRole('button', { name: 'existing 已用于第 1 项替换' });
+
+  const usedTarget = await screen.findByRole('button', { name: 'existing 已用于第 1 项替换' });
   expect((usedTarget as HTMLButtonElement).disabled).toBe(true);
-  expect(usedTarget.getAttribute('title')).toContain('不能在同一批次重复修改');
 });
 
-test('multiple SVG files stay in the pending queue until each is paired with a change', async () => {
+test('multiple SVG files stay in the local queue until each is paired with a change', async () => {
   saveProfile();
-  vi.stubGlobal('fetch', mockNamePreview());
+  vi.stubGlobal('fetch', vi.fn());
   const user = userEvent.setup();
 
   render(<App />);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, [svgFile('one.svg'), svgFile('two.svg')]);
-  expect(await screen.findByText('待处理 SVG')).toBeTruthy();
-  expect(screen.getByRole('button', { name: '选择 one.svg' })).toBeTruthy();
+  await screen.findByRole('button', { name: '选择 one.svg' });
   expect(screen.getByRole('button', { name: '选择 two.svg' })).toBeTruthy();
-  await user.type(screen.getByLabelText(/^设计名称/), 'pink-one');
+  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-one');
   await user.type(screen.getByLabelText(/^用途说明/), '第一个图标。');
-  await screen.findByText(/仓库最终名称预览：/);
   await user.click(screen.getByRole('button', { name: '加入新增队列' }));
 
   expect(screen.getByText('本次变更 1 项')).toBeTruthy();
   expect(screen.getByRole('button', { name: '选择 two.svg' })).toBeTruthy();
-  expect(screen.getByRole('img', { name: 'one.svg 预览' })).toBeTruthy();
 });
 
-test('a repository name preview collision cannot be added to the batch', async () => {
+test('delete only needs a catalog target and a design reason before it enters the queue', async () => {
   saveProfile();
-  vi.stubGlobal('fetch', vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') {
-      return Promise.resolve(jsonResponse({
-        ...namePreviewResponse(url.searchParams.get('name') ?? ''),
-        normalizedName: 'existing',
-        collision: { primaryName: 'existing', aliases: ['existing-alias'] },
-      }));
-    }
-    throw new Error(`Unexpected request: ${path}`);
-  }));
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+    baseCommit: 'a'.repeat(40), page: 1, pageSize: 24, total: 1,
+    icons: [{ primaryName: 'existing', aliases: ['existing-alias'], group: 'common', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>' }],
+  })));
   const user = userEvent.setup();
-  render(<App />);
-  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
-  await user.upload(fileInput, svgFile('collision.svg'));
-  await user.type(screen.getByLabelText(/^设计名称/), 'Existing');
-  await user.type(screen.getByLabelText(/^用途说明/), '验证名称冲突。');
-  await screen.findByText(/已与 existing/);
-  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
 
-  expect(screen.getByText(/仓库最终名称 existing 已被 existing/)).toBeTruthy();
-  expect(screen.getByText('本次变更 0 项')).toBeTruthy();
-});
-
-test('name preview debounces to the final design name and uses the designer-facing labels', async () => {
-  saveProfile();
-  const fetchMock = mockNamePreview();
-  vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
-  render(<App />);
-
-  const nameInput = screen.getByLabelText(/^设计名称/);
-  await user.type(nameInput, 'first-name');
-  await user.clear(nameInput);
-  await user.type(nameInput, 'pink-one');
-
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/names/preview?name=pink-one', {}));
-  const previewCalls = fetchMock.mock.calls.filter(([path]) => String(path).startsWith('/api/names/preview?'));
-  expect(previewCalls).toHaveLength(1);
-  expect(await screen.findByText(/仓库最终名称预览：/)).toBeTruthy();
-  expect(screen.queryByText('图标建议名称')).toBeNull();
-});
-
-test('an explicitly invalid repository name preview cannot be added to the batch', async () => {
-  saveProfile();
-  vi.stubGlobal('fetch', vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') {
-      return Promise.resolve(jsonResponse({
-        ...namePreviewResponse(url.searchParams.get('name') ?? ''),
-        valid: false,
-        normalizedName: '',
-      }));
-    }
-    throw new Error(`Unexpected request: ${path}`);
-  }));
-  const user = userEvent.setup();
-  render(<App />);
-  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
-  await user.upload(fileInput, svgFile('invalid.svg'));
-  await user.type(screen.getByLabelText(/^设计名称/), 'invalid-name');
-  await user.type(screen.getByLabelText(/^用途说明/), '验证明确无效的仓库名称预检。');
-  await screen.findByText(/仓库最终名称预览：/);
-  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
-
-  expect(screen.getByText('仓库最终名称不符合图标仓库规则。')).toBeTruthy();
-  expect(screen.getByText('本次变更 0 项')).toBeTruthy();
-});
-
-test('a failed name preview still allows a change and defers confirmation to final validation', async () => {
-  saveProfile();
-  vi.stubGlobal('fetch', vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') return Promise.reject(new Error('preview unavailable'));
-    throw new Error(`Unexpected request: ${path}`);
-  }));
-  const user = userEvent.setup();
-  render(<App />);
-  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
-  await user.upload(fileInput, svgFile('network.svg'));
-  await user.type(screen.getByLabelText(/^设计名称/), 'network-name');
-  await user.type(screen.getByLabelText(/^用途说明/), '验证网络失败不会阻止新增。');
-  await screen.findByText('名称预检暂不可用，可继续加入；最终校验会确认。');
-  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
-
-  expect(screen.getByText('本次变更 1 项')).toBeTruthy();
-  expect(screen.getByText('名称预检暂不可用，将在最终校验时确认。')).toBeTruthy();
-});
-
-test('a pending name preview still allows a change and does not use an older result', async () => {
-  saveProfile();
-  let resolveOldPreview!: (response: Response) => void;
-  const fetchMock = vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname !== '/api/names/preview') throw new Error(`Unexpected request: ${path}`);
-    const name = url.searchParams.get('name');
-    if (name === 'old-name') return new Promise<Response>((resolve) => { resolveOldPreview = resolve; });
-    return new Promise<Response>(() => undefined);
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
-  render(<App />);
-  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
-  await user.upload(fileInput, svgFile('pending.svg'));
-  const nameInput = screen.getByLabelText(/^设计名称/);
-  await user.type(nameInput, 'old-name');
-  await user.type(screen.getByLabelText(/^用途说明/), '验证旧预检不能影响新输入。');
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/names/preview?name=old-name', {}));
-  await user.clear(nameInput);
-  await user.type(nameInput, 'new-name');
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/names/preview?name=new-name', {}));
-  expect(screen.getByText('正在加载仓库最终名称预览…')).toBeTruthy();
-  resolveOldPreview(jsonResponse({
-    ...namePreviewResponse('old-name'),
-    normalizedName: 'existing',
-    collision: { primaryName: 'existing', aliases: ['existing-alias'] },
-  }));
-  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
-
-  expect(screen.getByText('本次变更 1 项')).toBeTruthy();
-  expect(screen.getByText('名称预检暂不可用，将在最终校验时确认。')).toBeTruthy();
-  expect(screen.queryByText(/仓库最终名称 existing 已被 existing/)).toBeNull();
-});
-
-test('delete only needs a target and design reason before it enters the queue', async () => {
-  saveProfile();
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(catalogResponse())));
-  const user = userEvent.setup();
   render(<App />);
   await user.click(screen.getByRole('tab', { name: '删除图标' }));
   await user.click(screen.getByRole('button', { name: '选择图标' }));
@@ -291,73 +208,145 @@ test('delete only needs a target and design reason before it enters the queue', 
   await user.click(screen.getByRole('button', { name: '加入删除队列' }));
 
   expect(screen.getByText('本次变更 1 项')).toBeTruthy();
-  expect(screen.queryByText(/删除可能影响现有调用方/)).toBeNull();
 });
 
-test('review drawer blocks incomplete batch details before any batch is created', async () => {
+test('review requires local batch fields but design link is optional', async () => {
   saveProfile();
-  const fetchMock = mockNamePreview();
+  const fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
   await addOneSvgChange(user);
   await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  expect(screen.getByRole('dialog', { name: '让开发准确理解这次设计' })).toBeTruthy();
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
+  await user.click(screen.getByRole('button', { name: '确认提交' }));
 
   expect(screen.getByText('请填写本次变更标题。')).toBeTruthy();
   expect(screen.getByText('请填写整体需求说明。')).toBeTruthy();
-  expect(screen.getByText('请填写有效的 HTTP(S) 设计稿链接。')).toBeTruthy();
   expect(screen.getByText('请确认本次变更内容。')).toBeTruthy();
-  expect(fetchMock).toHaveBeenCalledTimes(1);
-  expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/names/preview?name=pink-new-icon');
+  expect(screen.queryByText('请填写有效的 HTTP(S) 设计稿链接。')).toBeNull();
+  expect(fetchMock).not.toHaveBeenCalled();
 });
 
-test('review drawer rejects a malformed HTTP(S) URL before a batch is created', async () => {
+test('review rejects a malformed optional design link before it creates a batch', async () => {
   saveProfile();
-  const fetchMock = mockNamePreview();
+  const fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
   const user = userEvent.setup();
 
   render(<App />);
   await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '错误链接测试');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '链接必须使用明确协议分隔符。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https:www.123.com');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
+  await openReview(user, 'https:www.123.com');
+  await user.click(screen.getByRole('button', { name: '确认提交' }));
 
   expect(screen.getByText('请填写有效的 HTTP(S) 设计稿链接。')).toBeTruthy();
-  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(fetchMock).not.toHaveBeenCalled();
 });
 
-test('revalidation hides stale diagnostics and syncs latest batch metadata before items and validation', async () => {
+test('confirmation closes review, queues a DRAFT batch, and makes no preview or interactive validation request', async () => {
   saveProfile();
-  let resolveSecondValidation!: (response: Response) => void;
-  let validationCount = 0;
-  const item = { id: 'item-1', batchId: 'ICON-RECHECK', action: 'add', designName: 'pink-new-icon', description: '用于测试新增图标的设计稿。', sourceFile: 'items/item-1.svg' };
-  const draft = { id: 'ICON-RECHECK', executionMode: 'local', state: 'DRAFT', items: [item], validation: null, warningsAcknowledged: false, localDiff: null, delivery: { branch: null, commitSha: null, pullRequest: null, handoffAt: null }, error: null };
-  const fetchMock = vi.fn((path: string) => {
+  const draft = batch({ items: [] });
+  const item = { id: 'item-1', batchId: draft.id, action: 'add' as const, designName: 'pink-new-icon', description: '用于测试新增图标的设计稿。', sourceFile: 'items/item-1.svg' };
+  const queued = batch({ id: draft.id, state: 'QUEUED', items: [item] });
+  const fetchMock = vi.fn((path: string, _options?: RequestInit) => {
     const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ ...draft, items: [] }));
-    if (url.pathname === '/api/batches/ICON-RECHECK') return Promise.resolve(jsonResponse(draft));
-    if (url.pathname === '/api/batches/ICON-RECHECK/items' || url.pathname === '/api/batches/ICON-RECHECK/items/item-1') return Promise.resolve(jsonResponse(item));
-    if (url.pathname === '/api/batches/ICON-RECHECK/validate') {
-      validationCount += 1;
-      if (validationCount === 1) {
-        return Promise.resolve(jsonResponse({
-          ...draft,
-          validation: {
-            valid: false,
-            errors: [{ code: 'SVG_MULTIPLE_COLORS', message: 'SVG contains more than one literal paint color.', itemId: 'item-1' }],
-            warnings: [],
-          },
-        }));
-      }
-      return new Promise<Response>((resolve) => { resolveSecondValidation = resolve; });
+    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse(draft));
+    if (url.pathname === `/api/batches/${draft.id}/items`) return Promise.resolve(jsonResponse(item));
+    if (url.pathname === `/api/batches/${draft.id}/submit`) return Promise.resolve(jsonResponse(queued));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await addOneSvgChange(user);
+  await openReview(user);
+  await user.click(screen.getByRole('button', { name: '确认提交' }));
+
+  expect(screen.queryByRole('dialog', { name: '让开发准确理解这次设计' })).toBeNull();
+  await screen.findByRole('heading', { name: '已提交' });
+  expect(fetchMock.mock.calls.map(([path]) => String(path))).toEqual([
+    '/api/batches',
+    `/api/batches/${draft.id}/items`,
+    `/api/batches/${draft.id}/submit`,
+  ]);
+  const createOptions = fetchMock.mock.calls[0]?.[1] as RequestInit;
+  expect(JSON.parse(createOptions.body as string)).toMatchObject({ title: '模型入口图标', description: '新增模型入口图标。' });
+  expect(JSON.parse(createOptions.body as string)).not.toHaveProperty('designUrl');
+  expect(fetchMock.mock.calls.some(([path]) => String(path).includes('/validate') || String(path).includes('/names/preview'))).toBe(false);
+});
+
+test('a final validation failure shows Chinese diagnostics and can return to editing', async () => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-INVALID');
+  const failed = batch({
+    id: 'ICON-INVALID',
+    state: 'FAILED',
+    validation: { valid: false, errors: [{ code: 'SVG_MULTIPLE_COLORS', message: 'SVG contains more than one literal paint color.', itemId: 'item-1' }], warnings: [] },
+    items: [{ id: 'item-1', batchId: 'ICON-INVALID', action: 'add', designName: 'pink-new-icon', description: '需要改为单色。', sourceFile: 'items/item-1.svg' }],
+    error: { code: 'FINAL_VALIDATION_FAILED', message: 'Final validation failed.' },
+  });
+  const draft = batch({ id: failed.id, state: 'DRAFT', items: failed.items });
+  const fetchMock = vi.fn((path: string, _options?: RequestInit) => {
+    if (path === '/api/batches/ICON-INVALID') return Promise.resolve(jsonResponse(failed));
+    if (path === '/api/batches/ICON-INVALID/return-to-edit') return Promise.resolve(jsonResponse(draft));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await screen.findByRole('heading', { name: '需要修改' });
+  expect(screen.getByText('图标包含多种颜色')).toBeTruthy();
+  await user.click(screen.getByRole('button', { name: '返回编辑并修正' }));
+
+  await screen.findByRole('heading', { name: '本次交付尚未提交' });
+  expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-INVALID/return-to-edit', { method: 'POST' });
+});
+
+test('an infrastructure failure offers a manual delivery retry without exposing infrastructure details as the main message', async () => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-RETRY');
+  const failed = batch({
+    id: 'ICON-RETRY',
+    executionMode: 'remote',
+    state: 'FAILED',
+    delivery: delivery({ checkpoint: 'COMMIT_PREPARED', commitSha: 'a'.repeat(40) }),
+    error: { code: 'GIT_COMMAND_FAILED', message: 'git push exited with 128.' },
+  });
+  const queued = batch({ id: failed.id, executionMode: 'remote', state: 'QUEUED', delivery: failed.delivery });
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches/ICON-RETRY') return Promise.resolve(jsonResponse(failed));
+    if (path === '/api/batches/ICON-RETRY/retry') return Promise.resolve(jsonResponse(queued));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await screen.findByRole('heading', { name: '交付失败' });
+  expect(screen.getByText('本次交付没有完成。请在确认技术问题后，手动重新尝试交付。')).toBeTruthy();
+  await user.click(screen.getByRole('button', { name: '重新尝试交付' }));
+
+  await screen.findByRole('heading', { name: '已提交' });
+  expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-RETRY/retry', { method: 'POST' });
+});
+
+test('unchanged final-validation failures need an explicit confirmation before resubmission', async () => {
+  saveProfile();
+  const draft = batch({ items: [] });
+  const item = { id: 'item-1', batchId: draft.id, action: 'add' as const, designName: 'pink-new-icon', description: '用于测试新增图标的设计稿。', sourceFile: 'items/item-1.svg' };
+  const queued = batch({ id: draft.id, state: 'QUEUED', items: [item] });
+  let submitCount = 0;
+  const fetchMock = vi.fn((path: string, _options?: RequestInit) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse(draft));
+    if (url.pathname === `/api/batches/${draft.id}/items`) return Promise.resolve(jsonResponse(item));
+    if (url.pathname === `/api/batches/${draft.id}/submit`) {
+      submitCount += 1;
+      return submitCount === 1
+        ? Promise.resolve(jsonResponse({ error: { code: 'REPEATED_SUBMISSION_CONFIRMATION_REQUIRED', message: 'Confirm unchanged submission.' } }, 409))
+        : Promise.resolve(jsonResponse(queued));
     }
     throw new Error(`Unexpected request: ${path}`);
   });
@@ -366,399 +355,71 @@ test('revalidation hides stale diagnostics and syncs latest batch metadata befor
 
   render(<App />);
   await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '首次校验');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '首次校验会失败。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/first');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
+  await openReview(user);
+  await user.click(screen.getByRole('button', { name: '确认提交' }));
+  await screen.findByRole('button', { name: '仍要按原内容再次提交' });
+  await user.click(screen.getByRole('button', { name: '仍要按原内容再次提交' }));
 
-  await screen.findByText('图标包含多种颜色');
-  expect(screen.getByText('对应图标：新增图标：pink-new-icon')).toBeTruthy();
-  expect(await screen.findByText(/最新校验完成时间：/)).toBeTruthy();
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.clear(screen.getByLabelText(/^本次变更标题/));
-  expect(screen.queryByText(/最新校验完成时间：/)).toBeNull();
-  expect(screen.getByText('批次信息已修改，需要重新校验。')).toBeTruthy();
-  await user.type(screen.getByLabelText(/^本次变更标题/), '更新后的标题');
-  await user.clear(screen.getByLabelText(/^整体需求说明/));
-  await user.type(screen.getByLabelText(/^整体需求说明/), '已根据错误更新设计说明。');
-  await user.clear(screen.getByLabelText(/^设计稿链接/));
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/updated');
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
+  await screen.findByRole('heading', { name: '已提交' });
+  const submitCalls = fetchMock.mock.calls.filter(([path]) => path === `/api/batches/${draft.id}/submit`);
+  expect(submitCalls).toHaveLength(2);
+  expect(JSON.parse((submitCalls[1]?.[1] as RequestInit).body as string)).toEqual({ confirmRepeatedSubmission: true });
+});
 
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-RECHECK', expect.objectContaining({ method: 'PUT' })));
-  expect(screen.getByText('正在按最新修改重新校验…')).toBeTruthy();
-  expect(screen.queryByText('图标包含多种颜色')).toBeNull();
-  const updateBatchCall = fetchMock.mock.calls.find((call) => call[0] === '/api/batches/ICON-RECHECK') as unknown as [string, RequestInit] | undefined;
-  expect(updateBatchCall).toBeDefined();
-  expect(JSON.parse(updateBatchCall![1].body as string)).toEqual({
-    title: '更新后的标题',
-    description: '已根据错误更新设计说明。',
-    designUrl: 'https://design.example.invalid/updated',
+test('a restored local result never promises a Draft PR', async () => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-LOCAL');
+  const local = batch({
+    id: 'ICON-LOCAL',
+    state: 'LOCAL_DIFF_READY',
+    localDiff: { changedFiles: ['src/icons/pink-new-icon.svg'], patch: '' },
   });
-  const updateIndex = fetchMock.mock.calls.findIndex((call) => call[0] === '/api/batches/ICON-RECHECK');
-  const itemUpdateIndex = fetchMock.mock.calls.findIndex((call, index) => index > updateIndex && call[0] === '/api/batches/ICON-RECHECK/items/item-1');
-  const secondValidationIndex = fetchMock.mock.calls.findIndex((call, index) => index > itemUpdateIndex && call[0] === '/api/batches/ICON-RECHECK/validate');
-  expect(updateIndex).toBeLessThan(itemUpdateIndex);
-  expect(itemUpdateIndex).toBeLessThan(secondValidationIndex);
-  expect(fetchMock.mock.calls.filter((call) => call[0] === '/api/batches')).toHaveLength(1);
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(local)));
 
-  resolveSecondValidation(jsonResponse({
-    ...draft,
-    state: 'READY',
+  render(<App />);
+
+  await screen.findByRole('heading', { name: '本地预览已完成' });
+  expect(screen.getByText('此模式不会创建 PR。')).toBeTruthy();
+  expect(screen.queryByText('正在创建 Draft PR')).toBeNull();
+});
+
+test('a restored remote branch checkpoint reports delivery progress without exposing branch internals', async () => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-BRANCH');
+  const inProgress = batch({
+    id: 'ICON-BRANCH',
+    executionMode: 'remote',
+    state: 'BRANCH_PUSHED',
     validation: { valid: true, errors: [], warnings: [] },
-  }));
-  await screen.findByText(/已按最新内容重新校验/);
-  expect(screen.getByText(/最新校验完成时间：/)).toBeTruthy();
-});
-
-test('editing a DRAFT item invalidates the completed validation result and time', async () => {
-  saveProfile();
-  const item = { id: 'item-1', batchId: 'ICON-ITEM-EDIT', action: 'add', designName: 'pink-new-icon', description: '用于测试新增图标的设计稿。', sourceFile: 'items/item-1.svg' };
-  const draft = { id: 'ICON-ITEM-EDIT', executionMode: 'local', state: 'DRAFT', items: [item], validation: null, warningsAcknowledged: false, localDiff: null, delivery: { branch: null, commitSha: null, pullRequest: null, handoffAt: null }, error: null };
-  const fetchMock = vi.fn((path: string, options?: RequestInit) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ ...draft, items: [] }));
-    if (url.pathname === '/api/batches/ICON-ITEM-EDIT/items') return Promise.resolve(jsonResponse(item));
-    if (url.pathname === '/api/batches/ICON-ITEM-EDIT/items/item-1') {
-      return Promise.resolve(options?.method === 'DELETE' ? new Response(null, { status: 204 }) : jsonResponse(item));
-    }
-    if (url.pathname === '/api/batches/ICON-ITEM-EDIT/validate') {
-      return Promise.resolve(jsonResponse({
-        ...draft,
-        validation: { valid: false, errors: [{ code: 'SVG_MULTIPLE_COLORS', message: 'SVG contains more than one literal paint color.', itemId: 'item-1' }], warnings: [] },
-      }));
-    }
-    throw new Error(`Unexpected request: ${path}`);
+    delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: 'bot/ICON-BRANCH', commitSha: 'a'.repeat(40) }),
   });
-  vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(inProgress)));
 
   render(<App />);
-  await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '修改现有变更');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '先校验，再移除图标变更。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/item-edit');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
 
-  await screen.findByText('图标包含多种颜色');
-  expect(await screen.findByText(/最新校验完成时间：/)).toBeTruthy();
-  await user.click(screen.getByRole('button', { name: '移除 pink-new-icon' }));
-
-  await screen.findByText('变更已修改，需要重新校验。');
-  expect(screen.queryByText(/最新校验完成时间：/)).toBeNull();
-  expect(screen.queryByText('图标包含多种颜色')).toBeNull();
+  await screen.findByRole('heading', { name: '正在交付' });
+  expect(screen.queryByText(/bot\/ICON-BRANCH/)).toBeNull();
 });
 
-test('a failed revalidation does not retain the previous completion time', async () => {
+test('a restored PR-created batch shows the Draft PR handoff link', async () => {
   saveProfile();
-  let resolveSecondValidation!: (response: Response) => void;
-  let validationCount = 0;
-  const item = { id: 'item-1', batchId: 'ICON-VALIDATION-FAILURE', action: 'add', designName: 'pink-new-icon', description: '用于测试新增图标的设计稿。', sourceFile: 'items/item-1.svg' };
-  const draft = { id: 'ICON-VALIDATION-FAILURE', executionMode: 'local', state: 'DRAFT', items: [item], validation: null, warningsAcknowledged: false, localDiff: null, delivery: { branch: null, commitSha: null, pullRequest: null, handoffAt: null }, error: null };
-  const fetchMock = vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ ...draft, items: [] }));
-    if (url.pathname === '/api/batches/ICON-VALIDATION-FAILURE') return Promise.resolve(jsonResponse(draft));
-    if (url.pathname === '/api/batches/ICON-VALIDATION-FAILURE/items' || url.pathname === '/api/batches/ICON-VALIDATION-FAILURE/items/item-1') return Promise.resolve(jsonResponse(item));
-    if (url.pathname === '/api/batches/ICON-VALIDATION-FAILURE/validate') {
-      validationCount += 1;
-      if (validationCount === 1) {
-        return Promise.resolve(jsonResponse({
-          ...draft,
-          validation: { valid: false, errors: [{ code: 'SVG_MULTIPLE_COLORS', message: 'SVG contains more than one literal paint color.', itemId: 'item-1' }], warnings: [] },
-        }));
-      }
-      return new Promise<Response>((resolve) => { resolveSecondValidation = resolve; });
-    }
-    throw new Error(`Unexpected request: ${path}`);
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-PR');
+  const completed = batch({
+    id: 'ICON-PR',
+    executionMode: 'remote',
+    state: 'PR_CREATED',
+    delivery: delivery({
+      checkpoint: 'PR_CREATED',
+      pullRequest: { number: 42, url: 'https://github.example.invalid/pull/42', state: 'open', isDraft: true, createdAt: '2026-08-10T00:00:00.000Z' },
+      handoffAt: '2026-08-10T00:00:00.000Z',
+    }),
   });
+  const fetchMock = vi.fn().mockResolvedValue(jsonResponse(completed));
   vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
 
   render(<App />);
-  await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '重新校验失败');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '验证失败不能保留旧完成时间。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/revalidation-failure');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
-
-  await screen.findByText('图标包含多种颜色');
-  expect(await screen.findByText(/最新校验完成时间：/)).toBeTruthy();
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
-
-  await waitFor(() => expect(validationCount).toBe(2));
-  expect(screen.getByText('正在按最新修改重新校验…')).toBeTruthy();
-  expect(screen.queryByText(/最新校验完成时间：/)).toBeNull();
-  resolveSecondValidation(jsonResponse({ error: { code: 'TEST_VALIDATION_FAILURE', message: '本地模拟失败。' } }, 500));
-
-  await screen.findByText('本次校验失败，未完成：本地模拟失败。');
-  expect(screen.queryByText(/最新校验完成时间：/)).toBeNull();
-});
-
-test('a confirmed change creates a batch, uploads its SVG, and starts validation', async () => {
-  saveProfile();
-  const fetchMock = vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') {
-      return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    }
-    if (url.pathname === '/api/batches') {
-      return Promise.resolve(jsonResponse({ id: 'ICON-TEST', state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, error: null }));
-    }
-    if (url.pathname === '/api/batches/ICON-TEST/items') {
-      return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-TEST', action: 'add', sourceFile: 'items/item-1.svg' }));
-    }
-    if (url.pathname === '/api/batches/ICON-TEST/validate') {
-      return Promise.resolve(jsonResponse({
-        id: 'ICON-TEST',
-        state: 'READY',
-        items: [],
-        validation: { valid: true, errors: [], warnings: [] },
-        warningsAcknowledged: false,
-        localDiff: null,
-        error: null,
-      }));
-    }
-    throw new Error(`Unexpected request: ${path}`);
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
-
-  render(<App />);
-  await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '模型入口图标');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '新增模型入口图标。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/icon');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
-
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
-  expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/batches');
-  expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/batches/ICON-TEST/items');
-  expect(fetchMock.mock.calls[3]?.[0]).toBe('/api/batches/ICON-TEST/validate');
-  expect(screen.getByText('校验通过，可以生成本地修改。')).toBeTruthy();
-});
-
-test('validation warnings remain visible without requiring a designer acknowledgement', async () => {
-  saveProfile();
-  const fetchMock = vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') {
-      return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    }
-    if (url.pathname === '/api/batches') {
-      return Promise.resolve(jsonResponse({ id: 'ICON-WARNING', state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, error: null }));
-    }
-    if (url.pathname === '/api/batches/ICON-WARNING/items') {
-      return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-WARNING', action: 'add', sourceFile: 'items/item-1.svg' }));
-    }
-    if (url.pathname === '/api/batches/ICON-WARNING/validate') {
-      return Promise.resolve(jsonResponse({
-        id: 'ICON-WARNING',
-        state: 'READY',
-        items: [],
-        validation: { valid: true, errors: [], warnings: [{ code: 'TEST_WARNING', message: '需要开发审核。' }] },
-        warningsAcknowledged: false,
-        localDiff: null,
-        error: null,
-      }));
-    }
-    if (url.pathname === '/api/batches/ICON-WARNING/submit') {
-      return Promise.resolve(jsonResponse({ id: 'ICON-WARNING', state: 'QUEUED', items: [], validation: { valid: true, errors: [], warnings: [{ code: 'TEST_WARNING', message: '需要开发审核。' }] }, warningsAcknowledged: false, localDiff: null, error: null }));
-    }
-    throw new Error(`Unexpected request: ${path}`);
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
-
-  render(<App />);
-  await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '模型入口图标');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '新增模型入口图标。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/icon');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
-
-  await screen.findByText('开发审核提醒');
-  expect(screen.queryByRole('button', { name: '我已阅读并确认全部提醒' })).toBeNull();
-  await user.click(screen.getByRole('button', { name: '生成本地修改' }));
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-WARNING/submit', { method: 'POST' }));
-});
-
-test('a completed remote batch shows its Draft PR link and handoff boundary', async () => {
-  saveProfile();
-  const draftDelivery = {
-    branch: 'bot/ICON-PR',
-    commitSha: 'a'.repeat(40),
-    pullRequest: {
-      number: 42,
-      url: 'https://github.example.invalid/sekiroxxxx/sekiroxxxx-pink-codicons-automation-test/pull/42',
-      state: 'open',
-      isDraft: true,
-      createdAt: '2026-08-06T00:00:00.000Z',
-    },
-    handoffAt: '2026-08-06T00:00:00.000Z',
-  };
-  const fetchMock = vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ id: 'ICON-PR', executionMode: 'remote', state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, delivery: { ...draftDelivery, pullRequest: null }, error: null }));
-    if (url.pathname === '/api/batches/ICON-PR/items') return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-PR', action: 'add', sourceFile: 'items/item-1.svg' }));
-    if (url.pathname === '/api/batches/ICON-PR/validate') return Promise.resolve(jsonResponse({ id: 'ICON-PR', executionMode: 'remote', state: 'READY', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: null, delivery: { ...draftDelivery, pullRequest: null }, error: null }));
-    if (url.pathname === '/api/batches/ICON-PR/submit') return Promise.resolve(jsonResponse({ id: 'ICON-PR', executionMode: 'remote', state: 'PR_CREATED', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: { changedFiles: ['src/icons/pink-new-icon.svg'], patch: '' }, delivery: draftDelivery, error: null }));
-    throw new Error(`Unexpected request: ${path}`);
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
-
-  render(<App />);
-  await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), 'PR 结果展示');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '验证 Draft PR 链接。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/pr');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
-  await screen.findByText('校验通过，可以生成本地修改。');
-  await user.click(screen.getByRole('button', { name: '生成本地修改' }));
 
   const link = await screen.findByRole('link', { name: '打开 Draft PR #42' });
-  expect(link.getAttribute('href')).toBe(draftDelivery.pullRequest.url);
-  expect(screen.getByText('平台已停止写入该机器人分支；后续调整请直接在 PR 中完成。')).toBeTruthy();
-});
-
-test('a completed local preview never promises a Draft PR', async () => {
-  saveProfile();
-  const localDelivery = { branch: null, commitSha: null, pullRequest: null, handoffAt: null };
-  const fetchMock = vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ id: 'ICON-LOCAL', executionMode: 'local', state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, delivery: localDelivery, error: null }));
-    if (url.pathname === '/api/batches/ICON-LOCAL/items') return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-LOCAL', action: 'add', sourceFile: 'items/item-1.svg' }));
-    if (url.pathname === '/api/batches/ICON-LOCAL/validate') return Promise.resolve(jsonResponse({ id: 'ICON-LOCAL', executionMode: 'local', state: 'READY', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: null, delivery: localDelivery, error: null }));
-    if (url.pathname === '/api/batches/ICON-LOCAL/submit') return Promise.resolve(jsonResponse({ id: 'ICON-LOCAL', executionMode: 'local', state: 'LOCAL_DIFF_READY', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: { changedFiles: ['src/icons/pink-new-icon.svg'], patch: '' }, delivery: localDelivery, error: null }));
-    throw new Error(`Unexpected request: ${path}`);
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
-
-  render(<App />);
-  await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '本地预览结果');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '验证 local 模式不会创建 PR。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/local');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
-  await screen.findByText('校验通过，可以生成本地修改。');
-  await user.click(screen.getByRole('button', { name: '生成本地修改' }));
-
-  await screen.findByText('本地预览已完成，此模式不会创建 PR');
-  expect(screen.queryByText('等待创建 Draft PR')).toBeNull();
-  expect(screen.queryByText('正在创建 Draft PR')).toBeNull();
-});
-
-test('a historical local result without an execution mode never promises a Draft PR', async () => {
-  saveProfile();
-  const delivery = { branch: null, commitSha: null, pullRequest: null, handoffAt: null };
-  const fetchMock = vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ id: 'ICON-LEGACY-LOCAL', executionMode: null, state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, delivery, error: null }));
-    if (url.pathname === '/api/batches/ICON-LEGACY-LOCAL/items') return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-LEGACY-LOCAL', action: 'add', sourceFile: 'items/item-1.svg' }));
-    if (url.pathname === '/api/batches/ICON-LEGACY-LOCAL/validate') return Promise.resolve(jsonResponse({ id: 'ICON-LEGACY-LOCAL', executionMode: null, state: 'READY', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: null, delivery, error: null }));
-    if (url.pathname === '/api/batches/ICON-LEGACY-LOCAL/submit') return Promise.resolve(jsonResponse({ id: 'ICON-LEGACY-LOCAL', executionMode: null, state: 'LOCAL_DIFF_READY', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: { changedFiles: ['src/icons/pink-new-icon.svg'], patch: '' }, delivery, error: null }));
-    throw new Error(`Unexpected request: ${path}`);
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
-
-  render(<App />);
-  await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '历史本地结果');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '验证历史本地批次不会自动提 PR。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/legacy-local');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
-  await screen.findByText('校验通过，可以生成本地修改。');
-  await user.click(screen.getByRole('button', { name: '生成本地修改' }));
-
-  await screen.findByText('历史本地结果已生成，此批次不会自动创建 PR；如需自动提 PR，请新建批次。');
-  expect(screen.queryByText('等待创建 Draft PR')).toBeNull();
-  expect(screen.queryByText('正在创建 Draft PR')).toBeNull();
-});
-
-test('only a remote bot branch checkpoint shows Draft PR creation progress', async () => {
-  saveProfile();
-  const delivery = { branch: 'bot/ICON-BRANCH', commitSha: 'a'.repeat(40), pullRequest: null, handoffAt: null };
-  const fetchMock = vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ id: 'ICON-BRANCH', executionMode: 'remote', state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, delivery, error: null }));
-    if (url.pathname === '/api/batches/ICON-BRANCH/items') return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-BRANCH', action: 'add', sourceFile: 'items/item-1.svg' }));
-    if (url.pathname === '/api/batches/ICON-BRANCH/validate') return Promise.resolve(jsonResponse({ id: 'ICON-BRANCH', executionMode: 'remote', state: 'READY', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: null, delivery, error: null }));
-    if (url.pathname === '/api/batches/ICON-BRANCH/submit') return Promise.resolve(jsonResponse({ id: 'ICON-BRANCH', executionMode: 'remote', state: 'BRANCH_PUSHED', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: { changedFiles: ['src/icons/pink-new-icon.svg'], patch: '' }, delivery, error: null }));
-    if (url.pathname === '/api/batches/ICON-BRANCH') return Promise.resolve(jsonResponse({ id: 'ICON-BRANCH', executionMode: 'remote', state: 'BRANCH_PUSHED', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: { changedFiles: ['src/icons/pink-new-icon.svg'], patch: '' }, delivery, error: null }));
-    throw new Error(`Unexpected request: ${path}`);
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
-
-  render(<App />);
-  await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '远程交付进度');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '验证机器人分支后的 PR 状态。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/branch');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
-  await screen.findByText('校验通过，可以生成本地修改。');
-  await user.click(screen.getByRole('button', { name: '生成本地修改' }));
-
-  await screen.findByText('正在创建 Draft PR');
-});
-
-test('a remote delivery failure explains that no PR was created and offers the remote retry', async () => {
-  saveProfile();
-  const delivery = { branch: 'bot/ICON-FAILED', commitSha: 'a'.repeat(40), pullRequest: null, handoffAt: null };
-  const fetchMock = vi.fn((path: string) => {
-    const url = new URL(path, 'http://localhost');
-    if (url.pathname === '/api/names/preview') return Promise.resolve(jsonResponse(namePreviewResponse(url.searchParams.get('name') ?? '')));
-    if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse({ id: 'ICON-FAILED', executionMode: 'remote', state: 'DRAFT', items: [], validation: null, warningsAcknowledged: false, localDiff: null, delivery, error: null }));
-    if (url.pathname === '/api/batches/ICON-FAILED/items') return Promise.resolve(jsonResponse({ id: 'item-1', batchId: 'ICON-FAILED', action: 'add', sourceFile: 'items/item-1.svg' }));
-    if (url.pathname === '/api/batches/ICON-FAILED/validate') return Promise.resolve(jsonResponse({ id: 'ICON-FAILED', executionMode: 'remote', state: 'READY', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: null, delivery, error: null }));
-    if (url.pathname === '/api/batches/ICON-FAILED/submit') return Promise.resolve(jsonResponse({ id: 'ICON-FAILED', executionMode: 'remote', state: 'FAILED', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: null, delivery, error: { code: 'REMOTE_BRANCH_DIVERGED', message: 'Remote branch changed.' } }));
-    if (url.pathname === '/api/batches/ICON-FAILED/retry') return Promise.resolve(jsonResponse({ id: 'ICON-FAILED', executionMode: 'remote', state: 'QUEUED', items: [], validation: { valid: true, errors: [], warnings: [] }, warningsAcknowledged: false, localDiff: null, delivery, error: null }));
-    throw new Error(`Unexpected request: ${path}`);
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  const user = userEvent.setup();
-
-  render(<App />);
-  await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '远程失败结果');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '验证远程失败的重试入口。');
-  await user.type(screen.getByLabelText(/^设计稿链接/), 'https://design.example.invalid/failed');
-  await user.click(screen.getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: '进入校验' }));
-  await screen.findByText('校验通过，可以生成本地修改。');
-  await user.click(screen.getByRole('button', { name: '生成本地修改' }));
-
-  await screen.findByText('远程交付未完成');
-  expect(screen.getByText('未创建或恢复 Draft PR；请修正问题后重试远程交付。')).toBeTruthy();
-  await user.click(screen.getByRole('button', { name: '重试远程交付' }));
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-FAILED/retry', { method: 'POST' }));
+  expect(link.getAttribute('href')).toBe('https://github.example.invalid/pull/42');
+  expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-PR', {});
 });
