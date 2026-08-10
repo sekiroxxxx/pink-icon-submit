@@ -834,6 +834,7 @@ export function App() {
   const liveSvgDrafts = useRef(new Map<string, SvgDraft>());
   const previousView = useRef<AppView>(view);
   const workbenchHydrationVersion = useRef(0);
+  const activeBatchIdRef = useRef<string | undefined>(activeBatchId);
   const lastReconciledWorkbenchPath = useRef<string | undefined>(undefined);
   const skipNextWorkbenchHydrationPath = useRef<string | undefined>(undefined);
   const initialActiveRestoreStarted = useRef(false);
@@ -868,6 +869,10 @@ export function App() {
   }, []);
 
   const setBrowserActiveBatch = useCallback((batchId: string | undefined) => {
+    if (activeBatchIdRef.current !== batchId) {
+      workbenchHydrationVersion.current += 1;
+    }
+    activeBatchIdRef.current = batchId;
     if (batchId) {
       window.localStorage.setItem(activeBatchStorageKey, batchId);
     } else {
@@ -918,10 +923,24 @@ export function App() {
       if (workbenchHydrationVersion.current !== hydrationVersion) return undefined;
       hydrateWorkbenchFromDetails(restored, options.notice);
       return restored;
+    } catch (error) {
+      if (workbenchHydrationVersion.current !== hydrationVersion) return undefined;
+      throw error;
     } finally {
       if (options.busy && workbenchHydrationVersion.current === hydrationVersion) setBusy(false);
     }
   }, [hydrateWorkbenchFromDetails]);
+
+  const completeActiveBatch = useCallback((completed: BatchDetails) => {
+    if (isActiveBatch(completed) || activeBatchIdRef.current !== completed.id) return;
+    lastReconciledWorkbenchPath.current = undefined;
+    setBrowserActiveBatch(undefined);
+    void refreshBatchSummaries();
+    if (completed.state === 'PR_CREATED' && routeFromLocation().view === 'workbench') {
+      setNotice('已提交开发审核。');
+      navigate({ view: 'home' });
+    }
+  }, [navigate, refreshBatchSummaries, setBrowserActiveBatch]);
 
   const viewingActiveBatch = Boolean(batch && activeBatchId === batch.id && isActiveBatch(batch));
   const editable = !batch || (batch.state === 'DRAFT' && viewingActiveBatch);
@@ -980,20 +999,25 @@ export function App() {
         if (restoredRoute.view === 'workbench' && (!restoredRoute.batchId || restoredRoute.batchId === batchId)) {
           lastReconciledWorkbenchPath.current = routePath(restoredRoute);
         }
-        if (!isActiveBatch(restored)) {
-          setBrowserActiveBatch(undefined);
-          void refreshBatchSummaries();
-        }
-        setRestoringActiveBatch(false);
+        completeActiveBatch(restored);
       })
       .catch(() => {
-        if (!cancelled) {
+        if (!cancelled && activeBatchIdRef.current === batchId) {
           setBrowserActiveBatch(undefined);
+          lastReconciledWorkbenchPath.current = undefined;
+          const currentRoute = routeFromLocation();
+          if (currentRoute.view === 'workbench' && currentRoute.batchId === batchId) {
+            navigate({ view: 'home' }, true);
+          }
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
           setRestoringActiveBatch(false);
         }
       });
     return () => { cancelled = true; };
-  }, [activeBatchId, hydrateWorkbenchBatch, refreshBatchSummaries, setBrowserActiveBatch]);
+  }, [activeBatchId, completeActiveBatch, hydrateWorkbenchBatch, navigate, setBrowserActiveBatch]);
 
   useEffect(() => {
     void refreshBatchSummaries();
@@ -1007,14 +1031,9 @@ export function App() {
   }, [resetWorkbenchTransientState, view]);
 
   useEffect(() => {
-    if (!batch || activeBatchId !== batch.id || isActiveBatch(batch)) return;
-    setBrowserActiveBatch(undefined);
-    void refreshBatchSummaries();
-    if (batch.state === 'PR_CREATED' && view === 'workbench') {
-      setNotice('已提交开发审核。');
-      navigate({ view: 'home' });
-    }
-  }, [activeBatchId, batch, navigate, refreshBatchSummaries, setBrowserActiveBatch, view]);
+    if (!batch || activeBatchId !== batch.id) return;
+    completeActiveBatch(batch);
+  }, [activeBatchId, batch, completeActiveBatch]);
 
   useEffect(() => {
     const requestedBatchId = route.view === 'workbench' ? route.batchId : undefined;
@@ -1048,14 +1067,7 @@ export function App() {
     })
       .then((restored) => {
         if (cancelled || !restored) return;
-        if (!isActiveBatch(restored) && activeBatchId === batchId) {
-          setBrowserActiveBatch(undefined);
-          void refreshBatchSummaries();
-          if (restored.state === 'PR_CREATED') {
-            setNotice('已提交开发审核。');
-            navigate({ view: 'home' });
-          }
-        }
+        completeActiveBatch(restored);
       })
       .catch((error: unknown) => {
         if (cancelled) return;
@@ -1064,7 +1076,7 @@ export function App() {
         navigate({ view: 'home' }, true);
       })
     return () => { cancelled = true; };
-  }, [activeBatchId, hydrateWorkbenchBatch, navigate, refreshBatchSummaries, resetWorkbenchTransientState, restoringActiveBatch, route, setBrowserActiveBatch]);
+  }, [activeBatchId, completeActiveBatch, hydrateWorkbenchBatch, navigate, resetWorkbenchTransientState, restoringActiveBatch, route, setBrowserActiveBatch]);
 
   useEffect(() => {
     if (!needsCatalog) return undefined;

@@ -12,8 +12,9 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((nextResolve) => { resolve = nextResolve; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => { resolve = nextResolve; reject = nextReject; });
+  return { promise, resolve, reject };
 }
 
 function saveProfile(): void {
@@ -808,18 +809,86 @@ test('an invalid workbench batch URL clears a matching stale browser activity id
   saveProfile();
   window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-MISSING');
   window.history.replaceState({}, '', '/workbench?batch=ICON-MISSING');
-  stubFetch(vi.fn((path: string) => {
+  const fetchMock = vi.fn((path: string) => {
     if (path === '/api/batches/ICON-MISSING') {
       return Promise.resolve(jsonResponse({ error: { code: 'BATCH_NOT_FOUND', message: 'Unknown batch.' } }, 404));
     }
     throw new Error(`Unexpected request: ${path}`);
-  }));
+  });
+  stubFetch(fetchMock);
 
   render(<App />);
 
   await screen.findByRole('heading', { name: '把图标设计交给开发审核' });
   expect(`${window.location.pathname}${window.location.search}`).toBe('/');
   expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBeNull();
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test('a stale initial active success ends restoration and lets the current workbench hydration win', async () => {
+  saveProfile();
+  const activeId = 'ICON-INITIAL-SLOW-SUCCESS';
+  const oldResponse = deferred<Response>();
+  const stale = batch({
+    id: activeId,
+    items: [{ id: 'item-initial-stale', batchId: activeId, action: 'add', designName: 'pink-initial-stale', description: '过期响应。', sourceFile: 'items/item-initial-stale.svg' }],
+  });
+  const current = batch({
+    id: activeId,
+    items: [{ id: 'item-initial-current', batchId: activeId, action: 'add', designName: 'pink-initial-current', description: '当前路由恢复。', sourceFile: 'items/item-initial-current.svg' }],
+  });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', activeId);
+  let batchReads = 0;
+  const fetchMock = vi.fn((path: string) => {
+    if (path === `/api/batches/${activeId}`) {
+      batchReads += 1;
+      return batchReads === 1 ? oldResponse.promise : Promise.resolve(jsonResponse(current));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock);
+
+  render(<App />);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(`/api/batches/${activeId}`, {}));
+  window.history.replaceState({}, '', '/workbench');
+  fireEvent.popState(window);
+  oldResponse.resolve(jsonResponse(stale));
+
+  await screen.findByText(/pink-initial-current/);
+  expect(screen.queryByText(/pink-initial-stale/)).toBeNull();
+  expect(batchReads).toBe(2);
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBe(activeId);
+});
+
+test('a stale initial active failure does not clear the valid active batch and still reconciles the workbench', async () => {
+  saveProfile();
+  const activeId = 'ICON-INITIAL-SLOW-FAILURE';
+  const oldResponse = deferred<Response>();
+  const current = batch({
+    id: activeId,
+    items: [{ id: 'item-initial-failure-current', batchId: activeId, action: 'add', designName: 'pink-initial-failure-current', description: '当前路由恢复。', sourceFile: 'items/item-initial-failure-current.svg' }],
+  });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', activeId);
+  let batchReads = 0;
+  const fetchMock = vi.fn((path: string) => {
+    if (path === `/api/batches/${activeId}`) {
+      batchReads += 1;
+      return batchReads === 1 ? oldResponse.promise : Promise.resolve(jsonResponse(current));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock);
+
+  render(<App />);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(`/api/batches/${activeId}`, {}));
+  window.history.replaceState({}, '', '/workbench');
+  fireEvent.popState(window);
+  oldResponse.reject(new Error('Initial request failed after navigation.'));
+
+  await screen.findByText(/pink-initial-failure-current/);
+  expect(batchReads).toBe(2);
+  expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBe(activeId);
+  expect(screen.queryByText(/无法打开批次/)).toBeNull();
 });
 
 test('browser popstate switches between home and a blank workbench without replacing an activity id', async () => {
@@ -1018,6 +1087,35 @@ test('a direct blank workbench route restores the active batch from this browser
   expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(active.title);
   expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(active.description);
   expect((screen.getByLabelText(/^设计稿链接/) as HTMLInputElement).value).toBe(active.designUrl);
+});
+
+test('an initial PR_CREATED active batch immediately returns a direct workbench refresh to home', async () => {
+  saveProfile();
+  const completed = batch({
+    id: 'ICON-INITIAL-PR-CREATED', title: '已完成的开发审核', executionMode: 'remote', state: 'PR_CREATED',
+    delivery: delivery({ checkpoint: 'PR_CREATED', pullRequest: { number: 55, url: 'https://github.example.invalid/pull/55', state: 'open', isDraft: true, createdAt: '2026-08-10T00:00:00.000Z' } }),
+  });
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', completed.id);
+  window.history.replaceState({}, '', '/workbench');
+  let summaryReads = 0;
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches?limit=20') {
+      summaryReads += 1;
+      return Promise.resolve(jsonResponse([summary({ id: completed.id, title: completed.title, userStatus: 'submitted_review' })]));
+    }
+    if (path === `/api/batches/${completed.id}`) return Promise.resolve(jsonResponse(completed));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+
+  render(<App />);
+
+  await screen.findByRole('heading', { name: '把图标设计交给开发审核' });
+  await waitFor(() => expect(window.localStorage.getItem('pink-icon-submit.active-batch.v1')).toBeNull());
+  await waitFor(() => expect(summaryReads).toBeGreaterThanOrEqual(2));
+  expect(screen.queryByRole('heading', { name: '完成设计，交给开发' })).toBeNull();
+  expect(screen.getAllByRole('status').map((node) => node.textContent)).toEqual(['已提交开发审核。']);
+  expect(`${window.location.pathname}${window.location.search}`).toBe('/');
 });
 
 test('a stale historical hydration cannot overwrite the batch reopened by forward navigation', async () => {
