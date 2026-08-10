@@ -104,6 +104,22 @@ export interface BatchDetails extends StoredBatch {
   failureHistory: JobFailure[];
 }
 
+export interface BatchSummary {
+  id: string;
+  title: string;
+  state: BatchState;
+  deliveryCheckpoint: DeliveryCheckpoint;
+  validationValid: boolean | null;
+  errorCode: string | null;
+  createdAt: string;
+  itemCounts: {
+    total: number;
+    add: number;
+    replace: number;
+    delete: number;
+  };
+}
+
 export interface AppConfig {
   databasePath: string;
   storageRoot: string;

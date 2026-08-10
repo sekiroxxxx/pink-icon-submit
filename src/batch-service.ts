@@ -6,7 +6,7 @@ import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
-import type { BatchDetails, BatchExecutionContext, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredBatch, StoredItem, TargetRepository } from './types.js';
+import type { BatchDetails, BatchExecutionContext, BatchSummary, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredBatch, StoredItem, TargetRepository } from './types.js';
 
 const maximumBatchItems = 100;
 
@@ -308,6 +308,10 @@ export class BatchService {
 
   getBatch(batchId: string): BatchDetails {
     return this.database.getDetails(batchId);
+  }
+
+  listBatches(limit: number): BatchSummary[] {
+    return this.database.listBatchSummaries(limit);
   }
 
   private assertLocallySubmittable(batchId: string): void {

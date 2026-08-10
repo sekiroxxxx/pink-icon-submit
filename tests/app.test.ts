@@ -516,3 +516,65 @@ test('DRAFT API delivery accepts an optional design link and queues without the 
   assert.equal((queued.json() as { state: string; validation: unknown }).state, 'QUEUED');
   assert.equal((queued.json() as { validation: unknown }).validation, null);
 });
+
+test('batch list returns at most 20 minimal summaries in stable newest-first order', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+
+  const seed = await environment.batches.createBatch({
+    title: 'Seed batch',
+    description: 'Supplies the frozen protocol context for direct fixture rows.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  const context = {
+    executionMode: seed.executionMode ?? 'local' as const,
+    pushRepository: seed.pushRepository,
+    pushBranchPrefix: seed.pushBranchPrefix,
+  };
+  const create = (id: string, title: string) => environment.database.createBatch(id, {
+    title,
+    description: `${title} description`,
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  }, seed.catalogBaseline!, seed.targetRepository!, context);
+  create('ICON-HOME-A', 'First batch');
+  create('ICON-HOME-B', 'Second batch');
+  create('ICON-HOME-C', 'Third batch');
+  environment.database.insertItem('ICON-HOME-B', 'item-add', {
+    action: 'add', designName: 'summary-add', description: 'An added icon.',
+  }, 'items/item-add.svg');
+  environment.database.insertItem('ICON-HOME-B', 'item-replace', {
+    action: 'replace', targetName: 'existing', description: 'A replacement.',
+  }, 'items/item-replace.svg');
+  environment.database.insertItem('ICON-HOME-B', 'item-delete', {
+    action: 'delete', targetName: 'retired', reason: 'No longer needed.',
+  }, null);
+  environment.database.queueJob('ICON-HOME-B');
+  environment.database.failJob('ICON-HOME-B', 'GIT_COMMAND_FAILED', 'Internal command and diagnostics must not appear in a summary.');
+
+  const response = await app.inject({ method: 'GET', url: '/api/batches?limit=2' });
+  assert.equal(response.statusCode, 200);
+  const summaries = response.json() as Array<{
+    id: string;
+    title: string;
+    state: string;
+    deliveryCheckpoint: string;
+    validationValid: boolean | null;
+    errorCode: string | null;
+    createdAt: string;
+    itemCounts: { total: number; add: number; replace: number; delete: number };
+  }>;
+  assert.deepEqual(summaries.map((summary) => summary.id), ['ICON-HOME-C', 'ICON-HOME-B']);
+  assert.deepEqual(summaries[1]?.itemCounts, { total: 3, add: 1, replace: 1, delete: 1 });
+  assert.equal(summaries[1]?.state, 'FAILED');
+  assert.equal(summaries[1]?.errorCode, 'GIT_COMMAND_FAILED');
+  assert.equal(summaries[1]?.deliveryCheckpoint, 'NONE');
+  const serialized = JSON.stringify(summaries);
+  for (const internalField of ['failureHistory', 'error_message', 'sourceFile', 'branch', 'commitSha', 'targetRepository', 'pushRepository']) {
+    assert.equal(serialized.includes(internalField), false);
+  }
+
+  const invalidLimit = await app.inject({ method: 'GET', url: '/api/batches?limit=21' });
+  assert.equal(invalidLimit.statusCode, 400);
+  assert.equal((invalidLimit.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
+});

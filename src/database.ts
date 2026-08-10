@@ -6,6 +6,7 @@ import { AppError, sanitizeDiagnosticText } from './errors.js';
 import type {
   BatchExecutionContext,
   BatchDetails,
+  BatchSummary,
   BatchState,
   CatalogBaseline,
   CreateBatchInput,
@@ -66,6 +67,20 @@ interface ItemRow {
   replacement_name: string | null;
   source_file: string | null;
   created_at: string;
+}
+
+interface BatchSummaryRow {
+  id: string;
+  title: string;
+  state: BatchState;
+  delivery_checkpoint: DeliveryCheckpoint;
+  validation_json: string | null;
+  error_code: string | null;
+  created_at: string;
+  item_count: number;
+  add_count: number;
+  replace_count: number;
+  delete_count: number;
 }
 
 interface JobRow {
@@ -208,6 +223,25 @@ function toBatch(row: BatchRow): StoredBatch {
     error: row.error_code && row.error_message ? { code: row.error_code, message: row.error_message } : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function toBatchSummary(row: BatchSummaryRow): BatchSummary {
+  const validation = parseJson(row.validation_json);
+  return {
+    id: row.id,
+    title: row.title,
+    state: row.state,
+    deliveryCheckpoint: storedDeliveryCheckpoint(row.delivery_checkpoint),
+    validationValid: isObject(validation) && typeof validation.valid === 'boolean' ? validation.valid : null,
+    errorCode: row.error_code,
+    createdAt: row.created_at,
+    itemCounts: {
+      total: row.item_count,
+      add: row.add_count,
+      replace: row.replace_count,
+      delete: row.delete_count,
+    },
   };
 }
 
@@ -393,6 +427,28 @@ export class BatchDatabase {
     const items = (this.db.prepare('SELECT * FROM items WHERE batch_id = ? ORDER BY created_at, id').all(id) as ItemRow[]).map(toItem);
     const job = this.getJob(id);
     return { ...batch, items, job, failureHistory: this.getFailureHistory(id) };
+  }
+
+  listBatchSummaries(limit: number): BatchSummary[] {
+    return (this.db.prepare(`
+      SELECT
+        batches.id,
+        batches.title,
+        batches.state,
+        batches.delivery_checkpoint,
+        batches.validation_json,
+        batches.error_code,
+        batches.created_at,
+        COUNT(items.id) AS item_count,
+        COALESCE(SUM(CASE WHEN items.action = 'add' THEN 1 ELSE 0 END), 0) AS add_count,
+        COALESCE(SUM(CASE WHEN items.action = 'replace' THEN 1 ELSE 0 END), 0) AS replace_count,
+        COALESCE(SUM(CASE WHEN items.action = 'delete' THEN 1 ELSE 0 END), 0) AS delete_count
+      FROM batches
+      LEFT JOIN items ON items.batch_id = batches.id
+      GROUP BY batches.id
+      ORDER BY batches.created_at DESC, batches.id DESC
+      LIMIT ?
+    `).all(limit) as BatchSummaryRow[]).map(toBatchSummary);
   }
 
   getItems(batchId: string): StoredItem[] {
