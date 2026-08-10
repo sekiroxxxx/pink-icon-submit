@@ -301,7 +301,40 @@ test('a final validation failure shows Chinese diagnostics and can return to edi
   await user.click(screen.getByRole('button', { name: '返回编辑并修正' }));
 
   await screen.findByRole('heading', { name: '本次交付尚未提交' });
+  expect(screen.getByText('本次变更 1 项')).toBeTruthy();
+  expect(screen.getByText('已上传：item-1.svg')).toBeTruthy();
   expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-INVALID/return-to-edit', { method: 'POST' });
+});
+
+test('a refreshed DRAFT batch restores server items as removable changes', async () => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-RESTORE');
+  const item = {
+    id: 'item-restore',
+    batchId: 'ICON-RESTORE',
+    action: 'add' as const,
+    designName: 'pink-restored-icon',
+    description: 'Restored from the server after a refresh.',
+    sourceFile: 'items/item-restore.svg',
+  };
+  const restored = batch({ id: 'ICON-RESTORE', items: [item] });
+  const fetchMock = vi.fn((path: string, options?: RequestInit) => {
+    if (path === '/api/batches/ICON-RESTORE') return Promise.resolve(jsonResponse(restored));
+    if (path === '/api/batches/ICON-RESTORE/items/item-restore' && options?.method === 'DELETE') return Promise.resolve(jsonResponse(undefined, 204));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  await screen.findByText('本次变更 1 项');
+  expect(screen.getByText('已上传：item-restore.svg')).toBeTruthy();
+  expect((screen.getByRole('button', { name: '确认本次变更' }) as HTMLButtonElement).disabled).toBe(false);
+  await user.click(screen.getByRole('button', { name: '移除 pink-restored-icon' }));
+
+  await screen.findByText('本次变更 0 项');
+  expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-RESTORE/items/item-restore', { method: 'DELETE' });
 });
 
 test('an infrastructure failure offers a manual delivery retry without exposing infrastructure details as the main message', async () => {
@@ -364,6 +397,80 @@ test('unchanged final-validation failures need an explicit confirmation before r
   const submitCalls = fetchMock.mock.calls.filter(([path]) => path === `/api/batches/${draft.id}/submit`);
   expect(submitCalls).toHaveLength(2);
   expect(JSON.parse((submitCalls[1]?.[1] as RequestInit).body as string)).toEqual({ confirmRepeatedSubmission: true });
+});
+
+test('partial item sync reconciles server items before retrying without duplicate creation', async () => {
+  saveProfile();
+  const batchId = 'ICON-PARTIAL';
+  const serverItems: Array<{
+    id: string;
+    batchId: string;
+    action: 'add';
+    designName: string;
+    description: string;
+    sourceFile: string;
+  }> = [];
+  let failSecondCreate = true;
+  const snapshot = (state: BatchDetails['state'] = 'DRAFT') => batch({ id: batchId, state, items: [...serverItems] });
+  const itemFromRequest = (options: RequestInit | undefined) => {
+    const body = options?.body;
+    if (!(body instanceof FormData)) throw new Error('Expected the SVG item request to use multipart form data.');
+    return JSON.parse(String(body.get('item'))) as { action: 'add'; designName: string; description: string };
+  };
+  const fetchMock = vi.fn((path: string, options?: RequestInit) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/batches' && options?.method === 'POST') return Promise.resolve(jsonResponse(snapshot()));
+    if (url.pathname === `/api/batches/${batchId}` && options?.method === 'PUT') return Promise.resolve(jsonResponse(snapshot()));
+    if (url.pathname === `/api/batches/${batchId}`) return Promise.resolve(jsonResponse(snapshot()));
+    if (url.pathname === `/api/batches/${batchId}/items` && options?.method === 'POST') {
+      const input = itemFromRequest(options);
+      if (serverItems.length === 1 && failSecondCreate) {
+        failSecondCreate = false;
+        return Promise.resolve(jsonResponse({ error: { code: 'UPLOAD_FAILED', message: 'The second upload failed.' } }, 500));
+      }
+      const item = {
+        id: `item-${serverItems.length + 1}`,
+        batchId,
+        action: 'add' as const,
+        designName: input.designName,
+        description: input.description,
+        sourceFile: `items/item-${serverItems.length + 1}.svg`,
+      };
+      serverItems.push(item);
+      return Promise.resolve(jsonResponse(item));
+    }
+    if (url.pathname === `/api/batches/${batchId}/items/item-1` && options?.method === 'PUT') {
+      return Promise.resolve(jsonResponse(serverItems[0]));
+    }
+    if (url.pathname === `/api/batches/${batchId}/submit` && options?.method === 'POST') return Promise.resolve(jsonResponse(snapshot('QUEUED')));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await addOneSvgChange(user);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('second-icon.svg'));
+  await screen.findByRole('button', { name: '选择 second-icon.svg' });
+  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-second-icon');
+  await user.type(screen.getByLabelText(/^用途说明/), '第二项用于验证部分上传失败后的服务端对账。');
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+  await openReview(user);
+  await user.click(screen.getByRole('button', { name: '确认提交' }));
+
+  await screen.findByText('提交未完成：The second upload failed.');
+  expect(serverItems).toHaveLength(1);
+  expect(serverItems[0]?.designName).toBe('pink-new-icon');
+  expect(screen.getByText('本次变更 2 项')).toBeTruthy();
+
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await user.click(screen.getByRole('button', { name: '确认提交' }));
+
+  await screen.findByRole('heading', { name: '已提交' });
+  expect(serverItems).toHaveLength(2);
+  expect(serverItems.map((item) => item.id)).toEqual(['item-1', 'item-2']);
+  expect(serverItems.map((item) => item.designName)).toEqual(['pink-new-icon', 'pink-second-icon']);
 });
 
 test('a restored local result never promises a Draft PR', async () => {

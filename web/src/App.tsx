@@ -15,16 +15,22 @@ interface SvgDraft {
   warning?: string;
 }
 
+interface DraftCatalogIcon {
+  primaryName: string;
+  svg?: string;
+}
+
 interface DraftChange {
   clientId: string;
   serverId?: string;
   action: ItemAction;
   designName?: string;
-  target?: CatalogPageIcon;
+  target?: DraftCatalogIcon;
   description?: string;
   reason?: string;
-  replacement?: CatalogPageIcon;
+  replacement?: DraftCatalogIcon;
   svg?: SvgDraft;
+  uploadedSourceFile?: string | null;
 }
 
 interface TargetUse {
@@ -112,6 +118,49 @@ function toItemInput(change: DraftChange): ItemInput {
     reason: change.reason,
     ...(change.replacement ? { replacementName: change.replacement.primaryName } : {}),
   };
+}
+
+function draftIcon(primaryName: string | undefined): DraftCatalogIcon | undefined {
+  return primaryName ? { primaryName } : undefined;
+}
+
+function draftChangeFromItem(item: ApiItem): DraftChange {
+  return {
+    clientId: uniqueId('change'),
+    serverId: item.id,
+    action: item.action,
+    ...(item.designName ? { designName: item.designName } : {}),
+    ...(item.targetName ? { target: draftIcon(item.targetName) } : {}),
+    ...(item.description ? { description: item.description } : {}),
+    ...(item.reason ? { reason: item.reason } : {}),
+    ...(item.replacementName ? { replacement: draftIcon(item.replacementName) } : {}),
+    uploadedSourceFile: item.sourceFile,
+  };
+}
+
+function draftChangesFromBatch(batch: Pick<BatchDetails, 'items'>): DraftChange[] {
+  return batch.items.map(draftChangeFromItem);
+}
+
+function savedDraftChange(change: DraftChange, item: ApiItem): DraftChange {
+  return { ...change, serverId: item.id, uploadedSourceFile: item.sourceFile };
+}
+
+function reconcileDraftChanges(batch: Pick<BatchDetails, 'items'>, currentChanges: DraftChange[]): DraftChange[] {
+  const restored = draftChangesFromBatch(batch);
+  const restoredByServerId = new Map(restored.map((change) => [change.serverId!, change]));
+  const reconciled = currentChanges.flatMap((change) => {
+    if (!change.serverId) return [change];
+    const restoredChange = restoredByServerId.get(change.serverId);
+    if (!restoredChange) return [];
+    restoredByServerId.delete(change.serverId);
+    return [{ ...restoredChange, clientId: change.clientId }];
+  });
+  return [...reconciled, ...restoredByServerId.values()];
+}
+
+function sourceFileLabel(sourceFile: string): string {
+  return sourceFile.split(/[\\/]/).at(-1) ?? sourceFile;
 }
 
 function localNameIssue(value: string): string | undefined {
@@ -408,13 +457,14 @@ function SvgQueue({ pending, activeSvgId, disabled, error, onQueue, onActivate, 
 
 function ChangeCard({ change, disabled, onRemove }: { change: DraftChange; disabled: boolean; onRemove: () => void }) {
   const label = { add: '新增', replace: '替换', delete: '删除' }[change.action];
+  const uploadedFile = change.svg?.file.name ?? (change.uploadedSourceFile ? sourceFileLabel(change.uploadedSourceFile) : undefined);
   return (
     <article className={`change-card ${change.action}`}>
-      {change.action === 'replace' && change.target && <img src={svgPreviewUrl(change.target.svg)} alt={`${change.target.primaryName} 当前图标`} />}
+      {change.action === 'replace' && change.target?.svg && <img src={svgPreviewUrl(change.target.svg)} alt={`${change.target.primaryName} 当前图标`} />}
       {change.action === 'replace' && <span className="change-arrow">→</span>}
       {change.svg && <SvgPreview svg={change.svg} alt={`${change.svg.file.name} 预览`} className="change-preview" />}
-      {change.action === 'delete' && change.target && <img src={svgPreviewUrl(change.target.svg)} alt={`${change.target.primaryName} 当前图标`} />}
-      <span><strong>{label} · {change.action === 'add' ? change.designName : change.target?.primaryName}</strong><small>{change.action === 'delete' ? '将从图标仓库移除' : change.svg?.file.name}</small></span>
+      {change.action === 'delete' && change.target?.svg && <img src={svgPreviewUrl(change.target.svg)} alt={`${change.target.primaryName} 当前图标`} />}
+      <span><strong>{label} · {change.action === 'add' ? change.designName : change.target?.primaryName}</strong><small>{change.action === 'delete' ? '将从图标仓库移除' : uploadedFile ? `已上传：${uploadedFile}` : 'SVG 将在提交时上传'}</small></span>
       <button type="button" disabled={disabled} onClick={onRemove} aria-label={`移除 ${change.action === 'add' ? change.designName : change.target?.primaryName}`}>×</button>
     </article>
   );
@@ -629,6 +679,7 @@ export function App() {
       .then((restored) => {
         if (cancelled) return;
         setBatch(restored);
+        setChanges(draftChangesFromBatch(restored));
         setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
         setNotice('已恢复本次交付状态。');
       })
@@ -815,6 +866,9 @@ export function App() {
     }
     revokePreview(change.svg);
     if (change.svg) liveSvgDrafts.current.delete(change.svg.id);
+    if (batch && change.serverId) {
+      setBatch((current) => current ? { ...current, items: current.items.filter((item) => item.id !== change.serverId) } : current);
+    }
     setChanges((current) => current.filter((candidate) => candidate.clientId !== change.clientId));
     setNotice('已移除本次变更。');
   };
@@ -832,12 +886,14 @@ export function App() {
   };
 
   const syncChanges = async (batchId: string): Promise<DraftChange[]> => {
-    const saved: DraftChange[] = [];
-    for (const change of changes) {
+    const saved = [...changes];
+    for (let index = 0; index < saved.length; index += 1) {
+      const change = saved[index]!;
       const item: ApiItem = change.serverId
-        ? await api.updateItem(batchId, change.serverId, toItemInput(change), change.svg?.file)
+        ? await api.updateItem(batchId, change.serverId, toItemInput(change), change.uploadedSourceFile ? undefined : change.svg?.file)
         : await api.addItem(batchId, toItemInput(change), change.svg?.file);
-      saved.push({ ...change, serverId: item.id });
+      saved[index] = savedDraftChange(change, item);
+      setChanges([...saved]);
     }
     return saved;
   };
@@ -848,8 +904,8 @@ export function App() {
     setBusy(true);
     setRepeatedSubmissionConfirmation(false);
     setNotice('已提交本次变更，正在等待最终校验。');
+    let currentBatch = batch;
     try {
-      let currentBatch = batch;
       const metadata = {
         title: batchForm.title.trim(),
         description: batchForm.description.trim(),
@@ -866,6 +922,16 @@ export function App() {
       setChanges(saved);
       setBatch(await api.submitBatch(currentBatch.id));
     } catch (error) {
+      if (currentBatch) {
+        try {
+          const restored = await api.getBatch(currentBatch.id);
+          setBatch(restored);
+          setChanges((current) => reconcileDraftChanges(restored, current));
+          setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
+        } catch {
+          // Preserve the original submission failure when reconciliation is temporarily unavailable.
+        }
+      }
       if (error instanceof ApiError && error.code === 'REPEATED_SUBMISSION_CONFIRMATION_REQUIRED') {
         setRepeatedSubmissionConfirmation(true);
         setNotice('本次内容与上次最终校验失败时相同。确认后才能再次提交。');
@@ -894,7 +960,9 @@ export function App() {
     if (!batch) return;
     setBusy(true);
     try {
-      setBatch(await api.returnToEdit(batch.id));
+      const restored = await api.returnToEdit(batch.id);
+      setBatch(restored);
+      setChanges(draftChangesFromBatch(restored));
       setRepeatedSubmissionConfirmation(false);
       setNotice('已返回编辑。请修正内容后再次确认提交。');
     } catch (error) {

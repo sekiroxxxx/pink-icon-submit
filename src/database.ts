@@ -331,7 +331,7 @@ export class BatchDatabase {
   updateBatchMetadata(batchId: string, input: Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>): StoredBatch {
     const update = this.db.transaction(() => {
       this.requireDraftBatch(batchId);
-      const timestamp = now();
+      const timestamp = this.nextContentRevision(batchId);
       const result = this.db.prepare(`
         UPDATE batches
         SET title = ?, description = ?, design_url = ?
@@ -340,7 +340,7 @@ export class BatchDatabase {
       if (result.changes !== 1) {
         throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} is no longer editable.`, 409);
       }
-      this.clearValidationAfterItemChange(batchId, timestamp);
+      this.clearValidationAfterDraftContentChange(batchId, timestamp);
       return this.getBatch(batchId);
     });
     return update();
@@ -356,7 +356,7 @@ export class BatchDatabase {
         throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} is ${batch.state} and cannot be edited.`, 409);
       }
 
-      const timestamp = now();
+      const timestamp = this.nextContentRevision(batchId);
       this.db.prepare(`
         INSERT INTO items (
           id, batch_id, action, design_name, target_name, description, reason, replacement_name, source_file, created_at
@@ -373,7 +373,7 @@ export class BatchDatabase {
         sourceFile,
         timestamp,
       );
-      this.clearValidationAfterItemChange(batchId, timestamp);
+      this.clearValidationAfterDraftContentChange(batchId, timestamp);
       const row = this.db.prepare('SELECT * FROM items WHERE id = ?').get(id) as ItemRow;
       return toItem(row);
     });
@@ -422,7 +422,7 @@ export class BatchDatabase {
     const update = this.db.transaction(() => {
       this.requireDraftBatch(batchId);
       this.getItem(batchId, itemId);
-      const timestamp = now();
+      const timestamp = this.nextContentRevision(batchId);
       this.db.prepare(`
         UPDATE items
         SET action = ?, design_name = ?, target_name = ?, description = ?, reason = ?, replacement_name = ?, source_file = ?
@@ -438,7 +438,7 @@ export class BatchDatabase {
         itemId,
         batchId,
       );
-      this.clearValidationAfterItemChange(batchId, timestamp);
+      this.clearValidationAfterDraftContentChange(batchId, timestamp);
       return this.getItem(batchId, itemId);
     });
     return update();
@@ -451,7 +451,7 @@ export class BatchDatabase {
       if (result.changes !== 1) {
         throw new AppError('ITEM_NOT_FOUND', `Unknown item ${itemId} in batch ${batchId}.`, 404);
       }
-      this.clearValidationAfterItemChange(batchId, now());
+      this.clearValidationAfterDraftContentChange(batchId, this.nextContentRevision(batchId));
     });
     remove();
   }
@@ -831,7 +831,7 @@ export class BatchDatabase {
     this.db.prepare('UPDATE batches SET state = ?, updated_at = ? WHERE id = ?').run(state, now(), batchId);
   }
 
-  private clearValidationAfterItemChange(batchId: string, timestamp: string): void {
+  private clearValidationAfterDraftContentChange(batchId: string, timestamp: string): void {
     this.db.prepare(`
       UPDATE batches
       SET validation_json = NULL, warning_ack_request_sha256 = NULL,
@@ -839,6 +839,15 @@ export class BatchDatabase {
           error_code = NULL, error_message = NULL, updated_at = ?
       WHERE id = ?
     `).run(timestamp, batchId);
+  }
+
+  private nextContentRevision(batchId: string): string {
+    const batch = this.db.prepare('SELECT updated_at FROM batches WHERE id = ?').get(batchId) as Pick<BatchRow, 'updated_at'> | undefined;
+    if (!batch) {
+      throw new AppError('BATCH_NOT_FOUND', `Unknown batch: ${batchId}`, 404);
+    }
+    const previous = Date.parse(batch.updated_at);
+    return new Date(Math.max(Date.now(), Number.isFinite(previous) ? previous + 1 : 0)).toISOString();
   }
 
   private requireDraftBatch(batchId: string): void {

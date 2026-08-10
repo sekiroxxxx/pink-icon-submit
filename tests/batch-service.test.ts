@@ -194,6 +194,64 @@ test('editing after a final validation failure permits a normal DRAFT resubmissi
   assert.equal(environment.batches.submit(batch.id).state, 'QUEUED');
 });
 
+test('DRAFT content edits advance a monotonic revision after a same-millisecond final validation failure', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-08-10T08:00:00.000Z') });
+  const environment = await createTestEnvironment(t);
+  const batch = await environment.batches.createBatch({
+    title: 'Monotonic content revision',
+    description: 'Every real DRAFT edit must differ from the failure snapshot.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  const firstItem = await environment.batches.addItem(batch.id, {
+    action: 'add',
+    designName: 'revision-first-icon',
+    description: 'Existing item for the final validation failure.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(batch.id);
+  environment.database.claimNextJob();
+  environment.database.recordFinalValidation(batch.id, {
+    valid: false,
+    requestSha256: 'a'.repeat(64),
+    errors: [{ code: 'TEST_INVALID', message: 'Simulated final validation failure.' }],
+    warnings: [],
+  }, 'b'.repeat(40));
+  environment.database.failJob(batch.id, 'FINAL_VALIDATION_FAILED', 'Simulated final validation failure.');
+  const failure = environment.batches.getBatch(batch.id).failureHistory.at(-1)!;
+
+  environment.batches.returnToEdit(batch.id);
+  assert.throws(() => environment.batches.submit(batch.id), {
+    code: 'REPEATED_SUBMISSION_CONFIRMATION_REQUIRED',
+  });
+
+  const editedMetadata = await environment.batches.updateBatch(batch.id, {
+    title: 'Updated monotonic content revision',
+    description: 'Metadata is the first edit in the same wall-clock millisecond.',
+  });
+  assert.ok(Date.parse(editedMetadata.updatedAt) > Date.parse(failure.createdAt));
+  assert.equal(environment.database.requiresRepeatedSubmissionConfirmation(batch.id), false);
+
+  const secondItem = await environment.batches.addItem(batch.id, {
+    action: 'add',
+    designName: 'revision-second-icon',
+    description: 'Adding an item must advance the same revision cursor.',
+  }, Buffer.from(environment.validSvg));
+  const afterAdd = environment.batches.getBatch(batch.id);
+  assert.ok(Date.parse(afterAdd.updatedAt) > Date.parse(editedMetadata.updatedAt));
+
+  await environment.batches.updateItem(batch.id, firstItem.id, {
+    action: 'add',
+    designName: 'revision-first-icon-corrected',
+    description: 'Updating an item must advance the same revision cursor.',
+  }, undefined);
+  const afterUpdate = environment.batches.getBatch(batch.id);
+  assert.ok(Date.parse(afterUpdate.updatedAt) > Date.parse(afterAdd.updatedAt));
+
+  await environment.batches.deleteItem(batch.id, secondItem.id);
+  const afterDelete = environment.batches.getBatch(batch.id);
+  assert.ok(Date.parse(afterDelete.updatedAt) > Date.parse(afterUpdate.updatedAt));
+  assert.equal(environment.database.requiresRepeatedSubmissionConfirmation(batch.id), false);
+});
+
 test('interrupted RUNNING jobs become retryable failures on startup recovery', async (t) => {
   const environment = await createTestEnvironment(t);
   const batchId = await createBatch(environment.batches);
