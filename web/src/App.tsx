@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, ApiError, type ApiItem, type BatchDetails, type BatchSummary, type CatalogGroup, type CatalogPageIcon, type Diagnostic, type ItemAction, type ItemInput, type Submitter } from './api';
+import { api, ApiError, type ApiItem, type BatchDetails, type BatchSummary, type CatalogGroup, type CatalogPageIcon, type Diagnostic, type ItemAction, type ItemInput, type Submitter, type UserBatchStatus } from './api';
 import { displayDiagnostic } from './diagnostics';
 
 interface DesignerProfile extends Submitter {
@@ -40,7 +40,10 @@ interface TargetUse {
 
 type FieldErrors = Record<string, string>;
 type AppView = 'home' | 'workbench';
-type UserBatchStatus = '草稿' | '处理中' | '需要修改' | '交付暂时失败' | '需要开发处理' | '已提交开发审核' | '本地预览已完成';
+interface AppRoute {
+  view: AppView;
+  batchId?: string;
+}
 
 const identityStorageKey = 'pink-icon-submit.designer-profile.v1';
 const activeBatchStorageKey = 'pink-icon-submit.active-batch.v1';
@@ -76,6 +79,17 @@ function readProfile(): DesignerProfile | undefined {
 
 function writeProfile(profile: DesignerProfile): void {
   window.localStorage.setItem(identityStorageKey, JSON.stringify(profile));
+}
+
+function routeFromLocation(): AppRoute {
+  if (window.location.pathname !== '/workbench') return { view: 'home' };
+  const batchId = new URLSearchParams(window.location.search).get('batch')?.trim();
+  return batchId ? { view: 'workbench', batchId } : { view: 'workbench' };
+}
+
+function routePath(route: AppRoute): string {
+  if (route.view === 'home') return '/';
+  return route.batchId ? `/workbench?batch=${encodeURIComponent(route.batchId)}` : '/workbench';
 }
 
 function isEmail(value: string): boolean {
@@ -499,18 +513,6 @@ function isFinalValidationFailure(batch: BatchDetails): boolean {
     && batch.validation?.valid === false;
 }
 
-function canResumeDraftPullRequest(batch: BatchDetails): boolean {
-  return batch.state === 'FAILED'
-    && batch.executionMode === 'remote'
-    && (batch.delivery.checkpoint === 'BRANCH_PUSHED' || batch.delivery.checkpoint === 'PR_CREATING')
-    && batch.error !== null
-    && ['GIT_COMMAND_FAILED', 'GITHUB_API_REQUEST_FAILED', 'GITHUB_API_RESPONSE_INVALID', 'WORKER_INTERRUPTED'].includes(batch.error.code)
-    && Boolean(batch.baseCommit?.trim())
-    && Boolean(batch.delivery.branch?.trim())
-    && Boolean(batch.delivery.commitSha?.trim())
-    && batch.delivery.pullRequest === null;
-}
-
 const retryableDraftPullRequestErrorCodes = new Set([
   'GIT_COMMAND_FAILED',
   'GITHUB_API_REQUEST_FAILED',
@@ -518,43 +520,62 @@ const retryableDraftPullRequestErrorCodes = new Set([
   'WORKER_INTERRUPTED',
 ]);
 
-function userBatchStatus(input: {
-  state: BatchDetails['state'];
-  deliveryCheckpoint: BatchDetails['delivery']['checkpoint'];
-  validationValid: boolean | null;
-  errorCode: string | null;
-}): UserBatchStatus {
-  if (input.state === 'PR_CREATED') return '已提交开发审核';
-  if (input.state === 'LOCAL_DIFF_READY') return '本地预览已完成';
-  if (input.state === 'DRAFT') return '草稿';
-  if (input.state !== 'FAILED') return '处理中';
-  if (input.deliveryCheckpoint === 'NONE' && input.validationValid === false) return '需要修改';
-  if (input.deliveryCheckpoint === 'BRANCH_PUSHED' || input.deliveryCheckpoint === 'PR_CREATING') {
-    return input.errorCode && retryableDraftPullRequestErrorCodes.has(input.errorCode)
-      ? '交付暂时失败'
-      : '需要开发处理';
-  }
-  return '交付暂时失败';
+function canResumeDraftPullRequest(batch: BatchDetails): boolean {
+  return batch.state === 'FAILED'
+    && batch.executionMode === 'remote'
+    && (batch.delivery.checkpoint === 'BRANCH_PUSHED' || batch.delivery.checkpoint === 'PR_CREATING')
+    && batch.error !== null
+    && retryableDraftPullRequestErrorCodes.has(batch.error.code)
+    && Boolean(batch.baseCommit?.trim())
+    && Boolean(batch.delivery.branch?.trim())
+    && Boolean(batch.delivery.commitSha?.trim())
+    && batch.delivery.pullRequest === null;
+}
+
+function canRetryDelivery(batch: BatchDetails): boolean {
+  if (batch.state !== 'FAILED' || isFinalValidationFailure(batch)) return false;
+  if (batch.delivery.checkpoint === 'NONE' || batch.delivery.checkpoint === 'COMMIT_PREPARED') return true;
+  return canResumeDraftPullRequest(batch);
 }
 
 function batchStatus(batch: BatchDetails): UserBatchStatus {
-  return userBatchStatus({
-    state: batch.state,
-    deliveryCheckpoint: batch.delivery.checkpoint,
-    validationValid: batch.validation?.valid ?? null,
-    errorCode: batch.error?.code ?? null,
-  });
+  if (batch.state === 'PR_CREATED') return 'submitted_review';
+  if (batch.state === 'LOCAL_DIFF_READY') return 'local_complete';
+  if (batch.state === 'DRAFT') return 'draft';
+  if (batch.state !== 'FAILED') return 'processing';
+  if (isFinalValidationFailure(batch)) return 'needs_changes';
+  return canRetryDelivery(batch) ? 'delivery_retryable' : 'developer_attention';
 }
 
 function summaryStatus(batch: BatchSummary): UserBatchStatus {
-  return userBatchStatus(batch);
+  return batch.userStatus;
+}
+
+function isActiveBatch(batch: BatchDetails): boolean {
+  const status = batchStatus(batch);
+  return status === 'draft'
+    || status === 'processing'
+    || status === 'needs_changes'
+    || status === 'delivery_retryable';
+}
+
+function statusLabel(status: UserBatchStatus): string {
+  return {
+    draft: '草稿',
+    processing: '处理中',
+    needs_changes: '需要修改',
+    delivery_retryable: '交付暂时失败',
+    developer_attention: '需要开发处理',
+    submitted_review: '已提交开发审核',
+    local_complete: '本地预览已完成',
+  }[status];
 }
 
 function statusTone(status: UserBatchStatus): 'draft' | 'processing' | 'warning' | 'danger' | 'success' {
-  if (status === '草稿') return 'draft';
-  if (status === '处理中') return 'processing';
-  if (status === '需要修改' || status === '交付暂时失败') return 'warning';
-  if (status === '需要开发处理') return 'danger';
+  if (status === 'draft') return 'draft';
+  if (status === 'processing') return 'processing';
+  if (status === 'needs_changes' || status === 'delivery_retryable') return 'warning';
+  if (status === 'developer_attention') return 'danger';
   return 'success';
 }
 
@@ -600,13 +621,13 @@ function HomePage({
   const activeStatus = activeBatch ? batchStatus(activeBatch) : undefined;
   const activeAction = !activeBatch
     ? { label: '新建图标变更', onClick: onNew }
-    : activeStatus === '草稿'
+    : activeStatus === 'draft'
       ? { label: '继续编辑', onClick: onOpenActive }
-      : activeStatus === '需要修改'
+      : activeStatus === 'needs_changes'
         ? { label: '返回修改', onClick: onReturnToEdit }
-        : activeStatus === '处理中'
+        : activeStatus === 'processing'
           ? { label: '查看处理中', onClick: onOpenActive }
-          : { label: '查看交付结果', onClick: onOpenActive };
+          : { label: '恢复交付', onClick: onOpenActive };
 
   return (
     <main className="page-shell home-page">
@@ -614,7 +635,7 @@ function HomePage({
       {notice && <p className="notice app-toast" role="status">{notice}</p>}
       <section className="home-hero" aria-labelledby="home-entry-title">
         <div><p className="eyebrow">开始一项新工作</p><h2 id="home-entry-title">创建图标变更</h2><p>在工作台中新增、替换或删除图标；确认提交后会进入最终校验和开发审核流程。</p></div>
-        <button className="button primary" type="button" onClick={onNew}>新建图标变更</button>
+        <button className="button primary" type="button" onClick={activeBatch ? activeAction.onClick : onNew}>{activeBatch ? activeAction.label : '新建图标变更'}</button>
       </section>
       <section className="active-batch-card" aria-labelledby="active-batch-title">
         <div>
@@ -631,10 +652,10 @@ function HomePage({
               })} · 创建于 {formatBatchTime(activeBatch.createdAt)}</p>
               : <p>新建后会在这个浏览器中保留一个当前工作台。</p>}
         </div>
-        {activeBatch && activeStatus && <div className="active-batch-actions"><span className={`status-pill ${statusTone(activeStatus)}`}>{activeStatus}</span><button className="button secondary" type="button" onClick={activeAction.onClick}>{activeAction.label}</button></div>}
+        {activeBatch && activeStatus && <div className="active-batch-actions"><span className={`status-pill ${statusTone(activeStatus)}`}>{statusLabel(activeStatus)}</span><button className="button secondary" type="button" onClick={activeAction.onClick}>{activeAction.label}</button></div>}
       </section>
       <section className="history-card" aria-labelledby="history-title">
-        <div className="history-heading"><div><p className="eyebrow">最近记录</p><h2 id="history-title">最近 20 条批次</h2></div><span>当前为同一部署的内部数据，不按设计师账号隔离。</span></div>
+        <div className="history-heading"><div><p className="eyebrow">最近记录</p><h2 id="history-title">最近 20 条批次</h2></div></div>
         {loading && <p className="history-empty">正在读取最近批次…</p>}
         {error && <p className="inline-error">{error}</p>}
         {!loading && !error && summaries.length === 0 && <p className="history-empty">还没有提交记录。创建第一个图标变更吧。</p>}
@@ -642,7 +663,7 @@ function HomePage({
           const status = summaryStatus(summary);
           return <li key={summary.id}>
             <div><strong>{summary.title}</strong><span>{formatBatchTime(summary.createdAt)} · {itemCountSummary(summary.itemCounts)}</span></div>
-            <div className="history-actions"><span className={`status-pill ${statusTone(status)}`}>{status}</span><button className="button secondary" type="button" onClick={() => onOpenSummary(summary.id)}>查看</button></div>
+            <div className="history-actions"><span className={`status-pill ${statusTone(status)}`}>{statusLabel(status)}</span><button className="button secondary" type="button" onClick={() => onOpenSummary(summary.id)}>查看</button></div>
           </li>;
         })}</ul>}
       </section>
@@ -653,6 +674,7 @@ function HomePage({
 function DeliveryStatusCard({
   batch,
   busy,
+  readOnly,
   notice,
   repeatedSubmissionConfirmation,
   onReturnToEdit,
@@ -661,6 +683,7 @@ function DeliveryStatusCard({
 }: {
   batch: BatchDetails;
   busy: boolean;
+  readOnly: boolean;
   notice?: string;
   repeatedSubmissionConfirmation: boolean;
   onReturnToEdit: () => void;
@@ -722,9 +745,9 @@ function DeliveryStatusCard({
       {batch.state === 'FAILED' && !finalValidationFailure && batch.error && (
         <details><summary>技术详情</summary><p>规则：<code>{batch.error.code}</code></p><p>{batch.error.message}</p></details>
       )}
-      {finalValidationFailure && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onReturnToEdit}>返回编辑并修正</button></div>}
-      {batch.state === 'FAILED' && !finalValidationFailure && (!draftPullRequestRecoveryFailure || canResumeDraftPr) && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onRetry}>{canResumeDraftPr ? '重新尝试创建 Draft PR' : '重新尝试交付'}</button></div>}
-      {repeatedSubmissionConfirmation && batch.state === 'DRAFT' && (
+      {finalValidationFailure && !readOnly && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onReturnToEdit}>返回编辑并修正</button></div>}
+      {batch.state === 'FAILED' && !finalValidationFailure && (!draftPullRequestRecoveryFailure || canResumeDraftPr) && !readOnly && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onRetry}>{canResumeDraftPr ? '重新尝试创建 Draft PR' : '重新尝试交付'}</button></div>}
+      {repeatedSubmissionConfirmation && batch.state === 'DRAFT' && !readOnly && (
         <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onConfirmRepeatedSubmission}>仍要按原内容再次提交</button></div>
       )}
     </section>
@@ -774,7 +797,8 @@ function ReviewDrawer({
 export function App() {
   const [profile, setProfile] = useState<DesignerProfile | undefined>(() => readProfile());
   const [identityOpen, setIdentityOpen] = useState(() => !readProfile());
-  const [view, setView] = useState<AppView>('home');
+  const [route, setRoute] = useState<AppRoute>(() => routeFromLocation());
+  const view = route.view;
   const [action, setAction] = useState<ItemAction>('add');
   const [pendingSvgs, setPendingSvgs] = useState<SvgDraft[]>([]);
   const [activeSvgId, setActiveSvgId] = useState<string>();
@@ -808,8 +832,54 @@ export function App() {
   const [notice, setNotice] = useState<string>();
   const [repeatedSubmissionConfirmation, setRepeatedSubmissionConfirmation] = useState(false);
   const liveSvgDrafts = useRef(new Map<string, SvgDraft>());
-  const previousBatchState = useRef<BatchDetails['state'] | undefined>(undefined);
+  const previousView = useRef<AppView>(view);
   const activeRestoreVersion = useRef(0);
+
+  const resetWorkbenchTransientState = useCallback(() => {
+    liveSvgDrafts.current.forEach(revokePreview);
+    liveSvgDrafts.current.clear();
+    setAction('add');
+    setPendingSvgs([]);
+    setActiveSvgId(undefined);
+    setChanges([]);
+    setTarget(undefined);
+    setAddName('');
+    setAddDescription('');
+    setReplaceDescription('');
+    setDeleteReason('');
+    setReplacement(undefined);
+    setChangeErrors({});
+    setCatalogQuery('');
+    setCatalogGroup('all');
+    setCatalogPage(1);
+    setCatalog(undefined);
+    setCatalogLoading(false);
+    setCatalogError(undefined);
+    setCatalogSelection('target');
+    setCatalogOpen(false);
+    setBatchForm({ title: '', description: '', designUrl: '' });
+    setReviewOpen(false);
+    setReviewErrors({});
+    setConfirmed(false);
+    setRepeatedSubmissionConfirmation(false);
+  }, []);
+
+  const setBrowserActiveBatch = useCallback((batchId: string | undefined) => {
+    if (batchId) {
+      window.localStorage.setItem(activeBatchStorageKey, batchId);
+    } else {
+      window.localStorage.removeItem(activeBatchStorageKey);
+    }
+    setActiveBatchId(batchId);
+  }, []);
+
+  const navigate = useCallback((next: AppRoute, replace = false) => {
+    const nextPath = routePath(next);
+    if (`${window.location.pathname}${window.location.search}` !== nextPath) {
+      window.history[replace ? 'replaceState' : 'pushState']({}, '', nextPath);
+    }
+    setRoute(next);
+  }, []);
 
   const refreshBatchSummaries = useCallback(async () => {
     setBatchSummariesLoading(true);
@@ -823,7 +893,8 @@ export function App() {
     }
   }, []);
 
-  const editable = !batch || batch.state === 'DRAFT';
+  const viewingActiveBatch = Boolean(batch && activeBatchId === batch.id && isActiveBatch(batch));
+  const editable = !batch || (batch.state === 'DRAFT' && viewingActiveBatch);
   const needsCatalog = catalogOpen && editable && (action === 'replace' || action === 'delete');
   const activeSvg = useMemo(() => pendingSvgs.find((svg) => svg.id === activeSvgId), [activeSvgId, pendingSvgs]);
   const usedTargets = useMemo(() => {
@@ -854,6 +925,12 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const onPopState = () => setRoute(routeFromLocation());
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  useEffect(() => {
     const batchId = activeBatchId;
     if (!batchId) {
       setRestoringActiveBatch(false);
@@ -866,15 +943,16 @@ export function App() {
       .then((restored) => {
         if (cancelled || activeRestoreVersion.current !== restoreVersion) return;
         setBatch(restored);
-        setChanges(draftChangesFromBatch(restored));
-        setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
+        if (isActiveBatch(restored)) {
+          setChanges(draftChangesFromBatch(restored));
+          setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
+        }
         setNotice('已恢复本次交付状态。');
         setRestoringActiveBatch(false);
       })
       .catch(() => {
         if (!cancelled && activeRestoreVersion.current === restoreVersion) {
-          window.localStorage.removeItem(activeBatchStorageKey);
-          setActiveBatchId(undefined);
+          setBrowserActiveBatch(undefined);
           setRestoringActiveBatch(false);
         }
       });
@@ -884,25 +962,55 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (batch) {
-      window.localStorage.setItem(activeBatchStorageKey, batch.id);
-      setActiveBatchId(batch.id);
-    }
-  }, [batch]);
-
-  useEffect(() => {
     void refreshBatchSummaries();
   }, [refreshBatchSummaries]);
 
   useEffect(() => {
-    const previous = previousBatchState.current;
-    previousBatchState.current = batch?.state;
-    if (view === 'workbench' && previous && previous !== 'PR_CREATED' && batch?.state === 'PR_CREATED') {
-      setView('home');
-      setNotice('已提交开发审核。');
-      void refreshBatchSummaries();
+    if (previousView.current === 'workbench' && view === 'home') {
+      resetWorkbenchTransientState();
     }
-  }, [batch?.state, refreshBatchSummaries, view]);
+    previousView.current = view;
+  }, [resetWorkbenchTransientState, view]);
+
+  useEffect(() => {
+    if (!batch || activeBatchId !== batch.id || isActiveBatch(batch)) return;
+    setBrowserActiveBatch(undefined);
+    void refreshBatchSummaries();
+    if (batch.state === 'PR_CREATED' && view === 'workbench') {
+      setNotice('已提交开发审核。');
+      navigate({ view: 'home' });
+    }
+  }, [activeBatchId, batch, navigate, refreshBatchSummaries, setBrowserActiveBatch, view]);
+
+  useEffect(() => {
+    const requestedBatchId = route.view === 'workbench' ? route.batchId : undefined;
+    if (!requestedBatchId || restoringActiveBatch) return;
+    if (activeBatchId && activeBatchId !== requestedBatchId) {
+      setNotice('请先完成当前批次。');
+      navigate({ view: 'home' }, true);
+      return;
+    }
+    if (batch?.id === requestedBatchId) return;
+    let cancelled = false;
+    setBusy(true);
+    void api.getBatch(requestedBatchId)
+      .then((restored) => {
+        if (cancelled) return;
+        resetWorkbenchTransientState();
+        setBatch(restored);
+        setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
+        setChanges(draftChangesFromBatch(restored));
+        setNotice('正在查看历史批次。');
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        if (activeBatchId === requestedBatchId) setBrowserActiveBatch(undefined);
+        setNotice(error instanceof Error ? `无法打开批次：${error.message}` : '无法打开批次。');
+        navigate({ view: 'home' }, true);
+      })
+      .finally(() => { if (!cancelled) setBusy(false); });
+    return () => { cancelled = true; };
+  }, [activeBatchId, batch?.id, navigate, resetWorkbenchTransientState, restoringActiveBatch, route, setBrowserActiveBatch]);
 
   useEffect(() => {
     if (!needsCatalog) return undefined;
@@ -919,16 +1027,13 @@ export function App() {
   }, [catalogGroup, catalogPage, catalogQuery, needsCatalog]);
 
   useEffect(() => {
-    const requiresPolling = batch && (
-      ['QUEUED', 'RUNNING', 'COMMIT_PREPARED'].includes(batch.state)
-      || (batch.executionMode === 'remote' && ['BRANCH_PUSHED', 'PR_CREATING'].includes(batch.state))
-    );
+    const requiresPolling = Boolean(batch && activeBatchId === batch.id && batchStatus(batch) === 'processing');
     if (!requiresPolling || !batch) return undefined;
     const timer = window.setInterval(() => {
       void api.getBatch(batch.id).then(setBatch).catch((error: unknown) => setNotice(error instanceof Error ? error.message : '无法刷新批次状态。'));
     }, 1_500);
     return () => window.clearInterval(timer);
-  }, [batch]);
+  }, [activeBatchId, batch]);
 
   const selectAction = (nextAction: ItemAction) => {
     setAction(nextAction);
@@ -1124,6 +1229,7 @@ export function App() {
       };
       if (!currentBatch) {
         currentBatch = await api.createBatch({ ...metadata, submitter: { name: profile.name, email: profile.email } });
+        setBrowserActiveBatch(currentBatch.id);
         setBatch(currentBatch);
       } else {
         currentBatch = await api.updateBatch(currentBatch.id, metadata);
@@ -1156,7 +1262,7 @@ export function App() {
   };
 
   const retry = async () => {
-    if (!batch) return;
+    if (!batch || !viewingActiveBatch) return;
     setBusy(true);
     try {
       setBatch(await api.retryBatch(batch.id));
@@ -1170,7 +1276,7 @@ export function App() {
   };
 
   const returnToEdit = async () => {
-    if (!batch) return;
+    if (!batch || !viewingActiveBatch) return;
     setBusy(true);
     try {
       const restored = await api.returnToEdit(batch.id);
@@ -1187,7 +1293,7 @@ export function App() {
   };
 
   const confirmRepeatedSubmission = async () => {
-    if (!batch) return;
+    if (!batch || !viewingActiveBatch) return;
     setBusy(true);
     try {
       setBatch(await api.submitBatch(batch.id, true));
@@ -1208,47 +1314,39 @@ export function App() {
   };
 
   const startNewWorkbench = () => {
+    if (activeBatchId) {
+      setNotice('请先完成当前批次。');
+      navigate({ view: 'workbench' });
+      return;
+    }
     activeRestoreVersion.current += 1;
-    liveSvgDrafts.current.forEach(revokePreview);
-    liveSvgDrafts.current.clear();
+    resetWorkbenchTransientState();
     setBatch(undefined);
-    setActiveBatchId(undefined);
-    window.localStorage.removeItem(activeBatchStorageKey);
-    previousBatchState.current = undefined;
-    setPendingSvgs([]);
-    setActiveSvgId(undefined);
-    setChanges([]);
-    setTarget(undefined);
-    setReplacement(undefined);
-    setAddName('');
-    setAddDescription('');
-    setReplaceDescription('');
-    setDeleteReason('');
-    setChangeErrors({});
-    setBatchForm({ title: '', description: '', designUrl: '' });
-    setReviewOpen(false);
-    setReviewErrors({});
-    setConfirmed(false);
-    setRepeatedSubmissionConfirmation(false);
     setNotice(undefined);
-    setView('workbench');
+    navigate({ view: 'workbench' });
   };
 
   const openBatchWorkbench = async (batchId: string) => {
+    if (activeBatchId && activeBatchId !== batchId) {
+      setNotice('请先完成当前批次。');
+      return;
+    }
+    if (activeBatchId === batchId) {
+      navigate({ view: 'workbench' });
+      return;
+    }
     activeRestoreVersion.current += 1;
     setBusy(true);
     setNotice('正在打开批次…');
     try {
       const restored = await api.getBatch(batchId);
-      previousBatchState.current = restored.state;
+      resetWorkbenchTransientState();
       setBatch(restored);
-      setActiveBatchId(restored.id);
-      window.localStorage.setItem(activeBatchStorageKey, restored.id);
       setChanges(draftChangesFromBatch(restored));
       setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
       setRepeatedSubmissionConfirmation(false);
-      setView('workbench');
-      setNotice('已打开本次交付状态。');
+      navigate({ view: 'workbench', batchId: restored.id });
+      setNotice('正在查看历史批次。');
     } catch (error) {
       setNotice(error instanceof Error ? `无法打开批次：${error.message}` : '无法打开批次。');
     } finally {
@@ -1257,14 +1355,14 @@ export function App() {
   };
 
   const returnActiveBatchToEdit = async () => {
-    if (!batch) return;
-    setView('workbench');
+    if (!batch || !viewingActiveBatch) return;
+    navigate({ view: 'workbench' });
     await returnToEdit();
     void refreshBatchSummaries();
   };
 
   const returnHome = () => {
-    setView('home');
+    navigate({ view: 'home' });
     void refreshBatchSummaries();
   };
 
@@ -1275,14 +1373,14 @@ export function App() {
         {profile && <button className="profile-button" type="button" onClick={() => setIdentityOpen(true)} aria-label="修改设计师身份"><span className="avatar">{profile.name.slice(0, 1)}</span><span><strong>{profile.name}</strong><small>{profile.email}</small></span></button>}
       </header>
       {view === 'home' ? <HomePage
-        activeBatch={batch}
+        activeBatch={batch && activeBatchId === batch.id && isActiveBatch(batch) ? batch : undefined}
         restoringActiveBatch={restoringActiveBatch}
         summaries={batchSummaries}
         loading={batchSummariesLoading}
         error={batchSummariesError}
         notice={notice}
         onNew={startNewWorkbench}
-        onOpenActive={() => setView('workbench')}
+        onOpenActive={() => navigate({ view: 'workbench' })}
         onReturnToEdit={() => void returnActiveBatchToEdit()}
         onOpenSummary={(batchId) => void openBatchWorkbench(batchId)}
       /> : <main className="page-shell">
@@ -1291,12 +1389,15 @@ export function App() {
         {batch ? <DeliveryStatusCard
           batch={batch}
           busy={busy}
+          readOnly={!viewingActiveBatch}
           notice={notice}
           repeatedSubmissionConfirmation={repeatedSubmissionConfirmation}
           onReturnToEdit={() => void returnToEdit()}
           onRetry={() => void retry()}
           onConfirmRepeatedSubmission={() => void confirmRepeatedSubmission()}
         /> : notice && <p className="notice" aria-live="polite">{notice}</p>}
+
+        {batch && !viewingActiveBatch && <p className="notice" aria-live="polite">这是历史批次，仅供查看。</p>}
 
         <section className="composer-card" aria-labelledby="composer-title">
           <p className="eyebrow">正在编辑一项变更</p>

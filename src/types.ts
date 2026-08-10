@@ -107,10 +107,7 @@ export interface BatchDetails extends StoredBatch {
 export interface BatchSummary {
   id: string;
   title: string;
-  state: BatchState;
-  deliveryCheckpoint: DeliveryCheckpoint;
-  validationValid: boolean | null;
-  errorCode: string | null;
+  userStatus: UserBatchStatus;
   createdAt: string;
   itemCounts: {
     total: number;
@@ -119,6 +116,15 @@ export interface BatchSummary {
     delete: number;
   };
 }
+
+export type UserBatchStatus =
+  | 'draft'
+  | 'processing'
+  | 'needs_changes'
+  | 'delivery_retryable'
+  | 'developer_attention'
+  | 'submitted_review'
+  | 'local_complete';
 
 export interface AppConfig {
   databasePath: string;

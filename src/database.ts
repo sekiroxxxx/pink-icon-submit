@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import { AppError, sanitizeDiagnosticText } from './errors.js';
+import { userStatusForBatch } from './batch-lifecycle.js';
 import type {
   BatchExecutionContext,
   BatchDetails,
@@ -73,8 +74,17 @@ interface BatchSummaryRow {
   id: string;
   title: string;
   state: BatchState;
+  execution_mode: ExecutionMode | null;
   delivery_checkpoint: DeliveryCheckpoint;
+  delivery_branch: string | null;
+  delivery_commit_sha: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  pr_state: string | null;
+  pr_is_draft: number | null;
+  pr_created_at: string | null;
   validation_json: string | null;
+  base_commit: string | null;
   error_code: string | null;
   created_at: string;
   item_count: number;
@@ -231,10 +241,25 @@ function toBatchSummary(row: BatchSummaryRow): BatchSummary {
   return {
     id: row.id,
     title: row.title,
-    state: row.state,
-    deliveryCheckpoint: storedDeliveryCheckpoint(row.delivery_checkpoint),
-    validationValid: isObject(validation) && typeof validation.valid === 'boolean' ? validation.valid : null,
-    errorCode: row.error_code,
+    userStatus: userStatusForBatch({
+      state: row.state,
+      executionMode: storedExecutionMode(row.execution_mode),
+      baseCommit: row.base_commit,
+      validation,
+      errorCode: row.error_code,
+      delivery: {
+        checkpoint: storedDeliveryCheckpoint(row.delivery_checkpoint),
+        branch: row.delivery_branch,
+        commitSha: row.delivery_commit_sha,
+        pullRequest: row.pr_number === null ? null : {
+          number: row.pr_number,
+          url: row.pr_url ?? '',
+          state: row.pr_state ?? '',
+          isDraft: row.pr_is_draft === 1,
+          createdAt: row.pr_created_at,
+        },
+      },
+    }),
     createdAt: row.created_at,
     itemCounts: {
       total: row.item_count,
@@ -435,8 +460,17 @@ export class BatchDatabase {
         batches.id,
         batches.title,
         batches.state,
+        batches.execution_mode,
         batches.delivery_checkpoint,
+        batches.delivery_branch,
+        batches.delivery_commit_sha,
+        batches.pr_number,
+        batches.pr_url,
+        batches.pr_state,
+        batches.pr_is_draft,
+        batches.pr_created_at,
         batches.validation_json,
+        batches.base_commit,
         batches.error_code,
         batches.created_at,
         COUNT(items.id) AS item_count,

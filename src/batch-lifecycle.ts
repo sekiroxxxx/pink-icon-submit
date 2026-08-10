@@ -1,0 +1,92 @@
+import type { BatchState, DeliveryCheckpoint, ExecutionMode, RemoteDeliveryState, StoredBatch, UserBatchStatus } from './types.js';
+
+/**
+ * The user-facing lifecycle is intentionally derived from the existing
+ * recovery rules.  It does not add another persisted state machine.
+ */
+export interface BatchLifecycleSnapshot {
+  state: BatchState;
+  executionMode: ExecutionMode | null;
+  baseCommit: string | null;
+  validation: unknown | null;
+  errorCode: string | null;
+  delivery: Pick<RemoteDeliveryState, 'checkpoint' | 'branch' | 'commitSha' | 'pullRequest'>;
+}
+
+const postPushRetryableErrorCodes = new Set([
+  'GIT_COMMAND_FAILED',
+  'GITHUB_API_REQUEST_FAILED',
+  'GITHUB_API_RESPONSE_INVALID',
+  'WORKER_INTERRUPTED',
+]);
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validationIsInvalid(value: unknown): boolean {
+  return isObject(value) && value.valid === false;
+}
+
+export function isFinalValidationFailure(batch: Pick<BatchLifecycleSnapshot, 'state' | 'validation' | 'delivery'>): boolean {
+  return batch.state === 'FAILED'
+    && batch.delivery.checkpoint === 'NONE'
+    && validationIsInvalid(batch.validation);
+}
+
+export function hasPostPushPullRequestRecoveryEvidence(batch: Pick<BatchLifecycleSnapshot, 'executionMode' | 'baseCommit' | 'delivery'>): boolean {
+  return batch.executionMode === 'remote'
+    && Boolean(batch.baseCommit?.trim())
+    && Boolean(batch.delivery.branch?.trim())
+    && Boolean(batch.delivery.commitSha?.trim())
+    && batch.delivery.pullRequest === null;
+}
+
+export function isRetryablePostPushInfrastructureFailure(errorCode: string | null | undefined): boolean {
+  return errorCode !== null && errorCode !== undefined && postPushRetryableErrorCodes.has(errorCode);
+}
+
+export function canResumeDraftPullRequest(batch: BatchLifecycleSnapshot): boolean {
+  return batch.state === 'FAILED'
+    && (batch.delivery.checkpoint === 'BRANCH_PUSHED' || batch.delivery.checkpoint === 'PR_CREATING')
+    && isRetryablePostPushInfrastructureFailure(batch.errorCode)
+    && hasPostPushPullRequestRecoveryEvidence(batch);
+}
+
+export function canRetryBatch(batch: BatchLifecycleSnapshot): boolean {
+  if (batch.state !== 'FAILED') return false;
+  if (isFinalValidationFailure(batch)) return false;
+  if (batch.delivery.checkpoint === 'NONE' || batch.delivery.checkpoint === 'COMMIT_PREPARED') return true;
+  return canResumeDraftPullRequest(batch);
+}
+
+export function isActiveBatch(batch: BatchLifecycleSnapshot): boolean {
+  if (batch.state === 'DRAFT') return true;
+  if (batch.state !== 'FAILED' && batch.state !== 'PR_CREATED' && batch.state !== 'LOCAL_DIFF_READY') return true;
+  return isFinalValidationFailure(batch) || canRetryBatch(batch);
+}
+
+export function userStatusForBatch(batch: BatchLifecycleSnapshot): UserBatchStatus {
+  if (batch.state === 'PR_CREATED') return 'submitted_review';
+  if (batch.state === 'LOCAL_DIFF_READY') return 'local_complete';
+  if (batch.state === 'DRAFT') return 'draft';
+  if (batch.state !== 'FAILED') return 'processing';
+  if (isFinalValidationFailure(batch)) return 'needs_changes';
+  if (canRetryBatch(batch)) return 'delivery_retryable';
+  return 'developer_attention';
+}
+
+export function lifecycleSnapshot(batch: Pick<StoredBatch, 'state' | 'executionMode' | 'baseCommit' | 'validation' | 'error' | 'delivery'>): BatchLifecycleSnapshot {
+  return {
+    state: batch.state,
+    executionMode: batch.executionMode,
+    baseCommit: batch.baseCommit,
+    validation: batch.validation,
+    errorCode: batch.error?.code ?? null,
+    delivery: batch.delivery,
+  };
+}
+
+export function isPostPushCheckpoint(checkpoint: DeliveryCheckpoint): boolean {
+  return checkpoint === 'BRANCH_PUSHED' || checkpoint === 'PR_CREATING';
+}

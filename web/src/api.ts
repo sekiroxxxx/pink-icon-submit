@@ -69,10 +69,7 @@ export interface BatchDetails extends BatchInput {
 export interface BatchSummary {
   id: string;
   title: string;
-  state: BatchDetails['state'];
-  deliveryCheckpoint: BatchDetails['delivery']['checkpoint'];
-  validationValid: boolean | null;
-  errorCode: string | null;
+  userStatus: UserBatchStatus;
   createdAt: string;
   itemCounts: {
     total: number;
@@ -81,6 +78,15 @@ export interface BatchSummary {
     delete: number;
   };
 }
+
+export type UserBatchStatus =
+  | 'draft'
+  | 'processing'
+  | 'needs_changes'
+  | 'delivery_retryable'
+  | 'developer_attention'
+  | 'submitted_review'
+  | 'local_complete';
 
 export interface NamePreview {
   schemaVersion: 1;
