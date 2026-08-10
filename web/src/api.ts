@@ -47,6 +47,7 @@ export interface BatchDetails extends BatchInput {
   items: ApiItem[];
   validation: ValidationResult | null;
   warningsAcknowledged: boolean;
+  baseCommit: string | null;
   localDiff: { changedFiles: string[]; patch: string } | null;
   delivery: {
     checkpoint: 'NONE' | 'COMMIT_PREPARED' | 'BRANCH_PUSHED' | 'PR_CREATING' | 'PR_CREATED';

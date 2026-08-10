@@ -44,6 +44,7 @@ function batch(overrides: Partial<BatchDetails> = {}): BatchDetails {
     items: [],
     validation: null,
     warningsAcknowledged: false,
+    baseCommit: null,
     localDiff: null,
     delivery: delivery(),
     error: null,
@@ -363,6 +364,88 @@ test('an infrastructure failure offers a manual delivery retry without exposing 
 
   await screen.findByRole('heading', { name: '已提交' });
   expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-RETRY/retry', { method: 'POST' });
+});
+
+test('a refreshed pushed branch failure offers a Draft PR-only retry', async () => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-PR-RETRY');
+  const failed = batch({
+    id: 'ICON-PR-RETRY',
+    executionMode: 'remote',
+    state: 'FAILED',
+    baseCommit: 'b'.repeat(40),
+    delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: 'bot/ICON-PR-RETRY', commitSha: 'a'.repeat(40) }),
+    error: { code: 'GIT_COMMAND_FAILED', message: 'Target fetch failed before Draft PR creation.' },
+  });
+  const queued = batch({ id: failed.id, executionMode: 'remote', state: 'QUEUED', delivery: failed.delivery });
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches/ICON-PR-RETRY') return Promise.resolve(jsonResponse(failed));
+    if (path === '/api/batches/ICON-PR-RETRY/retry') return Promise.resolve(jsonResponse(queued));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  await screen.findByRole('heading', { name: '分支已推送，Draft PR 创建失败' });
+  expect(screen.getByText('图标变更已安全推送。你可以仅重新尝试创建 Draft PR，不会重新提交图标变更。')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '重新尝试交付' })).toBeNull();
+  await user.click(screen.getByRole('button', { name: '重新尝试创建 Draft PR' }));
+
+  await screen.findByRole('heading', { name: '已提交' });
+  expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-PR-RETRY/retry', { method: 'POST' });
+});
+
+test.each([
+  'FINAL_VALIDATION_FAILED',
+  'TARGET_BASE_ADVANCED',
+  'PR_BRANCH_ALREADY_EXISTS',
+  'REMOTE_BRANCH_DIVERGED',
+  'WORKER_UNEXPECTED',
+])('a refreshed non-recoverable post-push failure %s requires developer handling', async (errorCode) => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', `ICON-NO-RETRY-${errorCode}`);
+  const failed = batch({
+    id: `ICON-NO-RETRY-${errorCode}`,
+    executionMode: 'remote',
+    state: 'FAILED',
+    baseCommit: 'b'.repeat(40),
+    delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: `bot/ICON-NO-RETRY-${errorCode}`, commitSha: 'a'.repeat(40) }),
+    error: { code: errorCode, message: `Non-recoverable ${errorCode}.` },
+  });
+  const fetchMock = vi.fn().mockResolvedValue(jsonResponse(failed));
+  vi.stubGlobal('fetch', fetchMock);
+
+  render(<App />);
+
+  await screen.findByRole('heading', { name: 'Draft PR 创建无法自动恢复' });
+  expect(screen.getByText('当前交付状态需要开发处理；平台不会重新提交图标变更。')).toBeTruthy();
+  expect(screen.getByText(errorCode)).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '重新尝试创建 Draft PR' })).toBeNull();
+  expect(screen.queryByRole('button', { name: '重新尝试交付' })).toBeNull();
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test('a refreshed post-push failure with missing recovery evidence requires developer handling', async () => {
+  saveProfile();
+  window.localStorage.setItem('pink-icon-submit.active-batch.v1', 'ICON-NO-EVIDENCE');
+  const failed = batch({
+    id: 'ICON-NO-EVIDENCE',
+    executionMode: 'remote',
+    state: 'FAILED',
+    baseCommit: null,
+    delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: 'bot/ICON-NO-EVIDENCE', commitSha: 'a'.repeat(40) }),
+    error: { code: 'GIT_COMMAND_FAILED', message: 'Target fetch failed before Draft PR creation.' },
+  });
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(failed)));
+
+  render(<App />);
+
+  await screen.findByRole('heading', { name: 'Draft PR 创建无法自动恢复' });
+  expect(screen.getByText('当前交付状态需要开发处理；平台不会重新提交图标变更。')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '重新尝试创建 Draft PR' })).toBeNull();
+  expect(screen.queryByRole('button', { name: '重新尝试交付' })).toBeNull();
 });
 
 test('unchanged final-validation failures need an explicit confirmation before resubmission', async () => {

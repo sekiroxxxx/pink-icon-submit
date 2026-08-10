@@ -497,6 +497,18 @@ function isFinalValidationFailure(batch: BatchDetails): boolean {
     && batch.validation?.valid === false;
 }
 
+function canResumeDraftPullRequest(batch: BatchDetails): boolean {
+  return batch.state === 'FAILED'
+    && batch.executionMode === 'remote'
+    && (batch.delivery.checkpoint === 'BRANCH_PUSHED' || batch.delivery.checkpoint === 'PR_CREATING')
+    && batch.error !== null
+    && ['GIT_COMMAND_FAILED', 'GITHUB_API_REQUEST_FAILED', 'GITHUB_API_RESPONSE_INVALID', 'WORKER_INTERRUPTED'].includes(batch.error.code)
+    && Boolean(batch.baseCommit?.trim())
+    && Boolean(batch.delivery.branch?.trim())
+    && Boolean(batch.delivery.commitSha?.trim())
+    && batch.delivery.pullRequest === null;
+}
+
 function DeliveryStatusCard({
   batch,
   busy,
@@ -515,6 +527,9 @@ function DeliveryStatusCard({
   onConfirmRepeatedSubmission: () => void;
 }) {
   const finalValidationFailure = isFinalValidationFailure(batch);
+  const draftPullRequestRecoveryFailure = batch.state === 'FAILED'
+    && (batch.delivery.checkpoint === 'BRANCH_PUSHED' || batch.delivery.checkpoint === 'PR_CREATING');
+  const canResumeDraftPr = canResumeDraftPullRequest(batch);
   const localResult = batch.state === 'LOCAL_DIFF_READY'
     && (batch.executionMode === 'local' || batch.executionMode === null);
   const draftPr = batch.delivery.pullRequest;
@@ -532,6 +547,12 @@ function DeliveryStatusCard({
   } else if (finalValidationFailure) {
     headline = '需要修改';
     description = '最终校验发现需要修正的问题。返回编辑后修改内容，再次确认提交。';
+  } else if (canResumeDraftPr) {
+    headline = '分支已推送，Draft PR 创建失败';
+    description = '图标变更已安全推送。你可以仅重新尝试创建 Draft PR，不会重新提交图标变更。';
+  } else if (draftPullRequestRecoveryFailure) {
+    headline = 'Draft PR 创建无法自动恢复';
+    description = '当前交付状态需要开发处理；平台不会重新提交图标变更。';
   } else if (batch.state === 'FAILED') {
     headline = '交付失败';
     description = '本次交付没有完成。请在确认技术问题后，手动重新尝试交付。';
@@ -561,7 +582,7 @@ function DeliveryStatusCard({
         <details><summary>技术详情</summary><p>规则：<code>{batch.error.code}</code></p><p>{batch.error.message}</p></details>
       )}
       {finalValidationFailure && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onReturnToEdit}>返回编辑并修正</button></div>}
-      {batch.state === 'FAILED' && !finalValidationFailure && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onRetry}>重新尝试交付</button></div>}
+      {batch.state === 'FAILED' && !finalValidationFailure && (!draftPullRequestRecoveryFailure || canResumeDraftPr) && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onRetry}>{canResumeDraftPr ? '重新尝试创建 Draft PR' : '重新尝试交付'}</button></div>}
       {repeatedSubmissionConfirmation && batch.state === 'DRAFT' && (
         <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onConfirmRepeatedSubmission}>仍要按原内容再次提交</button></div>
       )}
