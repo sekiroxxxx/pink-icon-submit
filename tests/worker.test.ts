@@ -6,6 +6,14 @@ import test from 'node:test';
 import { LocalDiffWorker } from '../src/worker.js';
 import { createTestEnvironment } from './helpers.js';
 
+async function hasNoLegacyTemporaryEntries(path: string): Promise<boolean> {
+  try {
+    return (await readdir(path)).length === 0;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+}
+
 test('worker replans against a temporary target worktree and stores the allowed local diff', async (t) => {
   const environment = await createTestEnvironment(t);
   const batch = await environment.batches.createBatch({
@@ -87,7 +95,7 @@ test('local worker stops a final Stage 1 business failure at checkpoint NONE bef
   assert.equal(failed.error?.code, 'FINAL_VALIDATION_FAILED');
   assert.equal(failed.job?.state, 'FAILED');
   assert.equal(execFileSync('git', ['-C', environment.config.repositoryPath, 'rev-parse', 'main'], { encoding: 'utf8' }).trim(), targetHead);
-  assert.deepEqual(await readdir(environment.config.temporaryRoot), []);
+  assert.equal(await hasNoLegacyTemporaryEntries(environment.config.temporaryRoot), true);
 });
 
 test('worker rejects an out-of-plan diff and removes its temporary worktree', async (t) => {
@@ -112,5 +120,5 @@ test('worker rejects an out-of-plan diff and removes its temporary worktree', as
   assert.equal(failed.state, 'FAILED');
   assert.equal(failed.error?.code, 'DIFF_ALLOWLIST_VIOLATION');
   assert.equal(failed.job?.state, 'FAILED');
-  assert.deepEqual(await readdir(environment.config.temporaryRoot), []);
+  assert.equal(await hasNoLegacyTemporaryEntries(environment.config.temporaryRoot), true);
 });

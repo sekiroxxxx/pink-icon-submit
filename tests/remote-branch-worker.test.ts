@@ -14,6 +14,14 @@ function remoteHead(repositoryPath: string, branch: string): string {
   return execFileSync('git', [`--git-dir=${repositoryPath}`, 'rev-parse', `refs/heads/${branch}`], { encoding: 'utf8' }).trim();
 }
 
+async function hasNoLegacyTemporaryEntries(path: string): Promise<boolean> {
+  try {
+    return (await readdir(path)).length === 0;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+}
+
 async function advanceTargetMain(environment: TestEnvironment): Promise<string> {
   const targetRepositoryPath = execFileSync('git', [
     '-C', environment.config.repositoryPath,
@@ -145,7 +153,7 @@ test('remote worker creates one Draft PR only while the target base remains curr
   assert.match(github.created[0]?.body ?? '', new RegExp(`<!-- pink-icon-submit:batch=${batchId} -->`));
   assert.match(github.created[0]?.body ?? '', /平台不再 push 或修改该分支/);
   assert.throws(() => environment.batches.retry(batchId), /PR_CREATED/);
-  assert.deepEqual(await readdir(environment.config.temporaryRoot), []);
+  assert.equal(await hasNoLegacyTemporaryEntries(environment.config.temporaryRoot), true);
   assert.equal(remoteHead(environment.pushRepositoryPath!, 'main'), environment.config.targetRepository.branch === 'main'
     ? execFileSync('git', ['-C', environment.config.repositoryPath, 'rev-parse', 'upstream/main'], { encoding: 'utf8' }).trim()
     : '');
