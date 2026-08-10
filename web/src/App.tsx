@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, ApiError, type ApiItem, type BatchDetails, type CatalogGroup, type CatalogPageIcon, type Diagnostic, type ItemAction, type ItemInput, type Submitter } from './api';
+import { api, ApiError, type ApiItem, type BatchDetails, type BatchSummary, type CatalogGroup, type CatalogPageIcon, type Diagnostic, type ItemAction, type ItemInput, type Submitter } from './api';
 import { displayDiagnostic } from './diagnostics';
 
 interface DesignerProfile extends Submitter {
@@ -39,6 +39,8 @@ interface TargetUse {
 }
 
 type FieldErrors = Record<string, string>;
+type AppView = 'home' | 'workbench';
+type UserBatchStatus = '草稿' | '处理中' | '需要修改' | '交付暂时失败' | '需要开发处理' | '已提交开发审核' | '本地预览已完成';
 
 const identityStorageKey = 'pink-icon-submit.designer-profile.v1';
 const activeBatchStorageKey = 'pink-icon-submit.active-batch.v1';
@@ -509,6 +511,145 @@ function canResumeDraftPullRequest(batch: BatchDetails): boolean {
     && batch.delivery.pullRequest === null;
 }
 
+const retryableDraftPullRequestErrorCodes = new Set([
+  'GIT_COMMAND_FAILED',
+  'GITHUB_API_REQUEST_FAILED',
+  'GITHUB_API_RESPONSE_INVALID',
+  'WORKER_INTERRUPTED',
+]);
+
+function userBatchStatus(input: {
+  state: BatchDetails['state'];
+  deliveryCheckpoint: BatchDetails['delivery']['checkpoint'];
+  validationValid: boolean | null;
+  errorCode: string | null;
+}): UserBatchStatus {
+  if (input.state === 'PR_CREATED') return '已提交开发审核';
+  if (input.state === 'LOCAL_DIFF_READY') return '本地预览已完成';
+  if (input.state === 'DRAFT') return '草稿';
+  if (input.state !== 'FAILED') return '处理中';
+  if (input.deliveryCheckpoint === 'NONE' && input.validationValid === false) return '需要修改';
+  if (input.deliveryCheckpoint === 'BRANCH_PUSHED' || input.deliveryCheckpoint === 'PR_CREATING') {
+    return input.errorCode && retryableDraftPullRequestErrorCodes.has(input.errorCode)
+      ? '交付暂时失败'
+      : '需要开发处理';
+  }
+  return '交付暂时失败';
+}
+
+function batchStatus(batch: BatchDetails): UserBatchStatus {
+  return userBatchStatus({
+    state: batch.state,
+    deliveryCheckpoint: batch.delivery.checkpoint,
+    validationValid: batch.validation?.valid ?? null,
+    errorCode: batch.error?.code ?? null,
+  });
+}
+
+function summaryStatus(batch: BatchSummary): UserBatchStatus {
+  return userBatchStatus(batch);
+}
+
+function statusTone(status: UserBatchStatus): 'draft' | 'processing' | 'warning' | 'danger' | 'success' {
+  if (status === '草稿') return 'draft';
+  if (status === '处理中') return 'processing';
+  if (status === '需要修改' || status === '交付暂时失败') return 'warning';
+  if (status === '需要开发处理') return 'danger';
+  return 'success';
+}
+
+function formatBatchTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat('zh-CN', {
+    month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(date);
+}
+
+function itemCountSummary(counts: BatchSummary['itemCounts']): string {
+  const pieces = [
+    counts.add ? `新增 ${counts.add}` : '',
+    counts.replace ? `替换 ${counts.replace}` : '',
+    counts.delete ? `删除 ${counts.delete}` : '',
+  ].filter(Boolean);
+  return pieces.length > 0 ? pieces.join(' · ') : '尚未添加变更';
+}
+
+function HomePage({
+  activeBatch,
+  restoringActiveBatch,
+  summaries,
+  loading,
+  error,
+  notice,
+  onNew,
+  onOpenActive,
+  onReturnToEdit,
+  onOpenSummary,
+}: {
+  activeBatch?: BatchDetails;
+  restoringActiveBatch: boolean;
+  summaries: BatchSummary[];
+  loading: boolean;
+  error?: string;
+  notice?: string;
+  onNew: () => void;
+  onOpenActive: () => void;
+  onReturnToEdit: () => void;
+  onOpenSummary: (batchId: string) => void;
+}) {
+  const activeStatus = activeBatch ? batchStatus(activeBatch) : undefined;
+  const activeAction = !activeBatch
+    ? { label: '新建图标变更', onClick: onNew }
+    : activeStatus === '草稿'
+      ? { label: '继续编辑', onClick: onOpenActive }
+      : activeStatus === '需要修改'
+        ? { label: '返回修改', onClick: onReturnToEdit }
+        : activeStatus === '处理中'
+          ? { label: '查看处理中', onClick: onOpenActive }
+          : { label: '查看交付结果', onClick: onOpenActive };
+
+  return (
+    <main className="page-shell home-page">
+      <header className="page-header"><p className="eyebrow">PinK 图标设计交付</p><h1>把图标设计交给开发审核</h1><p>新建一次图标变更，或回到当前批次继续处理。</p></header>
+      {notice && <p className="notice app-toast" role="status">{notice}</p>}
+      <section className="home-hero" aria-labelledby="home-entry-title">
+        <div><p className="eyebrow">开始一项新工作</p><h2 id="home-entry-title">创建图标变更</h2><p>在工作台中新增、替换或删除图标；确认提交后会进入最终校验和开发审核流程。</p></div>
+        <button className="button primary" type="button" onClick={onNew}>新建图标变更</button>
+      </section>
+      <section className="active-batch-card" aria-labelledby="active-batch-title">
+        <div>
+          <p className="eyebrow">当前浏览器的活动批次</p>
+          <h2 id="active-batch-title">{restoringActiveBatch ? '正在恢复本次交付' : activeBatch?.title ?? '暂时没有活动批次'}</h2>
+          {restoringActiveBatch
+            ? <p>正在读取上次在此浏览器处理的批次。</p>
+            : activeBatch
+              ? <p>{itemCountSummary({
+                total: activeBatch.items.length,
+                add: activeBatch.items.filter((item) => item.action === 'add').length,
+                replace: activeBatch.items.filter((item) => item.action === 'replace').length,
+                delete: activeBatch.items.filter((item) => item.action === 'delete').length,
+              })} · 创建于 {formatBatchTime(activeBatch.createdAt)}</p>
+              : <p>新建后会在这个浏览器中保留一个当前工作台。</p>}
+        </div>
+        {activeBatch && activeStatus && <div className="active-batch-actions"><span className={`status-pill ${statusTone(activeStatus)}`}>{activeStatus}</span><button className="button secondary" type="button" onClick={activeAction.onClick}>{activeAction.label}</button></div>}
+      </section>
+      <section className="history-card" aria-labelledby="history-title">
+        <div className="history-heading"><div><p className="eyebrow">最近记录</p><h2 id="history-title">最近 20 条批次</h2></div><span>当前为同一部署的内部数据，不按设计师账号隔离。</span></div>
+        {loading && <p className="history-empty">正在读取最近批次…</p>}
+        {error && <p className="inline-error">{error}</p>}
+        {!loading && !error && summaries.length === 0 && <p className="history-empty">还没有提交记录。创建第一个图标变更吧。</p>}
+        {!loading && summaries.length > 0 && <ul className="history-list">{summaries.map((summary) => {
+          const status = summaryStatus(summary);
+          return <li key={summary.id}>
+            <div><strong>{summary.title}</strong><span>{formatBatchTime(summary.createdAt)} · {itemCountSummary(summary.itemCounts)}</span></div>
+            <div className="history-actions"><span className={`status-pill ${statusTone(status)}`}>{status}</span><button className="button secondary" type="button" onClick={() => onOpenSummary(summary.id)}>查看</button></div>
+          </li>;
+        })}</ul>}
+      </section>
+    </main>
+  );
+}
+
 function DeliveryStatusCard({
   batch,
   busy,
@@ -576,7 +717,7 @@ function DeliveryStatusCard({
       <h2>{headline}</h2>
       <p>{description}</p>
       {notice && <p className="notice delivery-notice">{notice}</p>}
-      {draftPr && <p><a href={draftPr.url} target="_blank" rel="noreferrer">打开 Draft PR #{draftPr.number}</a></p>}
+      {draftPr && <p><a className="secondary-link" href={draftPr.url} target="_blank" rel="noreferrer">打开开发审核记录</a></p>}
       {localResult && batch.localDiff && <details><summary>查看技术详情</summary><ul>{batch.localDiff.changedFiles.map((file) => <li key={file}>{file}</li>)}</ul></details>}
       {batch.state === 'FAILED' && !finalValidationFailure && batch.error && (
         <details><summary>技术详情</summary><p>规则：<code>{batch.error.code}</code></p><p>{batch.error.message}</p></details>
@@ -633,6 +774,7 @@ function ReviewDrawer({
 export function App() {
   const [profile, setProfile] = useState<DesignerProfile | undefined>(() => readProfile());
   const [identityOpen, setIdentityOpen] = useState(() => !readProfile());
+  const [view, setView] = useState<AppView>('home');
   const [action, setAction] = useState<ItemAction>('add');
   const [pendingSvgs, setPendingSvgs] = useState<SvgDraft[]>([]);
   const [activeSvgId, setActiveSvgId] = useState<string>();
@@ -653,6 +795,11 @@ export function App() {
   const [catalogSelection, setCatalogSelection] = useState<'target' | 'replacement'>('target');
   const [catalogOpen, setCatalogOpen] = useState(false);
   const [batch, setBatch] = useState<BatchDetails>();
+  const [activeBatchId, setActiveBatchId] = useState<string | undefined>(() => window.localStorage.getItem(activeBatchStorageKey) ?? undefined);
+  const [restoringActiveBatch, setRestoringActiveBatch] = useState(() => Boolean(window.localStorage.getItem(activeBatchStorageKey)));
+  const [batchSummaries, setBatchSummaries] = useState<BatchSummary[]>([]);
+  const [batchSummariesLoading, setBatchSummariesLoading] = useState(false);
+  const [batchSummariesError, setBatchSummariesError] = useState<string>();
   const [batchForm, setBatchForm] = useState({ title: '', description: '', designUrl: '' });
   const [reviewOpen, setReviewOpen] = useState(false);
   const [reviewErrors, setReviewErrors] = useState<FieldErrors>({});
@@ -661,6 +808,20 @@ export function App() {
   const [notice, setNotice] = useState<string>();
   const [repeatedSubmissionConfirmation, setRepeatedSubmissionConfirmation] = useState(false);
   const liveSvgDrafts = useRef(new Map<string, SvgDraft>());
+  const previousBatchState = useRef<BatchDetails['state'] | undefined>(undefined);
+  const activeRestoreVersion = useRef(0);
+
+  const refreshBatchSummaries = useCallback(async () => {
+    setBatchSummariesLoading(true);
+    setBatchSummariesError(undefined);
+    try {
+      setBatchSummaries(await api.getBatches());
+    } catch (error) {
+      setBatchSummariesError(error instanceof Error ? `无法读取最近批次：${error.message}` : '无法读取最近批次。');
+    } finally {
+      setBatchSummariesLoading(false);
+    }
+  }, []);
 
   const editable = !batch || batch.state === 'DRAFT';
   const needsCatalog = catalogOpen && editable && (action === 'replace' || action === 'delete');
@@ -693,26 +854,55 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const batchId = window.localStorage.getItem(activeBatchStorageKey);
-    if (!batchId) return undefined;
+    const batchId = activeBatchId;
+    if (!batchId) {
+      setRestoringActiveBatch(false);
+      return undefined;
+    }
     let cancelled = false;
+    const restoreVersion = activeRestoreVersion.current + 1;
+    activeRestoreVersion.current = restoreVersion;
     void api.getBatch(batchId)
       .then((restored) => {
-        if (cancelled) return;
+        if (cancelled || activeRestoreVersion.current !== restoreVersion) return;
         setBatch(restored);
         setChanges(draftChangesFromBatch(restored));
         setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
         setNotice('已恢复本次交付状态。');
+        setRestoringActiveBatch(false);
       })
       .catch(() => {
-        if (!cancelled) window.localStorage.removeItem(activeBatchStorageKey);
+        if (!cancelled && activeRestoreVersion.current === restoreVersion) {
+          window.localStorage.removeItem(activeBatchStorageKey);
+          setActiveBatchId(undefined);
+          setRestoringActiveBatch(false);
+        }
       });
     return () => { cancelled = true; };
+  // Only the browser-restored ID should initiate this recovery request.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    if (batch) window.localStorage.setItem(activeBatchStorageKey, batch.id);
+    if (batch) {
+      window.localStorage.setItem(activeBatchStorageKey, batch.id);
+      setActiveBatchId(batch.id);
+    }
   }, [batch]);
+
+  useEffect(() => {
+    void refreshBatchSummaries();
+  }, [refreshBatchSummaries]);
+
+  useEffect(() => {
+    const previous = previousBatchState.current;
+    previousBatchState.current = batch?.state;
+    if (view === 'workbench' && previous && previous !== 'PR_CREATED' && batch?.state === 'PR_CREATED') {
+      setView('home');
+      setNotice('已提交开发审核。');
+      void refreshBatchSummaries();
+    }
+  }, [batch?.state, refreshBatchSummaries, view]);
 
   useEffect(() => {
     if (!needsCatalog) return undefined;
@@ -942,6 +1132,7 @@ export function App() {
       const saved = await syncChanges(currentBatch.id);
       setChanges(saved);
       setBatch(await api.submitBatch(currentBatch.id));
+      void refreshBatchSummaries();
     } catch (error) {
       if (currentBatch) {
         try {
@@ -970,6 +1161,7 @@ export function App() {
     try {
       setBatch(await api.retryBatch(batch.id));
       setNotice('已重新安排本次交付。');
+      void refreshBatchSummaries();
     } catch (error) {
       setNotice(error instanceof Error ? `无法重新尝试交付：${error.message}` : '无法重新尝试交付。');
     } finally {
@@ -986,6 +1178,7 @@ export function App() {
       setChanges(draftChangesFromBatch(restored));
       setRepeatedSubmissionConfirmation(false);
       setNotice('已返回编辑。请修正内容后再次确认提交。');
+      void refreshBatchSummaries();
     } catch (error) {
       setNotice(error instanceof Error ? `无法返回编辑：${error.message}` : '无法返回编辑。');
     } finally {
@@ -1000,6 +1193,7 @@ export function App() {
       setBatch(await api.submitBatch(batch.id, true));
       setRepeatedSubmissionConfirmation(false);
       setNotice('已按原内容再次提交，正在等待最终校验。');
+      void refreshBatchSummaries();
     } catch (error) {
       setNotice(error instanceof Error ? `提交未完成：${error.message}` : '提交未完成，请稍后重试。');
     } finally {
@@ -1013,13 +1207,85 @@ export function App() {
     setIdentityOpen(false);
   };
 
+  const startNewWorkbench = () => {
+    activeRestoreVersion.current += 1;
+    liveSvgDrafts.current.forEach(revokePreview);
+    liveSvgDrafts.current.clear();
+    setBatch(undefined);
+    setActiveBatchId(undefined);
+    window.localStorage.removeItem(activeBatchStorageKey);
+    previousBatchState.current = undefined;
+    setPendingSvgs([]);
+    setActiveSvgId(undefined);
+    setChanges([]);
+    setTarget(undefined);
+    setReplacement(undefined);
+    setAddName('');
+    setAddDescription('');
+    setReplaceDescription('');
+    setDeleteReason('');
+    setChangeErrors({});
+    setBatchForm({ title: '', description: '', designUrl: '' });
+    setReviewOpen(false);
+    setReviewErrors({});
+    setConfirmed(false);
+    setRepeatedSubmissionConfirmation(false);
+    setNotice(undefined);
+    setView('workbench');
+  };
+
+  const openBatchWorkbench = async (batchId: string) => {
+    activeRestoreVersion.current += 1;
+    setBusy(true);
+    setNotice('正在打开批次…');
+    try {
+      const restored = await api.getBatch(batchId);
+      previousBatchState.current = restored.state;
+      setBatch(restored);
+      setActiveBatchId(restored.id);
+      window.localStorage.setItem(activeBatchStorageKey, restored.id);
+      setChanges(draftChangesFromBatch(restored));
+      setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
+      setRepeatedSubmissionConfirmation(false);
+      setView('workbench');
+      setNotice('已打开本次交付状态。');
+    } catch (error) {
+      setNotice(error instanceof Error ? `无法打开批次：${error.message}` : '无法打开批次。');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const returnActiveBatchToEdit = async () => {
+    if (!batch) return;
+    setView('workbench');
+    await returnToEdit();
+    void refreshBatchSummaries();
+  };
+
+  const returnHome = () => {
+    setView('home');
+    void refreshBatchSummaries();
+  };
+
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand"><img className="brand-logo" src="/pink-icon.svg" alt="" /><span>PinK 图标工作台</span></div>
+        <button className="brand brand-button" type="button" onClick={returnHome} aria-label="返回首页"><img className="brand-logo" src="/pink-icon.svg" alt="" /><span>PinK 图标工作台</span></button>
         {profile && <button className="profile-button" type="button" onClick={() => setIdentityOpen(true)} aria-label="修改设计师身份"><span className="avatar">{profile.name.slice(0, 1)}</span><span><strong>{profile.name}</strong><small>{profile.email}</small></span></button>}
       </header>
-      <main className="page-shell">
+      {view === 'home' ? <HomePage
+        activeBatch={batch}
+        restoringActiveBatch={restoringActiveBatch}
+        summaries={batchSummaries}
+        loading={batchSummariesLoading}
+        error={batchSummariesError}
+        notice={notice}
+        onNew={startNewWorkbench}
+        onOpenActive={() => setView('workbench')}
+        onReturnToEdit={() => void returnActiveBatchToEdit()}
+        onOpenSummary={(batchId) => void openBatchWorkbench(batchId)}
+      /> : <main className="page-shell">
         <header className="page-header"><h1>完成设计，交给开发</h1><p>选择现有图标或拖入新的 SVG，把本次设计变更一次提交给开发审核。</p></header>
 
         {batch ? <DeliveryStatusCard
@@ -1074,7 +1340,7 @@ export function App() {
         <section className="changes-card" aria-label="本次变更"><div><h2>本次变更 {changes.length} 项</h2><p>{changes.length === 0 ? '把一项操作加入队列后，会在这里同时显示所有待改动图标。' : '确认前可移除任何一项变更。'}</p></div><div className="change-list">{changes.map((change) => <ChangeCard key={change.clientId} change={change} disabled={!editable || busy} onRemove={() => void removeChange(change)} />)}</div><div className="changes-actions"><button className="button primary" type="button" disabled={!editable || busy || changes.length === 0} onClick={() => { setReviewErrors({}); setReviewOpen(true); }}>确认本次变更</button></div></section>
 
         {batch && isFinalValidationFailure(batch) && <DiagnosticList title="需要修正的问题" diagnostics={batch.validation?.errors ?? []} tone="error" items={batch.items} />}
-      </main>
+      </main>}
       {identityOpen && <IdentityDialog profile={profile} onSave={saveProfile} onClose={profile ? () => setIdentityOpen(false) : undefined} />}
       {reviewOpen && profile && <ReviewDrawer changes={changes} form={batchForm} profile={profile} errors={reviewErrors} confirmed={confirmed} busy={busy} onChange={updateBatchMetadata} onConfirmedChange={setConfirmed} onClose={() => setReviewOpen(false)} onSubmit={() => void submitReview()} />}
     </div>

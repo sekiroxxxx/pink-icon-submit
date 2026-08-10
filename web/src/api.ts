@@ -63,6 +63,23 @@ export interface BatchDetails extends BatchInput {
     handoffAt: string | null;
   };
   error: { code: string; message: string } | null;
+  createdAt: string;
+}
+
+export interface BatchSummary {
+  id: string;
+  title: string;
+  state: BatchDetails['state'];
+  deliveryCheckpoint: BatchDetails['delivery']['checkpoint'];
+  validationValid: boolean | null;
+  errorCode: string | null;
+  createdAt: string;
+  itemCounts: {
+    total: number;
+    add: number;
+    replace: number;
+    delete: number;
+  };
 }
 
 export interface NamePreview {
@@ -177,4 +194,5 @@ export const api = {
   returnToEdit: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/return-to-edit`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
+  getBatches: () => request<BatchSummary[]>('/api/batches?limit=20'),
 };
