@@ -67,15 +67,14 @@ function isRetryablePostPushInfrastructureFailure(errorCode: string | undefined)
     'GITHUB_API_REQUEST_FAILED',
     'GITHUB_API_RESPONSE_INVALID',
     'WORKER_INTERRUPTED',
-    'WORKER_UNEXPECTED',
   ].includes(errorCode);
 }
 
 function hasPostPushPullRequestRecoveryEvidence(batch: Pick<StoredBatch, 'executionMode' | 'baseCommit' | 'delivery'>): boolean {
   return batch.executionMode === 'remote'
-    && batch.baseCommit !== null
-    && batch.delivery.branch !== null
-    && batch.delivery.commitSha !== null;
+    && Boolean(batch.baseCommit?.trim())
+    && Boolean(batch.delivery.branch?.trim())
+    && Boolean(batch.delivery.commitSha?.trim());
 }
 
 function baseCommitFrom(value: unknown): string | null {
