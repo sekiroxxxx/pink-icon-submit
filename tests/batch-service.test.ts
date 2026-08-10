@@ -6,6 +6,7 @@ import test from 'node:test';
 import { BatchService } from '../src/batch-service.js';
 import { catalogOptionsFromConfig } from '../src/config.js';
 import { IconBatchCli } from '../src/icon-batch-cli.js';
+import { LocalDiffWorker } from '../src/worker.js';
 import type { IconBatchResult } from '../src/types.js';
 import { createTestEnvironment } from './helpers.js';
 
@@ -112,6 +113,87 @@ test('validation makes the batch immutable until it completes and rejects queued
   await assert.rejects(batches.validateBatch(batchId), { code: 'BATCH_NOT_VALIDATABLE' });
 });
 
+test('DRAFT submission validates only local input requirements and does not require compatibility validation', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const batch = await environment.batches.createBatch({
+    title: 'Queue from draft',
+    description: 'Final validation belongs to the Worker.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  await environment.batches.addItem(batch.id, {
+    action: 'add',
+    designName: 'draft-queue-icon',
+    description: 'Queues without a compatibility validation request.',
+  }, Buffer.from(environment.validSvg));
+
+  const queued = environment.batches.submit(batch.id);
+  assert.equal(queued.state, 'QUEUED');
+  assert.equal(queued.validation, null);
+  assert.equal(queued.designUrl, undefined);
+
+  const requestPath = await environment.batches.writeRequest(batch.id);
+  const request = JSON.parse(await readFile(requestPath, 'utf8')) as Record<string, unknown>;
+  assert.equal(Object.hasOwn(request, 'designUrl'), false);
+});
+
+test('a final validation failure at checkpoint NONE returns to editing and requires confirmation only when unchanged', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const batch = await environment.batches.createBatch({
+    title: 'Correct final validation',
+    description: 'Preserve the designer input after a business failure.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  const item = await environment.batches.addItem(batch.id, {
+    action: 'add',
+    designName: 'final-validation-failure',
+    description: 'Fails only in final Stage 1 validation.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(batch.id);
+  await new LocalDiffWorker(environment.batches).processNext();
+  const failed = environment.batches.getBatch(batch.id);
+  assert.equal(failed.state, 'FAILED');
+  assert.equal(failed.delivery.checkpoint, 'NONE');
+  assert.equal(failed.validation !== null, true);
+
+  const draft = environment.batches.returnToEdit(batch.id);
+  assert.equal(draft.state, 'DRAFT');
+  assert.equal(draft.items[0]?.id, item.id);
+  assert.equal(draft.items[0]?.sourceFile, item.sourceFile);
+  assert.equal(draft.validation, null);
+  assert.equal(draft.plan, null);
+  assert.equal(draft.baseCommit, null);
+  assert.equal(draft.localDiff, null);
+  assert.equal(draft.error, null);
+  assert.throws(() => environment.batches.submit(batch.id), {
+    code: 'REPEATED_SUBMISSION_CONFIRMATION_REQUIRED',
+  });
+  assert.equal(environment.batches.submit(batch.id, true).state, 'QUEUED');
+});
+
+test('editing after a final validation failure permits a normal DRAFT resubmission', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const batch = await environment.batches.createBatch({
+    title: 'Edit after final validation',
+    description: 'A real edit removes the unchanged resubmission confirmation.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  const item = await environment.batches.addItem(batch.id, {
+    action: 'add',
+    designName: 'final-validation-failure',
+    description: 'Will be corrected before resubmission.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(batch.id);
+  await new LocalDiffWorker(environment.batches).processNext();
+  environment.batches.returnToEdit(batch.id);
+
+  await environment.batches.updateItem(batch.id, item.id, {
+    action: 'add',
+    designName: 'corrected-final-validation-icon',
+    description: 'Changed designer input.',
+  }, undefined);
+  assert.equal(environment.batches.submit(batch.id).state, 'QUEUED');
+});
+
 test('interrupted RUNNING jobs become retryable failures on startup recovery', async (t) => {
   const environment = await createTestEnvironment(t);
   const batchId = await createBatch(environment.batches);
@@ -137,6 +219,29 @@ test('interrupted RUNNING jobs become retryable failures on startup recovery', a
   assert.equal(retried.job?.state, 'QUEUED');
   assert.equal(retried.job?.attempt, 2);
   assert.equal(retried.failureHistory.length, 1);
+});
+
+test('a checkpoint NONE infrastructure failure remains manually retryable without a validation result', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const batchId = await createBatch(environment.batches);
+  await environment.batches.addItem(batchId, {
+    action: 'add',
+    designName: 'retry-infrastructure-icon',
+    description: 'Infrastructure failures can be retried manually.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(batchId);
+  environment.database.claimNextJob();
+  environment.database.failJob(batchId, 'GIT_COMMAND_FAILED', 'Temporary target fetch failure.', {
+    operation: 'git fetch',
+    command: 'git fetch upstream',
+    exitCode: 128,
+    stderr: 'temporary failure',
+  });
+
+  const retried = environment.batches.retry(batchId);
+  assert.equal(retried.state, 'QUEUED');
+  assert.equal(retried.job?.attempt, 2);
+  assert.equal(retried.validation, null);
 });
 
 test('interrupted VALIDATING batches return to DRAFT on startup recovery', async (t) => {

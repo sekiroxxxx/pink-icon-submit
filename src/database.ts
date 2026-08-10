@@ -191,7 +191,7 @@ function toBatch(row: BatchRow): StoredBatch {
     id: row.id,
     title: row.title,
     description: row.description,
-    designUrl: row.design_url,
+    ...(row.design_url ? { designUrl: row.design_url } : {}),
     submitter: { name: row.submitter_name, email: row.submitter_email },
     catalogBaseline: storedCatalogBaseline(row.catalog_baseline_json),
     targetRepository: storedTargetRepository(row.target_repository_json),
@@ -314,7 +314,7 @@ export class BatchDatabase {
       id,
       input.title,
       input.description,
-      input.designUrl,
+      input.designUrl ?? '',
       input.submitter.name,
       input.submitter.email,
       JSON.stringify(catalogBaseline),
@@ -336,7 +336,7 @@ export class BatchDatabase {
         UPDATE batches
         SET title = ?, description = ?, design_url = ?
         WHERE id = ? AND state = 'DRAFT'
-      `).run(input.title, input.description, input.designUrl, batchId);
+      `).run(input.title, input.description, input.designUrl ?? '', batchId);
       if (result.changes !== 1) {
         throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} is no longer editable.`, 409);
       }
@@ -510,6 +510,32 @@ export class BatchDatabase {
       }
     });
     record();
+  }
+
+  returnToDraftForEditing(batchId: string): void {
+    const result = this.db.prepare(`
+      UPDATE batches
+      SET state = 'DRAFT', validation_json = NULL, warning_ack_request_sha256 = NULL,
+          plan_json = NULL, base_commit = NULL, local_diff_json = NULL,
+          error_code = NULL, error_message = NULL
+      WHERE id = ? AND state = 'FAILED' AND delivery_checkpoint = 'NONE'
+    `).run(batchId);
+    if (result.changes !== 1) {
+      throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} cannot return to editing from its current delivery state.`, 409);
+    }
+  }
+
+  requiresRepeatedSubmissionConfirmation(batchId: string): boolean {
+    const batch = this.getBatch(batchId);
+    if (batch.state !== 'DRAFT') {
+      return false;
+    }
+    const failure = this.db.prepare(`
+      SELECT created_at FROM job_failures
+      WHERE batch_id = ? AND error_code = 'FINAL_VALIDATION_FAILED'
+      ORDER BY id DESC LIMIT 1
+    `).get(batchId) as { created_at: string } | undefined;
+    return Boolean(failure && batch.updatedAt === failure.created_at);
   }
 
   abortValidation(batchId: string): void {

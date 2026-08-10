@@ -34,7 +34,7 @@ export interface Submitter {
 export interface CreateBatchInput {
   title: string;
   description: string;
-  designUrl: string;
+  designUrl?: string;
   submitter: Submitter;
 }
 

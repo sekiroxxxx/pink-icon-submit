@@ -67,22 +67,26 @@ function baseCommitFrom(value: unknown): string | null {
 
 function batchMetadataFrom(value: unknown): Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'> {
   const submitted: Record<string, unknown> = isObject(value) ? value : {};
-  const designUrl = requiredText(submitted.designUrl, 'designUrl', 2_000);
-  if (!/^https?:\/\//i.test(designUrl)) {
-    throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
-  }
-  try {
-    const parsed = new URL(designUrl);
-    if (!['http:', 'https:'].includes(parsed.protocol)) {
-      throw new Error('unsupported scheme');
+  const rawDesignUrl = submitted.designUrl;
+  let designUrl: string | undefined;
+  if (rawDesignUrl !== undefined && rawDesignUrl !== null && !(typeof rawDesignUrl === 'string' && rawDesignUrl.trim() === '')) {
+    designUrl = requiredText(rawDesignUrl, 'designUrl', 2_000);
+    if (!/^https?:\/\//i.test(designUrl)) {
+      throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
     }
-  } catch {
-    throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
+    try {
+      const parsed = new URL(designUrl);
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('unsupported scheme');
+      }
+    } catch {
+      throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
+    }
   }
   return {
     title: requiredText(submitted.title, 'title', 200),
     description: requiredText(submitted.description, 'description', 5_000),
-    designUrl,
+    ...(designUrl ? { designUrl } : {}),
   };
 }
 
@@ -135,6 +139,12 @@ export class BatchService {
     return this.withBatchLock(batchId, async () => {
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
       const normalized = batchMetadataFrom(input);
+      const current = this.database.getBatch(batchId);
+      if (current.title === normalized.title
+        && current.description === normalized.description
+        && current.designUrl === normalized.designUrl) {
+        return this.database.getDetails(batchId);
+      }
       this.database.updateBatchMetadata(batchId, normalized);
       return this.database.getDetails(batchId);
     });
@@ -160,6 +170,15 @@ export class BatchService {
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
       const existing = this.database.getItem(batchId, itemId);
       const normalized = await this.normalizeItemInput(batchId, input, svg, existing.sourceFile, itemId);
+      if (!svg
+        && existing.action === normalized.action
+        && existing.designName === normalized.designName
+        && existing.targetName === normalized.targetName
+        && existing.description === normalized.description
+        && existing.reason === normalized.reason
+        && existing.replacementName === normalized.replacementName) {
+        return existing;
+      }
       const sourceFile = normalized.action === 'delete'
         ? null
         : svg
@@ -212,15 +231,38 @@ export class BatchService {
     return this.catalog.svg(requiredIconName(name, 'icon name'));
   }
 
-  submit(batchId: string): BatchDetails {
+  submit(batchId: string, confirmRepeatedSubmission = false): BatchDetails {
     const batch = this.database.getBatch(batchId);
-    if (!validationIsValid(batch.validation)) {
-      throw new AppError('BATCH_NOT_READY', 'Validate the batch successfully before submission.', 409);
+    if (batch.state === 'DRAFT') {
+      this.assertLocallySubmittable(batchId);
+      if (this.database.requiresRepeatedSubmissionConfirmation(batchId) && !confirmRepeatedSubmission) {
+        throw new AppError('REPEATED_SUBMISSION_CONFIRMATION_REQUIRED', 'This batch has not changed since its final validation failed. Confirm before submitting it unchanged.', 409);
+      }
+      this.database.queueJob(batchId);
+      return this.database.getDetails(batchId);
     }
-    if (!['READY', 'FAILED'].includes(batch.state)) {
-      throw new AppError('BATCH_NOT_SUBMITTABLE', `Batch ${batchId} is ${batch.state}.`, 409);
+    if (batch.state === 'READY' && validationIsValid(batch.validation)) {
+      this.database.queueJob(batchId);
+      return this.database.getDetails(batchId);
     }
-    this.database.queueJob(batchId);
+    if (batch.state === 'READY') {
+      throw new AppError('BATCH_NOT_READY', 'The legacy READY batch no longer has a successful validation.', 409);
+    }
+    if (batch.state === 'FAILED') {
+      throw new AppError('BATCH_RETRY_REQUIRED', `Batch ${batchId} failed and must use its recovery action.`, 409);
+    }
+    throw new AppError('BATCH_NOT_SUBMITTABLE', `Batch ${batchId} is ${batch.state}.`, 409);
+  }
+
+  returnToEdit(batchId: string): BatchDetails {
+    const batch = this.database.getBatch(batchId);
+    if (batch.state !== 'FAILED'
+      || batch.delivery.checkpoint !== 'NONE'
+      || !isObject(batch.validation)
+      || batch.validation.valid !== false) {
+      throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} cannot return to editing from its current delivery state.`, 409);
+    }
+    this.database.returnToDraftForEditing(batchId);
     return this.database.getDetails(batchId);
   }
 
@@ -229,8 +271,11 @@ export class BatchService {
     if (batch.state !== 'FAILED') {
       throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is ${batch.state}.`, 409);
     }
-    if (!validationIsValid(batch.validation)) {
-      throw new AppError('BATCH_NOT_READY', 'The batch requires a successful validation before retry.', 409);
+    if (batch.delivery.checkpoint === 'NONE' && isObject(batch.validation) && batch.validation.valid === false) {
+      throw new AppError('BATCH_RETURN_TO_EDIT_REQUIRED', 'A final validation failure must be corrected in the editor before delivery can be retried.', 409);
+    }
+    if (!['NONE', 'COMMIT_PREPARED', 'BRANCH_PUSHED', 'PR_CREATING'].includes(batch.delivery.checkpoint)) {
+      throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is already handed off.`, 409);
     }
     this.database.queueJob(batchId);
     return this.database.getDetails(batchId);
@@ -238,6 +283,26 @@ export class BatchService {
 
   getBatch(batchId: string): BatchDetails {
     return this.database.getDetails(batchId);
+  }
+
+  private assertLocallySubmittable(batchId: string): void {
+    const details = this.database.getDetails(batchId);
+    if (details.items.length === 0) {
+      throw new AppError('BATCH_EMPTY', 'A batch needs at least one item before delivery.', 409);
+    }
+    if (details.items.length > maximumBatchItems) {
+      throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
+    }
+    for (const item of details.items) {
+      const invalid = item.action === 'add'
+        ? !item.designName || !item.description || !item.sourceFile
+        : item.action === 'replace'
+          ? !item.targetName || !item.sourceFile
+          : !item.targetName || !item.reason || item.sourceFile !== null;
+      if (invalid) {
+        throw new AppError('BATCH_ITEM_INVALID', `Batch ${batchId} has an incomplete ${item.action} item.`, 409);
+      }
+    }
   }
 
   async writeRequest(batchId: string): Promise<string> {

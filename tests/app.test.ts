@@ -480,3 +480,39 @@ test('multipart item payload must be an object', async (t) => {
   assert.equal(response.statusCode, 400);
   assert.equal((response.json() as { error: { code: string } }).error.code, 'ITEM_INVALID');
 });
+
+test('DRAFT API delivery accepts an optional design link and queues without the legacy validate endpoint', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const app = await buildApp({ batches: environment.batches });
+  t.after(() => app.close());
+
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Optional design link',
+      description: 'Worker validation will run after review submission.',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  assert.equal(created.statusCode, 201);
+  const body = created.json() as { id: string; designUrl?: string };
+  assert.equal(body.designUrl, undefined);
+
+  const item = await app.inject({
+    method: 'POST',
+    url: `/api/batches/${body.id}/items`,
+    payload: {
+      action: 'add',
+      designName: 'optional-design-link-icon',
+      description: 'Can be queued without an interactive validation result.',
+      svgBase64: Buffer.from(environment.validSvg).toString('base64'),
+    },
+  });
+  assert.equal(item.statusCode, 201);
+
+  const queued = await app.inject({ method: 'POST', url: `/api/batches/${body.id}/submit` });
+  assert.equal(queued.statusCode, 200);
+  assert.equal((queued.json() as { state: string; validation: unknown }).state, 'QUEUED');
+  assert.equal((queued.json() as { validation: unknown }).validation, null);
+});

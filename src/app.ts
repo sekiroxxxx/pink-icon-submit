@@ -98,6 +98,16 @@ function catalogPageInput(query: unknown): CatalogPageInput {
   };
 }
 
+function submitConfirmation(body: unknown): boolean {
+  if (body === undefined || body === null) {
+    return false;
+  }
+  if (!isObject(body) || (body.confirmRepeatedSubmission !== undefined && typeof body.confirmRepeatedSubmission !== 'boolean')) {
+    throw new AppError('REQUEST_INVALID', 'confirmRepeatedSubmission must be a boolean when provided.');
+  }
+  return body.confirmRepeatedSubmission === true;
+}
+
 export interface AppDependencies {
   batches: BatchService;
 }
@@ -179,7 +189,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post('/api/batches/:batchId/submit', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.submit(batchId);
+    return dependencies.batches.submit(batchId, submitConfirmation(request.body));
+  });
+
+  app.post('/api/batches/:batchId/return-to-edit', async (request) => {
+    const { batchId } = request.params as { batchId: string };
+    return dependencies.batches.returnToEdit(batchId);
   });
 
   app.get('/api/batches/:batchId', async (request) => {
