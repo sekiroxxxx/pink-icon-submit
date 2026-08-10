@@ -244,6 +244,19 @@ export class BatchService {
     return (await this.prepareStage1Request(batchId)).requestPath;
   }
 
+  async finalValidate(
+    batchId: string,
+    worktreePath: string,
+    stage1Input: { requestPath: string; catalogTarball: string; targetRepository: string },
+  ): Promise<void> {
+    const result = await this.iconBatch.validate(worktreePath, stage1Input.requestPath, stage1Input);
+    const validation = result.payload;
+    this.database.recordFinalValidation(batchId, validation, baseCommitFrom(validation));
+    if (!validationIsValid(validation)) {
+      throw new AppError('FINAL_VALIDATION_FAILED', 'The batch failed final Stage 1 validation before delivery.', 409, validation);
+    }
+  }
+
   async prepareStage1Request(batchId: string): Promise<{ requestPath: string; catalogTarball: string; targetRepository: string }> {
     const details = this.database.getDetails(batchId);
     if (details.items.length === 0) {

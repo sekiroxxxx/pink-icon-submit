@@ -22,23 +22,23 @@ export class IconBatchCli {
   ) {}
 
   catalog(repositoryPath: string): Promise<IconBatchResult> {
-    return this.run(['catalog', '--repo', repositoryPath], repositoryPath, [0]);
+    return this.run('catalog', ['catalog', '--repo', repositoryPath], repositoryPath, [0]);
   }
 
   namePreview(repositoryPath: string, name: string): Promise<IconBatchResult> {
-    return this.run(['name-preview', name, '--repo', repositoryPath], repositoryPath, [0], false);
+    return this.run('name-preview', ['name-preview', name, '--repo', repositoryPath], repositoryPath, [0], false);
   }
 
   validate(repositoryPath: string, requestPath: string, input?: IconBatchV2Input): Promise<IconBatchResult> {
-    return this.run(['validate', requestPath, '--repo', repositoryPath, ...this.v2Arguments(input)], repositoryPath, [0, 2]);
+    return this.run('validate', ['validate', requestPath, '--repo', repositoryPath, ...this.v2Arguments(input)], repositoryPath, [0, 2]);
   }
 
   plan(repositoryPath: string, requestPath: string, input?: IconBatchV2Input): Promise<IconBatchResult> {
-    return this.run(['plan', requestPath, '--repo', repositoryPath, ...this.v2Arguments(input)], repositoryPath, [0, 2]);
+    return this.run('plan', ['plan', requestPath, '--repo', repositoryPath, ...this.v2Arguments(input)], repositoryPath, [0, 2]);
   }
 
   apply(repositoryPath: string, planPath: string, input?: IconBatchV2Input & { requestPath: string }): Promise<IconBatchResult> {
-    return this.run([
+    return this.run('apply', [
       'apply',
       planPath,
       '--repo',
@@ -48,18 +48,30 @@ export class IconBatchCli {
     ], repositoryPath, [0]);
   }
 
-  private async run(args: string[], cwd: string, acceptedExitCodes: number[], needsDependencies = true): Promise<IconBatchResult> {
+  private async run(command: string, args: string[], cwd: string, acceptedExitCodes: number[], needsDependencies = true): Promise<IconBatchResult> {
     const sourceDirectory = this.options.sourceDirectory ?? cwd;
     if (needsDependencies) {
       await this.ensureDependencies(sourceDirectory, Boolean(this.options.sourceDirectory));
     }
-    const result = await this.execute(this.nodeExecutable, [join(sourceDirectory, 'scripts', 'icon-batch.mjs'), ...args], cwd);
+    const commandText = `icon-batch ${command}`;
+    let result: { exitCode: number; stdout: string; stderr: string };
+    try {
+      result = await this.execute(this.nodeExecutable, [join(sourceDirectory, 'scripts', 'icon-batch.mjs'), ...args], cwd);
+    } catch (error) {
+      throw new AppError('ICON_BATCH_COMMAND_START_FAILED', 'Unable to start the icon-batch command.', 502, {
+        operation: `stage1 ${command}`,
+        command: commandText,
+        stderr: error instanceof Error ? error.message : String(error),
+      });
+    }
 
     let payload: Record<string, unknown>;
     try {
       payload = JSON.parse(result.stdout) as Record<string, unknown>;
     } catch {
       throw new AppError('ICON_BATCH_INVALID_OUTPUT', 'icon-batch did not return JSON output.', 502, {
+        operation: `stage1 ${command}`,
+        command: commandText,
         exitCode: result.exitCode,
         stderr: result.stderr,
       });
@@ -67,6 +79,8 @@ export class IconBatchCli {
 
     if (!acceptedExitCodes.includes(result.exitCode)) {
       throw new AppError('ICON_BATCH_COMMAND_FAILED', 'icon-batch command failed.', 502, {
+        operation: `stage1 ${command}`,
+        command: commandText,
         exitCode: result.exitCode,
         stderr: result.stderr,
         payload,
@@ -80,6 +94,7 @@ export class IconBatchCli {
   }
 
   private async ensureDependencies(repositoryPath: string, localSource: boolean): Promise<void> {
+    const installCommand = 'npm ci --include=dev --ignore-scripts --no-audit --no-fund';
     try {
       await access(join(repositoryPath, 'node_modules'));
       return;
@@ -95,11 +110,15 @@ export class IconBatchCli {
       result = await this.execute(this.nodeExecutable, [this.npmCliPath, 'ci', '--include=dev', '--ignore-scripts', '--no-audit', '--no-fund'], repositoryPath);
     } catch (error) {
       throw new AppError('ICON_BATCH_DEPENDENCY_INSTALL_FAILED', 'Unable to start npm ci for the temporary worktree.', 502, {
+        operation: 'stage1 dependencies',
+        command: installCommand,
         message: error instanceof Error ? error.message : String(error),
       });
     }
     if (result.exitCode !== 0) {
       throw new AppError('ICON_BATCH_DEPENDENCY_INSTALL_FAILED', 'npm ci failed for the temporary worktree.', 502, {
+        operation: 'stage1 dependencies',
+        command: installCommand,
         exitCode: result.exitCode,
         stderr: result.stderr,
       });

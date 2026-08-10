@@ -492,6 +492,26 @@ export class BatchDatabase {
     }
   }
 
+  recordFinalValidation(batchId: string, validation: unknown, baseCommit: string | null): void {
+    const record = this.db.transaction(() => {
+      const job = this.db.prepare('SELECT state FROM jobs WHERE batch_id = ?').get(batchId) as Pick<JobRow, 'state'> | undefined;
+      if (!job || job.state !== 'RUNNING') {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} is not running a delivery job.`, 409);
+      }
+      const result = this.db.prepare(`
+        UPDATE batches
+        SET validation_json = ?, warning_ack_request_sha256 = NULL,
+            plan_json = NULL, base_commit = ?, local_diff_json = NULL,
+            error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ? AND delivery_checkpoint = 'NONE'
+      `).run(JSON.stringify(validation), baseCommit, now(), batchId);
+      if (result.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} cannot record final validation from its current checkpoint.`, 409);
+      }
+    });
+    record();
+  }
+
   abortValidation(batchId: string): void {
     this.db.prepare(`
       UPDATE batches

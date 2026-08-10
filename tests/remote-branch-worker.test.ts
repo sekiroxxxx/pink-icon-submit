@@ -99,6 +99,23 @@ async function createSubmittedRemoteBatch(t: test.TestContext): Promise<{ enviro
   return { environment, batchId: batch.id };
 }
 
+async function createQueuedRemoteBatch(t: test.TestContext): Promise<{ environment: TestEnvironment; batchId: string }> {
+  const environment = await createTestEnvironment(t, { executionMode: 'remote' });
+  const batch = await environment.batches.createBatch({
+    title: 'Remote final validation',
+    description: 'Exercise final validation without an interactive validation request.',
+    designUrl: 'https://design.example.invalid/remote-final-validation',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  await environment.batches.addItem(batch.id, {
+    action: 'add',
+    designName: 'remote-final-validation-icon',
+    description: 'The remote worker must run final validation before pushing.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(batch.id);
+  return { environment, batchId: batch.id };
+}
+
 test('remote worker creates one Draft PR only while the target base remains current', async (t) => {
   const { environment, batchId } = await createSubmittedRemoteBatch(t);
   const github = new FakeGitHubPullRequestClient();
@@ -134,6 +151,18 @@ test('remote worker creates one Draft PR only while the target base remains curr
     : '');
 });
 
+test('remote worker runs and persists final Stage 1 validation before committing or pushing', async (t) => {
+  const { environment, batchId } = await createQueuedRemoteBatch(t);
+
+  await workerFor(environment).processNext();
+
+  const completed = environment.batches.getBatch(batchId);
+  assert.equal(completed.state, 'PR_CREATED');
+  assert.equal(completed.delivery.checkpoint, 'PR_CREATED');
+  assert.equal((completed.validation as { valid?: unknown } | null)?.valid, true);
+  assert.equal(completed.delivery.commitSha, remoteHead(environment.pushRepositoryPath!, completed.delivery.branch!));
+});
+
 test('branch delivery phase stops after a safe push without creating a Draft PR', async (t) => {
   const { environment, batchId } = await createSubmittedRemoteBatch(t);
   const github = new FakeGitHubPullRequestClient();
@@ -159,6 +188,38 @@ test('branch delivery phase stops after a safe push without creating a Draft PR'
   assert.equal(pushed.job?.state, 'COMPLETED');
   assert.equal(remoteHead(environment.pushRepositoryPath!, pushed.delivery.branch!), pushed.delivery.commitSha);
   assert.equal(github.created.length, 0);
+});
+
+test('remote worker recovers BRANCH_PUSHED without repeating final validation, plan, or apply', async (t) => {
+  const { environment, batchId } = await createSubmittedRemoteBatch(t);
+  const github = new FakeGitHubPullRequestClient();
+  const delivery = environment.config.remoteDelivery!;
+  const branchWorker = new RemoteBranchWorker(environment.batches, {
+    pushRemote: delivery.pushRemote,
+    pushRepository: delivery.pushRepository,
+    pushBranchPrefix: delivery.pushBranchPrefix,
+    deliveryPhase: 'branch',
+    committer: delivery.committer,
+    targetRepository: environment.config.targetRepository,
+    github,
+    authentication: {
+      username: delivery.pushRepository.split('/')[0],
+      token: delivery.githubToken,
+    },
+  });
+  await branchWorker.processNext();
+
+  const inspection = new (await import('better-sqlite3')).default(environment.config.databasePath);
+  inspection.prepare("UPDATE items SET design_name = 'final-validation-failure' WHERE batch_id = ?").run(batchId);
+  inspection.close();
+  assert.equal(environment.database.resumeBranchPushedJobs(), 1);
+
+  await workerFor(environment, github).processNext();
+
+  const recovered = environment.batches.getBatch(batchId);
+  assert.equal(recovered.state, 'PR_CREATED');
+  assert.equal(recovered.delivery.checkpoint, 'PR_CREATED');
+  assert.equal(github.created.length, 1);
 });
 
 test('remote worker refuses Draft PR creation after the target base advances without changing the bot branch', async (t) => {
@@ -273,6 +334,9 @@ test('remote worker recovers a successful Draft PR when only PR_CREATING survive
     WHERE id = ?
   `).run(batchId);
   inspection.close();
+  const mutateItem = new (await import('better-sqlite3')).default(environment.config.databasePath);
+  mutateItem.prepare("UPDATE items SET design_name = 'final-validation-failure' WHERE batch_id = ?").run(batchId);
+  mutateItem.close();
   environment.batches.retry(batchId);
   const advancedBaseCommit = await advanceTargetMain(environment);
   assert.notEqual(advancedBaseCommit, environment.batches.getBatch(batchId).baseCommit);

@@ -78,6 +78,7 @@ export class RemoteBranchWorker {
 
       const stage1Input = await this.batches.prepareStage1Request(job.batchId);
       const result = await this.batches.repository.withBaseWorktree(async (worktreePath) => {
+        await this.batches.finalValidate(job.batchId, worktreePath, stage1Input);
         const planned = await this.batches.iconBatch.plan(worktreePath, stage1Input.requestPath, stage1Input);
         if (planned.exitCode !== 0) {
           throw new AppError('REPLAN_VALIDATION_FAILED', 'The batch is no longer valid against the latest target branch.', 409, planned.payload);
@@ -101,7 +102,7 @@ export class RemoteBranchWorker {
           });
         }
         const baseCommit = planBaseCommit(plan);
-        const message = commitText(batch, baseCommit);
+        const message = commitText(this.batches.database.getBatch(job.batchId), baseCommit);
         const commitSha = await this.batches.repository.commitPlannedChanges(
           worktreePath,
           expectedFiles,

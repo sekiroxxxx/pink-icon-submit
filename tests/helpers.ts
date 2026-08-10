@@ -33,10 +33,15 @@ if (command === 'catalog') {
   emit({ schemaVersion: 1, baseCommit: head(), icons: [{ primaryName: 'existing', sourceName: 'existing', aliases: ['existing-alias'], codepoint: 50000, sourceFile: 'src/icons/existing.svg', metadataPresent: false }], retiredCodepoints: [] });
 } else if (command === 'validate') {
   const request = JSON.parse(readFileSync(inputPath, 'utf8'));
+  const finalValidationFailure = request.items.some((item) => item.designName === 'final-validation-failure');
+  if (finalValidationFailure) {
+    emit({ schemaVersion: 1, batchId: request.batchId, requestSha256: 'a'.repeat(64), baseCommit: head(), valid: false, summary: { errorCount: 1, warningCount: 0 }, errors: [{ code: 'SVG_MULTIPLE_COLORS', message: 'Fixture final validation failure.', itemId: request.items.find((item) => item.designName === 'final-validation-failure').id }], warnings: [] }, 2);
+  } else {
   const warnings = request.items.some((item) => item.designName === 'warning-icon')
     ? [{ code: 'SVG_STROKE_PRESENT', message: 'Stroke usage requires manual review.', itemId: request.items.find((item) => item.designName === 'warning-icon').id }]
     : [];
   emit({ schemaVersion: 1, batchId: request.batchId, requestSha256: 'a'.repeat(64), baseCommit: head(), valid: true, summary: { errorCount: 0, warningCount: warnings.length }, errors: [], warnings });
+  }
 } else if (command === 'name-preview') {
   const input = inputPath;
   const normalizedName = input
