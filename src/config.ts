@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 
-import type { AppConfig, ExecutionMode, NpmPackageCatalogOptions, RemoteDeliveryConfig, RemoteDeliveryPhase, TargetRepository } from './types.js';
+import type { AppConfig, BootstrapUserCredentials, ExecutionMode, NpmPackageCatalogOptions, RemoteDeliveryConfig, RemoteDeliveryPhase, TargetRepository } from './types.js';
 
 const p3TargetRepository = 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test';
 const p3PushRepository = 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test';
@@ -39,6 +39,19 @@ function requiredEnvironmentValue(environment: NodeJS.ProcessEnv, name: string):
     throw new Error(`${name} is required.`);
   }
   return value;
+}
+
+function bootstrapUserFromEnv(environment: NodeJS.ProcessEnv): BootstrapUserCredentials | undefined {
+  const username = environment.PINK_ICON_BOOTSTRAP_USERNAME?.trim();
+  const password = environment.PINK_ICON_BOOTSTRAP_PASSWORD;
+  if (!username && !password) return undefined;
+  if (!username || !password) {
+    throw new Error('PINK_ICON_BOOTSTRAP_USERNAME and PINK_ICON_BOOTSTRAP_PASSWORD must be set together.');
+  }
+  if (!/^\S+@\S+\.\S+$/.test(username)) {
+    throw new Error('PINK_ICON_BOOTSTRAP_USERNAME must be an internal email address.');
+  }
+  return { username, password };
 }
 
 function targetRepositoryFromEnv(environment: NodeJS.ProcessEnv, requireExplicitBranch: boolean): TargetRepository {
@@ -124,6 +137,7 @@ export function configFromEnv(environment = process.env): AppConfig {
   const remoteDelivery = mode === 'remote'
     ? remoteDeliveryFromEnv(environment, targetRepository)
     : undefined;
+  const bootstrapUser = bootstrapUserFromEnv(environment);
   const dataRoot = resolve(environment.PINK_ICON_SUBMIT_DATA_DIR ?? 'data');
   const resolvedRepositoryPath = resolve(repositoryPath);
   return {
@@ -146,6 +160,7 @@ export function configFromEnv(environment = process.env): AppConfig {
     workerEnabled: workerEnabled(environment.PINK_ICON_WORKER_ENABLED),
     workerPollIntervalMs: positiveInteger(environment.PINK_ICON_WORKER_POLL_MS, 1_000),
     maxUploadBytes: positiveInteger(environment.PINK_ICON_MAX_UPLOAD_BYTES, 1024 * 1024),
+    ...(bootstrapUser ? { bootstrapUser } : {}),
   };
 }
 

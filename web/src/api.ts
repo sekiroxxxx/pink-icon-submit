@@ -6,12 +6,19 @@ export interface Submitter {
   email: string;
 }
 
+export interface AuthenticatedUser {
+  id: string;
+  username: string;
+}
+
 export interface BatchInput {
   title: string;
   description: string;
   designUrl?: string;
   submitter: Submitter;
 }
+
+export type CreateBatchInput = Omit<BatchInput, 'submitter'>;
 
 export interface ItemInput {
   action: ItemAction;
@@ -134,7 +141,7 @@ export interface CatalogPageQuery {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, public readonly code?: string) {
+  constructor(message: string, public readonly code?: string, public readonly status?: number) {
     super(message);
   }
 }
@@ -143,7 +150,10 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, options);
   if (!response.ok) {
     const body = await response.json().catch(() => null) as { error?: { message?: string; code?: string } } | null;
-    throw new ApiError(body?.error?.message ?? `请求失败 (${response.status})`, body?.error?.code);
+    if (response.status === 401 || response.status === 403) {
+      window.dispatchEvent(new Event('pink-icon-submit.authentication-required'));
+    }
+    throw new ApiError(body?.error?.message ?? `请求失败 (${response.status})`, body?.error?.code, response.status);
   }
   if (response.status === 204) {
     return undefined as T;
@@ -166,6 +176,13 @@ function itemRequest(item: ItemInput, svg?: File): RequestInit {
 }
 
 export const api = {
+  login: (input: { username: string; password: string }) => request<{ user: AuthenticatedUser }>('/api/auth/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  }),
+  logout: () => request<void>('/api/auth/logout', { method: 'POST' }),
+  me: () => request<{ user: AuthenticatedUser }>('/api/auth/me'),
   getCatalogPage: (query: CatalogPageQuery) => {
     const parameters = new URLSearchParams();
     if (query.query) parameters.set('query', query.query);
@@ -175,7 +192,7 @@ export const api = {
     return request<CatalogPage>(`/api/catalog/page?${parameters.toString()}`);
   },
   previewName: (name: string) => request<NamePreview>(`/api/names/preview?${new URLSearchParams({ name }).toString()}`),
-  createBatch: (input: BatchInput) => request<BatchDetails>('/api/batches', {
+  createBatch: (input: CreateBatchInput) => request<BatchDetails>('/api/batches', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(input),
@@ -203,5 +220,6 @@ export const api = {
   cloneBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/clone`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
+  getActiveBatch: () => request<BatchDetails | undefined>('/api/batches/active'),
   getBatches: () => request<BatchSummary[]>('/api/batches?limit=20'),
 };

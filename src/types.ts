@@ -31,6 +31,17 @@ export interface Submitter {
   email: string;
 }
 
+/** The only user record exposed to the browser. Password and session data are never serialized. */
+export interface AuthenticatedUser {
+  id: string;
+  username: string;
+}
+
+export interface BootstrapUserCredentials {
+  username: string;
+  password: string;
+}
+
 export interface CreateBatchInput {
   title: string;
   description: string;
@@ -151,6 +162,7 @@ export interface AppConfig {
   workerEnabled: boolean;
   workerPollIntervalMs: number;
   maxUploadBytes: number;
+  bootstrapUser?: BootstrapUserCredentials;
 }
 
 export interface IconBatchResult {

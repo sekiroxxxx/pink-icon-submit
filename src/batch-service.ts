@@ -116,7 +116,7 @@ export class BatchService {
     return this.maxUploadBytes;
   }
 
-  async createBatch(input: CreateBatchInput): Promise<BatchDetails> {
+  async createBatch(input: CreateBatchInput, ownerId?: string): Promise<BatchDetails> {
     const submitted: Record<string, unknown> = isObject(input) ? input : {};
     const submitter = isObject(submitted.submitter) ? submitted.submitter : {};
     const metadata = batchMetadataFrom(submitted);
@@ -131,13 +131,23 @@ export class BatchService {
       throw new AppError('REQUEST_INVALID', 'submitter.email must be a valid email address.');
     }
     const catalogBaseline = await this.catalog.baseline();
-    const batch = this.database.createBatch(createBatchId(), normalized, catalogBaseline, this.targetRepository, this.executionContext);
+    const batch = this.database.createBatch(
+      createBatchId(),
+      normalized,
+      catalogBaseline,
+      this.targetRepository,
+      this.executionContext,
+      ownerId,
+      ownerId !== undefined,
+    );
     return this.database.getDetails(batch.id);
   }
 
-  async updateBatch(batchId: string, input: Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>): Promise<BatchDetails> {
+  async updateBatch(batchId: string, input: Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
     return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
       const normalized = batchMetadataFrom(input);
       const current = this.database.getBatch(batchId);
@@ -151,9 +161,11 @@ export class BatchService {
     });
   }
 
-  async addItem(batchId: string, input: CreateItemInput, svg: Buffer | undefined): Promise<StoredItem> {
+  async addItem(batchId: string, input: CreateItemInput, svg: Buffer | undefined, ownerId?: string): Promise<StoredItem> {
+    this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
     return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
       if (this.database.countItems(batchId) >= maximumBatchItems) {
         throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
@@ -165,9 +177,11 @@ export class BatchService {
     });
   }
 
-  async updateItem(batchId: string, itemId: string, input: CreateItemInput, svg: Buffer | undefined): Promise<StoredItem> {
+  async updateItem(batchId: string, itemId: string, input: CreateItemInput, svg: Buffer | undefined, ownerId?: string): Promise<StoredItem> {
+    this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
     return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
       const existing = this.database.getItem(batchId, itemId);
       const normalized = await this.normalizeItemInput(batchId, input, svg, existing.sourceFile, itemId);
@@ -189,17 +203,21 @@ export class BatchService {
     });
   }
 
-  async deleteItem(batchId: string, itemId: string): Promise<void> {
+  async deleteItem(batchId: string, itemId: string, ownerId?: string): Promise<void> {
+    this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
     return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
       this.database.deleteItem(batchId, itemId);
     });
   }
 
-  async validateBatch(batchId: string): Promise<BatchDetails> {
+  async validateBatch(batchId: string, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_VALIDATABLE', 'validated');
     return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
       this.database.beginValidation(batchId);
       try {
         const stage1Input = await this.prepareStage1Request(batchId);
@@ -232,7 +250,8 @@ export class BatchService {
     return this.catalog.svg(requiredIconName(name, 'icon name'));
   }
 
-  submit(batchId: string, confirmRepeatedSubmission = false): BatchDetails {
+  submit(batchId: string, confirmRepeatedSubmission = false, ownerId?: string): BatchDetails {
+    this.assertOwner(batchId, ownerId);
     const batch = this.database.getBatch(batchId);
     if (batch.state === 'DRAFT') {
       this.assertLocallySubmittable(batchId);
@@ -255,7 +274,8 @@ export class BatchService {
     throw new AppError('BATCH_NOT_SUBMITTABLE', `Batch ${batchId} is ${batch.state}.`, 409);
   }
 
-  returnToEdit(batchId: string): BatchDetails {
+  returnToEdit(batchId: string, ownerId?: string): BatchDetails {
+    this.assertOwner(batchId, ownerId);
     const batch = this.database.getBatch(batchId);
     if (!isFinalValidationFailure(lifecycleSnapshot(batch))) {
       throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} cannot return to editing from its current delivery state.`, 409);
@@ -264,7 +284,8 @@ export class BatchService {
     return this.database.getDetails(batchId);
   }
 
-  retry(batchId: string): BatchDetails {
+  retry(batchId: string, ownerId?: string): BatchDetails {
+    this.assertOwner(batchId, ownerId);
     const batch = this.database.getBatch(batchId);
     const failureCode = batch.error?.code ?? this.database.getDetails(batchId).job?.error?.code ?? null;
     const retrySnapshot = { ...lifecycleSnapshot(batch), errorCode: failureCode };
@@ -292,16 +313,20 @@ export class BatchService {
     return this.database.getDetails(batchId);
   }
 
-  getBatch(batchId: string): BatchDetails {
-    return this.database.getDetails(batchId);
+  getBatch(batchId: string, ownerId?: string): BatchDetails {
+    return ownerId === undefined ? this.database.getDetails(batchId) : this.database.getDetailsForOwner(batchId, ownerId);
   }
 
-  listBatches(limit: number): BatchSummary[] {
-    return this.database.listBatchSummaries(limit);
+  listBatches(limit: number, ownerId?: string): BatchSummary[] {
+    return this.database.listBatchSummaries(limit, ownerId);
   }
 
-  async cloneBatch(batchId: string): Promise<BatchDetails> {
-    const source = this.database.getDetails(batchId);
+  getActiveBatch(ownerId: string): BatchDetails | null {
+    return this.database.getActiveBatchForOwner(ownerId);
+  }
+
+  async cloneBatch(batchId: string, ownerId?: string): Promise<BatchDetails> {
+    const source = this.getBatch(batchId, ownerId);
     if (isActiveBatch(lifecycleSnapshot(source))) {
       throw new AppError('BATCH_NOT_CLONEABLE', `Batch ${batchId} is still active and cannot be cloned.`, 409);
     }
@@ -325,6 +350,8 @@ export class BatchService {
         pushRepository: source.pushRepository,
         pushBranchPrefix: source.pushBranchPrefix,
       },
+      ownerId ?? this.database.getBatchOwnerId(source.id),
+      ownerId !== undefined,
     );
 
     try {
@@ -420,6 +447,12 @@ export class BatchService {
     const batch = this.database.getBatch(batchId);
     if (batch.state !== 'DRAFT') {
       throw new AppError(code, `Batch ${batchId} is ${batch.state} and cannot be ${action}.`, 409);
+    }
+  }
+
+  private assertOwner(batchId: string, ownerId: string | undefined): void {
+    if (ownerId !== undefined) {
+      this.database.getBatchForOwner(batchId, ownerId);
     }
   }
 

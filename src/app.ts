@@ -1,9 +1,16 @@
 import multipart from '@fastify/multipart';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 
+import { AuthService, sessionCookieName, sessionMaxAgeSeconds } from './auth.js';
 import { BatchService } from './batch-service.js';
 import { AppError, isAppError } from './errors.js';
-import type { CatalogGroup, CatalogPageInput, CreateBatchInput, CreateItemInput } from './types.js';
+import type { AuthenticatedUser, CatalogGroup, CatalogPageInput, CreateBatchInput, CreateItemInput } from './types.js';
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    authenticatedUser?: AuthenticatedUser;
+  }
+}
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -113,8 +120,52 @@ function submitConfirmation(body: unknown): boolean {
   return body.confirmRepeatedSubmission === true;
 }
 
+function requestPath(request: FastifyRequest): string {
+  return request.url.split('?', 1)[0] ?? request.url;
+}
+
+function cookieValue(request: FastifyRequest, name: string): string | undefined {
+  const header = request.headers.cookie;
+  if (!header) return undefined;
+  for (const entry of header.split(';')) {
+    const [key, ...rest] = entry.trim().split('=');
+    if (key !== name) continue;
+    const value = rest.join('=');
+    if (!value) return undefined;
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function sessionCookie(token: string): string {
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  return `${sessionCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${sessionMaxAgeSeconds}${secure}`;
+}
+
+function expiredSessionCookie(): string {
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  return `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`;
+}
+
+function authenticatedUser(request: FastifyRequest): AuthenticatedUser {
+  if (!request.authenticatedUser) {
+    throw new AppError('AUTHENTICATION_REQUIRED', '请先登录后再继续。', 401);
+  }
+  return request.authenticatedUser;
+}
+
+function submitterFor(user: AuthenticatedUser): CreateBatchInput['submitter'] {
+  const [name] = user.username.split('@');
+  return { name: name || user.username, email: user.username };
+}
+
 export interface AppDependencies {
   batches: BatchService;
+  auth: AuthService;
 }
 
 export async function buildApp(dependencies: AppDependencies): Promise<FastifyInstance> {
@@ -141,7 +192,31 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     });
   });
 
+  app.addHook('preHandler', async (request) => {
+    const path = requestPath(request);
+    const isPublic = (request.method === 'GET' && path === '/api/health')
+      || (request.method === 'POST' && path === '/api/auth/login');
+    if (!path.startsWith('/api/') || isPublic) return;
+    const user = dependencies.auth.authenticate(cookieValue(request, sessionCookieName));
+    if (!user) {
+      throw new AppError('AUTHENTICATION_REQUIRED', '请先登录后再继续。', 401);
+    }
+    request.authenticatedUser = user;
+  });
+
   app.get('/api/health', async () => ({ status: 'ok' }));
+
+  app.post('/api/auth/login', async (request, reply) => {
+    const session = await dependencies.auth.login(request.body);
+    return reply.header('set-cookie', sessionCookie(session.token)).send({ user: session.user });
+  });
+
+  app.post('/api/auth/logout', async (request, reply) => {
+    dependencies.auth.logout(cookieValue(request, sessionCookieName));
+    return reply.header('set-cookie', expiredSessionCookie()).status(204).send();
+  });
+
+  app.get('/api/auth/me', async (request) => ({ user: authenticatedUser(request) }));
 
   app.get('/api/catalog', async () => dependencies.batches.getCatalog());
 
@@ -158,66 +233,75 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return reply.type('image/svg+xml; charset=utf-8').send(svg);
   });
 
-  app.get('/api/batches', async (request) => dependencies.batches.listBatches(batchListLimit(request.query)));
+  app.get('/api/batches', async (request) => dependencies.batches.listBatches(batchListLimit(request.query), authenticatedUser(request).id));
+
+  app.get('/api/batches/active', async (request, reply) => {
+    const active = dependencies.batches.getActiveBatch(authenticatedUser(request).id);
+    return active ? reply.send(active) : reply.status(204).send();
+  });
 
   app.post('/api/batches', async (request, reply) => {
-    const batch = await dependencies.batches.createBatch(request.body as CreateBatchInput);
+    const user = authenticatedUser(request);
+    const batch = await dependencies.batches.createBatch({
+      ...(request.body as Omit<CreateBatchInput, 'submitter'>),
+      submitter: submitterFor(user),
+    }, user.id);
     return reply.status(201).send(batch);
   });
 
   app.put('/api/batches/:batchId', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.updateBatch(batchId, request.body as Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>);
+    return dependencies.batches.updateBatch(batchId, request.body as Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>, authenticatedUser(request).id);
   });
 
   app.post('/api/batches/:batchId/items', async (request, reply) => {
     const { batchId } = request.params as { batchId: string };
     const { item, svg } = await readItemPayload(request);
-    const created = await dependencies.batches.addItem(batchId, item, svg);
+    const created = await dependencies.batches.addItem(batchId, item, svg, authenticatedUser(request).id);
     return reply.status(201).send(created);
   });
 
   app.put('/api/batches/:batchId/items/:itemId', async (request) => {
     const { batchId, itemId } = request.params as { batchId: string; itemId: string };
     const { item, svg } = await readItemPayload(request);
-    return dependencies.batches.updateItem(batchId, itemId, item, svg);
+    return dependencies.batches.updateItem(batchId, itemId, item, svg, authenticatedUser(request).id);
   });
 
   app.delete('/api/batches/:batchId/items/:itemId', async (request, reply) => {
     const { batchId, itemId } = request.params as { batchId: string; itemId: string };
-    await dependencies.batches.deleteItem(batchId, itemId);
+    await dependencies.batches.deleteItem(batchId, itemId, authenticatedUser(request).id);
     return reply.status(204).send();
   });
 
   app.post('/api/batches/:batchId/validate', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.validateBatch(batchId);
+    return dependencies.batches.validateBatch(batchId, authenticatedUser(request).id);
   });
 
   app.post('/api/batches/:batchId/submit', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.submit(batchId, submitConfirmation(request.body));
+    return dependencies.batches.submit(batchId, submitConfirmation(request.body), authenticatedUser(request).id);
   });
 
   app.post('/api/batches/:batchId/return-to-edit', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.returnToEdit(batchId);
+    return dependencies.batches.returnToEdit(batchId, authenticatedUser(request).id);
   });
 
   app.post('/api/batches/:batchId/clone', async (request, reply) => {
     const { batchId } = request.params as { batchId: string };
-    const cloned = await dependencies.batches.cloneBatch(batchId);
+    const cloned = await dependencies.batches.cloneBatch(batchId, authenticatedUser(request).id);
     return reply.status(201).send(cloned);
   });
 
   app.get('/api/batches/:batchId', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.getBatch(batchId);
+    return dependencies.batches.getBatch(batchId, authenticatedUser(request).id);
   });
 
   app.post('/api/batches/:batchId/retry', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.retry(batchId);
+    return dependencies.batches.retry(batchId, authenticatedUser(request).id);
   });
 
   return app;

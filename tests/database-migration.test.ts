@@ -64,6 +64,9 @@ test('migrates an existing database to the Stage 1 v2 batch protocol fields', as
   const columns = inspection.prepare('PRAGMA table_info(batches)').all() as Array<{ name: string }>;
   const migrations = inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const jobFailuresTable = inspection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'job_failures'").get();
+  const usersTable = inspection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
+  const sessionsTable = inspection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").get();
+  const legacyOwner = inspection.prepare('SELECT owner_id FROM batches WHERE id = ?').get('ICON-20260801-ABCDEF12') as { owner_id: string };
   inspection.close();
   assert.deepEqual(columns.map((column) => column.name).filter((name) => name.endsWith('_json')).sort(), [
     'catalog_baseline_json',
@@ -99,8 +102,12 @@ test('migrates an existing database to the Stage 1 v2 batch protocol fields', as
     'push_branch_prefix',
     'push_repository',
   ]);
-  assert.deepEqual(migrations, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+  assert.deepEqual(migrations, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
   assert.notEqual(jobFailuresTable, undefined);
+  assert.notEqual(usersTable, undefined);
+  assert.notEqual(sessionsTable, undefined);
+  assert.equal(columns.some((column) => column.name === 'owner_id'), true);
+  assert.equal(legacyOwner.owner_id, 'legacy-bootstrap');
 });
 
 test('retains redacted worker diagnostics after a retry clears the job error', async (t) => {

@@ -117,3 +117,25 @@ test('worker execution is disabled by default and requires an explicit true valu
   assert.equal(configFromEnv({ ...environment, PINK_ICON_WORKER_ENABLED: 'false' }).workerEnabled, false);
   assert.throws(() => configFromEnv({ ...environment, PINK_ICON_WORKER_ENABLED: '1' }), /PINK_ICON_WORKER_ENABLED/);
 });
+
+test('bootstrap credentials are optional but must be configured as a valid pair', () => {
+  const environment = {
+    PINK_CODICONS_DIR: 'C:\\workspace\\target-clone',
+    PINK_ICON_EXECUTION_MODE: 'local',
+    PINK_ICON_STAGE1_SOURCE_DIR: 'C:\\workspace\\pink-codicons',
+    PINK_ICON_LOCAL_TARGET_REF: 'main',
+    PINK_ICON_TARGET_REPOSITORY: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test',
+  };
+
+  assert.equal(configFromEnv(environment).bootstrapUser, undefined);
+  assert.deepEqual(configFromEnv({
+    ...environment,
+    PINK_ICON_BOOTSTRAP_USERNAME: 'designer@example.invalid',
+    PINK_ICON_BOOTSTRAP_PASSWORD: 'test-only-password',
+  }).bootstrapUser, {
+    username: 'designer@example.invalid',
+    password: 'test-only-password',
+  });
+  assert.throws(() => configFromEnv({ ...environment, PINK_ICON_BOOTSTRAP_USERNAME: 'designer@example.invalid' }), /set together/);
+  assert.throws(() => configFromEnv({ ...environment, PINK_ICON_BOOTSTRAP_USERNAME: 'not-an-email', PINK_ICON_BOOTSTRAP_PASSWORD: 'test-only-password' }), /internal email/);
+});
