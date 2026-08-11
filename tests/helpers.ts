@@ -233,6 +233,7 @@ export async function createTestEnvironment(t: TestContext, options: TestEnviron
     catalogRefreshIntervalMs: 60_000,
     workerEnabled: false,
     workerPollIntervalMs: 10,
+    sessionCookieSecure: false,
     maxUploadBytes: 1024 * 1024,
   };
   const database = new BatchDatabase(config.databasePath);

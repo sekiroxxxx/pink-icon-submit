@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 
@@ -257,6 +257,61 @@ test('cloning an immutable batch copies designer content without delivery or val
   assert.notEqual(cloned.items[0]?.sourceFile, item.sourceFile);
   const cloneRequest = JSON.parse(await readFile(await environment.batches.writeRequest(cloned.id), 'utf8')) as { items: Array<{ sourceFile?: string }> };
   assert.match(cloneRequest.items[0]?.sourceFile ?? '', /^uploads\/item-/);
+});
+
+test('cloning a terminal batch with a missing source SVG leaves no active batch, items, or clone files', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const source = await environment.batches.createBatch({
+    title: 'Missing clone source',
+    description: 'A failed clone must not leave an active DRAFT behind.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  const item = await environment.batches.addItem(source.id, {
+    action: 'add',
+    designName: 'missing-clone-source-icon',
+    description: 'The upload is deliberately removed before cloning.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(source.id);
+  environment.database.claimNextJob();
+  environment.database.failJob(source.id, 'CATALOG_INTEGRITY_MISMATCH', 'Terminal source fixture.');
+  await rm(join(environment.config.storageRoot, source.id, item.sourceFile!));
+
+  await assert.rejects(() => environment.batches.cloneBatch(source.id));
+
+  assert.equal(environment.batches.getActiveBatch('legacy-bootstrap'), null);
+  assert.deepEqual(environment.batches.listBatches(20).map((batch) => batch.id), [source.id]);
+  assert.deepEqual(await readdir(environment.config.storageRoot), [source.id]);
+});
+
+test('a later source SVG failure cleans staged clone files without changing the old batch', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const source = await environment.batches.createBatch({
+    title: 'Later clone source failure',
+    description: 'The first staged SVG must not leave a partial clone.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  await environment.batches.addItem(source.id, {
+    action: 'add',
+    designName: 'clone-first-icon',
+    description: 'This first source remains readable.',
+  }, Buffer.from(environment.validSvg));
+  const missing = await environment.batches.addItem(source.id, {
+    action: 'add',
+    designName: 'clone-second-icon',
+    description: 'This second source is removed mid-copy.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(source.id);
+  environment.database.claimNextJob();
+  environment.database.failJob(source.id, 'CATALOG_INTEGRITY_MISMATCH', 'Terminal source fixture.');
+  await rm(join(environment.config.storageRoot, source.id, missing.sourceFile!));
+
+  await assert.rejects(() => environment.batches.cloneBatch(source.id));
+
+  const retained = environment.batches.getBatch(source.id);
+  assert.equal(retained.items.length, 2);
+  assert.equal(retained.state, 'FAILED');
+  assert.equal(environment.batches.getActiveBatch('legacy-bootstrap'), null);
+  assert.deepEqual(await readdir(environment.config.storageRoot), [source.id]);
 });
 
 test('DRAFT content edits advance a monotonic revision after a same-millisecond final validation failure', async (t) => {

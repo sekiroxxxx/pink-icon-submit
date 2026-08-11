@@ -161,6 +161,8 @@ export interface AppConfig {
   catalogRefreshIntervalMs: number;
   workerEnabled: boolean;
   workerPollIntervalMs: number;
+  /** Explicit cookie transport policy; never inferred from NODE_ENV. */
+  sessionCookieSecure: boolean;
   maxUploadBytes: number;
   bootstrapUser?: BootstrapUserCredentials;
 }

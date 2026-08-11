@@ -37,6 +37,12 @@ interface SessionInput {
   expiresAt: string;
 }
 
+interface ClonedBatchItem {
+  id: string;
+  input: CreateItemInput;
+  sourceFile: string | null;
+}
+
 interface BatchRow {
   id: string;
   title: string;
@@ -466,6 +472,100 @@ export class BatchDatabase {
     });
     create();
     return this.getBatch(id);
+  }
+
+  /**
+   * Clone creation writes the DRAFT row and all of its design inputs in one
+   * transaction.  It deliberately has no delivery evidence to copy.
+   */
+  createClonedBatch(
+    id: string,
+    input: CreateBatchInput,
+    catalogBaseline: CatalogBaseline,
+    targetRepository: TargetRepository,
+    executionContext: BatchExecutionContext,
+    ownerId: string,
+    items: ReadonlyArray<ClonedBatchItem>,
+    enforceSingleActiveOwner = false,
+  ): StoredBatch {
+    const create = this.db.transaction(() => {
+      if (enforceSingleActiveOwner) this.assertNoActiveBatchForOwner(ownerId);
+      const timestamp = now();
+      this.db.prepare(`
+        INSERT INTO batches (
+          id, owner_id, title, description, design_url, submitter_name, submitter_email,
+          catalog_baseline_json, target_repository_json, execution_mode, push_repository, push_branch_prefix,
+          state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?)
+      `).run(
+        id,
+        ownerId,
+        input.title,
+        input.description,
+        input.designUrl ?? '',
+        input.submitter.name,
+        input.submitter.email,
+        JSON.stringify(catalogBaseline),
+        JSON.stringify(targetRepository),
+        executionContext.executionMode,
+        executionContext.pushRepository,
+        executionContext.pushBranchPrefix,
+        timestamp,
+        timestamp,
+      );
+      const insertItem = this.db.prepare(`
+        INSERT INTO items (
+          id, batch_id, action, design_name, target_name, description, reason, replacement_name, source_file, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const item of items) {
+        insertItem.run(
+          item.id,
+          id,
+          item.input.action,
+          item.input.designName ?? null,
+          item.input.targetName ?? null,
+          item.input.description ?? null,
+          item.input.reason ?? null,
+          item.input.replacementName ?? null,
+          item.sourceFile,
+          timestamp,
+        );
+      }
+    });
+    create();
+    return this.getBatch(id);
+  }
+
+  discardUnpublishedClone(id: string, ownerId: string): void {
+    const discard = this.db.transaction(() => {
+      const row = this.db.prepare(`
+        SELECT state, owner_id, validation_json, plan_json, base_commit, local_diff_json,
+          error_code, delivery_checkpoint, delivery_branch, delivery_commit_sha, pr_number
+        FROM batches WHERE id = ?
+      `).get(id) as (Pick<BatchRow,
+        'state' | 'validation_json' | 'plan_json' | 'base_commit' | 'local_diff_json' | 'error_code'
+        | 'delivery_checkpoint' | 'delivery_branch' | 'delivery_commit_sha' | 'pr_number'> & { owner_id: string }) | undefined;
+      if (!row
+        || row.owner_id !== ownerId
+        || row.state !== 'DRAFT'
+        || row.validation_json !== null
+        || row.plan_json !== null
+        || row.base_commit !== null
+        || row.local_diff_json !== null
+        || row.error_code !== null
+        || row.delivery_checkpoint !== 'NONE'
+        || row.delivery_branch !== null
+        || row.delivery_commit_sha !== null
+        || row.pr_number !== null) {
+        throw new AppError('CLONE_CLEANUP_CONFLICT', `Batch ${id} is not an unpublished clone.`, 409);
+      }
+      const result = this.db.prepare('DELETE FROM batches WHERE id = ? AND owner_id = ?').run(id, ownerId);
+      if (result.changes !== 1) {
+        throw new AppError('CLONE_CLEANUP_CONFLICT', `Batch ${id} could not be discarded.`, 409);
+      }
+    });
+    discard();
   }
 
   updateBatchMetadata(batchId: string, input: Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>): StoredBatch {

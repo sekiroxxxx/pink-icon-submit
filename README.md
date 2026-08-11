@@ -36,6 +36,7 @@ PINK_ICON_CATALOG_AUTH_TOKEN=...                           # 私有 registry 需
 PINK_ICON_CATALOG_SOURCE_REPOSITORY=sud-global/pink-codicons # 可选
 PINK_ICON_CATALOG_REFRESH_MS=60000                         # 可选，默认 60 秒
 PINK_ICON_WORKER_ENABLED=false                              # 可选，默认 false；仅 true 执行队列任务
+PINK_ICON_SESSION_COOKIE_SECURE=false                       # localhost HTTP 可显式 false；HTTPS 部署必须 true
 PINK_ICON_BOOTSTRAP_USERNAME=designer@example.invalid       # 启动时预置内部账号；与密码成对配置
 PINK_ICON_BOOTSTRAP_PASSWORD=<deployment-secret>            # 仅环境注入，不写入数据库明文或日志
 ```
@@ -56,11 +57,14 @@ PINK_ICON_GITHUB_TOKEN=<deployment-secret>
 PINK_ICON_GIT_COMMITTER_NAME=PinK Icon Bot
 PINK_ICON_GIT_COMMITTER_EMAIL=<approved-bot-email>
 PINK_ICON_WORKER_ENABLED=false
+PINK_ICON_SESSION_COOKIE_SECURE=true
 PINK_ICON_BOOTSTRAP_USERNAME=designer@example.invalid
 PINK_ICON_BOOTSTRAP_PASSWORD=<deployment-secret>
 ```
 
 `PINK_ICON_BOOTSTRAP_USERNAME` 与 `PINK_ICON_BOOTSTRAP_PASSWORD` 要么同时省略，要么同时配置；用户名必须是邮箱形式。服务只在账号不存在时创建它，不会在每次启动时轮换既有账号密码。唯一例外是 migration 自动创建的 `legacy-bootstrap@internal.invalid`：它初始为禁用占位账号，只有明确用同名 bootstrap 配置启动时才会写入现代密码哈希并可登录查看保留的旧数据。
+
+`PINK_ICON_SESSION_COOKIE_SECURE` 只能为 `true` 或 `false`，默认 `false` 以支持 localhost HTTP 体验；生产 HTTPS 部署必须显式设为 `true`，不会根据 `NODE_ENV` 推断。会话 Cookie 固定为 HttpOnly、SameSite=Lax；已登录的状态变更请求若携带 `Origin`，服务会拒绝非同源或无效来源。受控非浏览器调用可不带 `Origin`。
 
 远程模式只允许上述 R2/R3 配对，启动时验证 target/push remote URL、R3 的直接 fork parent 和 `bot/` 前缀。Token 只用于后端 GitHub API Authorization header 和临时 `GIT_ASKPASS` 子进程；不写入 remote URL、数据库、前端、命令参数或错误消息。
 

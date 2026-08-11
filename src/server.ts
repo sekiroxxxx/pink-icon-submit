@@ -46,7 +46,7 @@ const batches = new BatchService(
   },
 );
 database.recoverInterruptedValidations();
-const app = await buildApp({ batches, auth });
+const app = await buildApp({ batches, auth, sessionCookieSecure: config.sessionCookieSecure });
 let github: GitHubApiClient | undefined;
 const remoteGithub = (): GitHubApiClient => {
   if (!config.remoteDelivery) {

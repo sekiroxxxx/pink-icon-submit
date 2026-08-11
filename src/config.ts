@@ -41,6 +41,17 @@ function requiredEnvironmentValue(environment: NodeJS.ProcessEnv, name: string):
   return value;
 }
 
+function sessionCookieSecure(value: string | undefined): boolean {
+  if (value === undefined || value.trim() === '') {
+    // Local HTTP development remains usable by default. HTTPS deployments must
+    // opt in explicitly so a deployment's NODE_ENV cannot weaken cookies.
+    return false;
+  }
+  if (value.trim() === 'true') return true;
+  if (value.trim() === 'false') return false;
+  throw new Error('PINK_ICON_SESSION_COOKIE_SECURE must be true or false.');
+}
+
 function bootstrapUserFromEnv(environment: NodeJS.ProcessEnv): BootstrapUserCredentials | undefined {
   const username = environment.PINK_ICON_BOOTSTRAP_USERNAME?.trim();
   const password = environment.PINK_ICON_BOOTSTRAP_PASSWORD;
@@ -159,6 +170,7 @@ export function configFromEnv(environment = process.env): AppConfig {
     catalogRefreshIntervalMs: positiveInteger(environment.PINK_ICON_CATALOG_REFRESH_MS, 60_000),
     workerEnabled: workerEnabled(environment.PINK_ICON_WORKER_ENABLED),
     workerPollIntervalMs: positiveInteger(environment.PINK_ICON_WORKER_POLL_MS, 1_000),
+    sessionCookieSecure: sessionCookieSecure(environment.PINK_ICON_SESSION_COOKIE_SECURE),
     maxUploadBytes: positiveInteger(environment.PINK_ICON_MAX_UPLOAD_BYTES, 1024 * 1024),
     ...(bootstrapUser ? { bootstrapUser } : {}),
   };

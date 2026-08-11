@@ -59,6 +59,46 @@ test('login uses an HttpOnly session, requires authentication, and never seriali
   assert.doesNotMatch(tokenHash, new RegExp(cookie.split('=', 2)[1]!));
 });
 
+test('session cookie Secure is explicit and authenticated mutations reject a cross-origin browser request', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const auth = new AuthService(environment.database);
+  await auth.provisionBootstrapUser({ username: 'secure@example.invalid', password: 'secure password' });
+  const app = await buildApp({ batches: environment.batches, auth, sessionCookieSecure: true });
+  t.after(() => app.close());
+
+  const login = await app.inject({
+    method: 'POST',
+    url: '/api/auth/login',
+    payload: { username: 'secure@example.invalid', password: 'secure password' },
+  });
+  const cookie = cookieFrom(login);
+  assert.match(login.headers['set-cookie'] as string, /; Secure/);
+
+  const noOrigin = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    headers: { cookie },
+    payload: { title: 'Controlled caller', description: 'A non-browser caller has no Origin header.' },
+  });
+  assert.equal(noOrigin.statusCode, 201);
+
+  const crossOrigin = await app.inject({
+    method: 'POST',
+    url: '/api/auth/logout',
+    headers: { cookie, host: 'pink.local', origin: 'https://attacker.example.invalid' },
+  });
+  assert.equal(crossOrigin.statusCode, 403);
+  assert.equal((crossOrigin.json() as { error: { code: string } }).error.code, 'CSRF_ORIGIN_INVALID');
+
+  const sameOrigin = await app.inject({
+    method: 'POST',
+    url: '/api/auth/logout',
+    headers: { cookie, host: 'pink.local', origin: 'http://pink.local' },
+  });
+  assert.equal(sameOrigin.statusCode, 204);
+  assert.match(sameOrigin.headers['set-cookie'] as string, /; Secure/);
+});
+
 test('owner scoping hides other accounts, enforces one active batch, and logout or expiry invalidates a session', async (t) => {
   const environment = await createTestEnvironment(t);
   const auth = new AuthService(environment.database);
@@ -126,6 +166,64 @@ test('owner scoping hides other accounts, enforces one active batch, and logout 
   expiry.close();
   const expired = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie: `${sessionCookieName}=${token}` } });
   assert.equal(expired.statusCode, 401);
+});
+
+test('all batch routes use the same owner boundary and never reveal another account\'s batch', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const auth = new AuthService(environment.database);
+  await auth.provisionBootstrapUser({ username: 'owner@example.invalid', password: 'owner password' });
+  await auth.provisionBootstrapUser({ username: 'other@example.invalid', password: 'other password' });
+  const app = await buildApp({ batches: environment.batches, auth });
+  t.after(() => app.close());
+
+  const ownerLogin = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'owner@example.invalid', password: 'owner password' } });
+  const otherLogin = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'other@example.invalid', password: 'other password' } });
+  const ownerCookie = cookieFrom(ownerLogin);
+  const otherCookie = cookieFrom(otherLogin);
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    headers: { cookie: ownerCookie },
+    payload: { title: 'Private route matrix', description: 'Every mutating route must check ownership first.' },
+  });
+  const batchId = (created.json() as { id: string }).id;
+  const item = await app.inject({
+    method: 'POST',
+    url: `/api/batches/${batchId}/items`,
+    headers: { cookie: ownerCookie },
+    payload: {
+      action: 'add',
+      designName: 'private-route-matrix-icon',
+      description: 'Valid payload so only ownership controls the result.',
+      svgBase64: Buffer.from(environment.validSvg).toString('base64'),
+    },
+  });
+  const itemId = (item.json() as { id: string }).id;
+
+  const attempts: Array<{ name: string; method: 'GET' | 'POST' | 'PUT' | 'DELETE'; url: string; payload?: unknown }> = [
+    { name: 'detail', method: 'GET', url: `/api/batches/${batchId}` },
+    { name: 'update metadata', method: 'PUT', url: `/api/batches/${batchId}`, payload: { title: 'Other', description: 'Must never reach DRAFT editing.' } },
+    { name: 'add item', method: 'POST', url: `/api/batches/${batchId}/items`, payload: { action: 'delete', targetName: 'existing', reason: 'Must never reach item validation.' } },
+    { name: 'update item', method: 'PUT', url: `/api/batches/${batchId}/items/${itemId}`, payload: { action: 'add', designName: 'other-icon', description: 'Must never reach item validation.' } },
+    { name: 'delete item', method: 'DELETE', url: `/api/batches/${batchId}/items/${itemId}` },
+    { name: 'validate', method: 'POST', url: `/api/batches/${batchId}/validate` },
+    { name: 'submit', method: 'POST', url: `/api/batches/${batchId}/submit`, payload: {} },
+    { name: 'return to edit', method: 'POST', url: `/api/batches/${batchId}/return-to-edit` },
+    { name: 'clone', method: 'POST', url: `/api/batches/${batchId}/clone` },
+    { name: 'retry', method: 'POST', url: `/api/batches/${batchId}/retry` },
+  ];
+
+  for (const attempt of attempts) {
+    const response = await app.inject({ method: attempt.method, url: attempt.url, headers: { cookie: otherCookie }, ...(attempt.payload !== undefined ? { payload: attempt.payload } : {}) });
+    assert.equal(response.statusCode, 404, attempt.name);
+    assert.equal((response.json() as { error: { code: string } }).error.code, 'BATCH_NOT_FOUND', attempt.name);
+  }
+
+  const list = await app.inject({ method: 'GET', url: '/api/batches?limit=20', headers: { cookie: otherCookie } });
+  assert.equal(list.statusCode, 200);
+  assert.deepEqual(list.json(), []);
+  const active = await app.inject({ method: 'GET', url: '/api/batches/active', headers: { cookie: otherCookie } });
+  assert.equal(active.statusCode, 204);
 });
 
 test('an explicit bootstrap secret can activate the retained legacy account without exposing it to other users', async (t) => {

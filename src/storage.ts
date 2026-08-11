@@ -1,5 +1,5 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { join, relative, resolve } from 'node:path';
 
 import { AppError } from './errors.js';
 import type { StoredBatch, StoredItem } from './types.js';
@@ -18,6 +18,52 @@ export class BatchStorage {
   async copySvg(sourceBatchId: string, sourceFile: string, targetBatchId: string, targetItemId: string): Promise<string> {
     const content = await readFile(this.resolveBatchPath(sourceBatchId, sourceFile));
     return this.saveSvg(targetBatchId, targetItemId, content);
+  }
+
+  /**
+   * Prepare every cloned SVG outside of the destination batch directory.  A
+   * caller can therefore prove that all source uploads are readable before it
+   * creates the new batch record.
+   */
+  async stageCloneSvgs(sourceBatchId: string, files: ReadonlyArray<{ sourceFile: string; targetItemId: string }>): Promise<StagedClone> {
+    const root = this.storageRoot();
+    await mkdir(root, { recursive: true });
+    const directory = await mkdtemp(join(root, '.clone-'));
+    this.assertOwnedPath(directory, root);
+    try {
+      for (const file of files) {
+        const content = await readFile(this.resolveBatchPath(sourceBatchId, file.sourceFile));
+        const relativePath = `uploads/${file.targetItemId}.svg`;
+        const outputPath = this.resolveWithin(directory, relativePath);
+        await mkdir(resolve(outputPath, '..'), { recursive: true });
+        await writeFile(outputPath, content);
+      }
+      return { directory };
+    } catch (error) {
+      try {
+        await this.discardCloneStaging({ directory });
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'Clone SVG staging failed and could not be fully cleaned up.');
+      }
+      throw error;
+    }
+  }
+
+  async publishStagedClone(staging: StagedClone, targetBatchId: string): Promise<void> {
+    const root = this.storageRoot();
+    this.assertOwnedPath(staging.directory, root);
+    const target = this.resolveBatchDirectory(targetBatchId);
+    await rename(staging.directory, target);
+  }
+
+  async discardCloneStaging(staging: StagedClone): Promise<void> {
+    this.assertOwnedPath(staging.directory, this.storageRoot());
+    await rm(staging.directory, { recursive: true, force: true });
+  }
+
+  async discardClonedBatch(batchId: string): Promise<void> {
+    const directory = this.resolveBatchDirectory(batchId);
+    await rm(directory, { recursive: true, force: true });
   }
 
   async writeRequest(batch: StoredBatch, items: StoredItem[]): Promise<string> {
@@ -52,6 +98,29 @@ export class BatchStorage {
     return join(this.rootDirectory, batchId, relativePath);
   }
 
+  private storageRoot(): string {
+    return resolve(this.rootDirectory);
+  }
+
+  private resolveBatchDirectory(batchId: string): string {
+    const directory = resolve(this.storageRoot(), batchId);
+    this.assertOwnedPath(directory, this.storageRoot());
+    return directory;
+  }
+
+  private resolveWithin(directory: string, relativePath: string): string {
+    const output = resolve(directory, relativePath);
+    this.assertOwnedPath(output, directory);
+    return output;
+  }
+
+  private assertOwnedPath(candidate: string, owner: string): void {
+    const relativePath = relative(resolve(owner), resolve(candidate));
+    if (relativePath === '' || relativePath.startsWith('..') || relativePath.includes(':')) {
+      throw new AppError('STORAGE_PATH_INVALID', 'Storage path is outside its owned directory.', 500);
+    }
+  }
+
   private toRequestItem(item: StoredItem): Record<string, unknown> {
     if (item.action === 'add') {
       return {
@@ -79,4 +148,8 @@ export class BatchStorage {
       ...(item.replacementName ? { replacementName: item.replacementName } : {}),
     };
   }
+}
+
+export interface StagedClone {
+  directory: string;
 }

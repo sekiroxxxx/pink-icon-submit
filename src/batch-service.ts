@@ -335,47 +335,74 @@ export class BatchService {
     }
 
     const clonedId = createBatchId();
-    this.database.createBatch(
-      clonedId,
-      {
-        title: source.title,
-        description: source.description,
-        ...(source.designUrl ? { designUrl: source.designUrl } : {}),
-        submitter: source.submitter,
-      },
-      source.catalogBaseline,
-      source.targetRepository,
-      {
-        executionMode: source.executionMode ?? this.executionContext.executionMode,
-        pushRepository: source.pushRepository,
-        pushBranchPrefix: source.pushBranchPrefix,
-      },
-      ownerId ?? this.database.getBatchOwnerId(source.id),
-      ownerId !== undefined,
-    );
-
-    try {
-      for (const item of source.items) {
-        const itemId = createItemId();
-        const sourceFile = item.sourceFile
-          ? await this.storage.copySvg(source.id, item.sourceFile, clonedId, itemId)
-          : null;
-        this.database.insertItem(clonedId, itemId, {
+    const cloneOwnerId = ownerId ?? this.database.getBatchOwnerId(source.id);
+    const clonedItems = source.items.map((item) => {
+      const id = createItemId();
+      return {
+        id,
+        input: {
           action: item.action,
           ...(item.designName ? { designName: item.designName } : {}),
           ...(item.targetName ? { targetName: item.targetName } : {}),
           ...(item.description ? { description: item.description } : {}),
           ...(item.reason ? { reason: item.reason } : {}),
           ...(item.replacementName ? { replacementName: item.replacementName } : {}),
-        }, sourceFile);
-      }
+        },
+        sourceFile: item.sourceFile ? `uploads/${id}.svg` : null,
+        originalSourceFile: item.sourceFile,
+      };
+    });
+    const staged = await this.storage.stageCloneSvgs(source.id, clonedItems.flatMap((item) => item.originalSourceFile
+      ? [{ sourceFile: item.originalSourceFile, targetItemId: item.id }]
+      : []));
+    try {
+      this.database.createClonedBatch(
+        clonedId,
+        {
+          title: source.title,
+          description: source.description,
+          ...(source.designUrl ? { designUrl: source.designUrl } : {}),
+          submitter: source.submitter,
+        },
+        source.catalogBaseline,
+        source.targetRepository,
+        {
+          executionMode: source.executionMode ?? this.executionContext.executionMode,
+          pushRepository: source.pushRepository,
+          pushBranchPrefix: source.pushBranchPrefix,
+        },
+        cloneOwnerId,
+        clonedItems.map(({ id, input, sourceFile }) => ({ id, input, sourceFile })),
+        ownerId !== undefined,
+      );
+      await this.storage.publishStagedClone(staged, clonedId);
     } catch (error) {
-      // The database record is an isolated DRAFT and contains no delivery
-      // evidence. Preserve the original copy error for the caller rather than
-      // continuing with a silently incomplete clone.
+      await this.discardFailedClone(clonedId, cloneOwnerId, staged, error);
       throw error;
     }
     return this.database.getDetails(clonedId);
+  }
+
+  private async discardFailedClone(clonedId: string, ownerId: string, staged: { directory: string }, originalError: unknown): Promise<void> {
+    const cleanupErrors: unknown[] = [];
+    try {
+      this.database.discardUnpublishedClone(clonedId, ownerId);
+    } catch (error) {
+      if (!(error instanceof AppError && error.code === 'BATCH_NOT_FOUND')) cleanupErrors.push(error);
+    }
+    for (const cleanup of [
+      () => this.storage.discardCloneStaging(staged),
+      () => this.storage.discardClonedBatch(clonedId),
+    ]) {
+      try {
+        await cleanup();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([originalError, ...cleanupErrors], `Clone ${clonedId} failed and its owned resources could not be fully cleaned up.`);
+    }
   }
 
   private assertLocallySubmittable(batchId: string): void {

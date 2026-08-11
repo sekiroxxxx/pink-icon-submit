@@ -141,14 +141,37 @@ function cookieValue(request: FastifyRequest, name: string): string | undefined 
   return undefined;
 }
 
-function sessionCookie(token: string): string {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+function sessionCookie(token: string, secureCookie: boolean): string {
+  const secure = secureCookie ? '; Secure' : '';
   return `${sessionCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${sessionMaxAgeSeconds}${secure}`;
 }
 
-function expiredSessionCookie(): string {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+function expiredSessionCookie(secureCookie: boolean): string {
+  const secure = secureCookie ? '; Secure' : '';
   return `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`;
+}
+
+function isMutation(request: FastifyRequest): boolean {
+  return ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method);
+}
+
+function assertSameOriginWhenPresent(request: FastifyRequest): void {
+  const header = request.headers.origin;
+  if (header === undefined) return;
+  const origin = Array.isArray(header) ? header[0] : header;
+  const host = request.headers.host;
+  if (!origin || !host) {
+    throw new AppError('CSRF_ORIGIN_INVALID', '请求来源无效，请从当前服务页面重新提交。', 403);
+  }
+  try {
+    const expected = new URL(`${request.protocol}://${host}`).origin;
+    if (new URL(origin).origin !== expected) {
+      throw new AppError('CSRF_ORIGIN_INVALID', '请求来源无效，请从当前服务页面重新提交。', 403);
+    }
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError('CSRF_ORIGIN_INVALID', '请求来源无效，请从当前服务页面重新提交。', 403);
+  }
 }
 
 function authenticatedUser(request: FastifyRequest): AuthenticatedUser {
@@ -166,6 +189,7 @@ function submitterFor(user: AuthenticatedUser): CreateBatchInput['submitter'] {
 export interface AppDependencies {
   batches: BatchService;
   auth: AuthService;
+  sessionCookieSecure?: boolean;
 }
 
 export async function buildApp(dependencies: AppDependencies): Promise<FastifyInstance> {
@@ -196,7 +220,11 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const path = requestPath(request);
     const isPublic = (request.method === 'GET' && path === '/api/health')
       || (request.method === 'POST' && path === '/api/auth/login');
-    if (!path.startsWith('/api/') || isPublic) return;
+    if (!path.startsWith('/api/')) return;
+    if (isMutation(request)) {
+      assertSameOriginWhenPresent(request);
+    }
+    if (isPublic) return;
     const user = dependencies.auth.authenticate(cookieValue(request, sessionCookieName));
     if (!user) {
       throw new AppError('AUTHENTICATION_REQUIRED', '请先登录后再继续。', 401);
@@ -208,12 +236,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post('/api/auth/login', async (request, reply) => {
     const session = await dependencies.auth.login(request.body);
-    return reply.header('set-cookie', sessionCookie(session.token)).send({ user: session.user });
+    return reply.header('set-cookie', sessionCookie(session.token, dependencies.sessionCookieSecure === true)).send({ user: session.user });
   });
 
   app.post('/api/auth/logout', async (request, reply) => {
     dependencies.auth.logout(cookieValue(request, sessionCookieName));
-    return reply.header('set-cookie', expiredSessionCookie()).status(204).send();
+    return reply.header('set-cookie', expiredSessionCookie(dependencies.sessionCookieSecure === true)).status(204).send();
   });
 
   app.get('/api/auth/me', async (request) => ({ user: authenticatedUser(request) }));
