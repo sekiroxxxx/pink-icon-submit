@@ -59,11 +59,16 @@ test('login uses an HttpOnly session, requires authentication, and never seriali
   assert.doesNotMatch(tokenHash, new RegExp(cookie.split('=', 2)[1]!));
 });
 
-test('session cookie Secure is explicit and authenticated mutations reject a cross-origin browser request', async (t) => {
+test('session cookie Secure uses the configured public origin behind an HTTPS proxy', async (t) => {
   const environment = await createTestEnvironment(t);
   const auth = new AuthService(environment.database);
   await auth.provisionBootstrapUser({ username: 'secure@example.invalid', password: 'secure password' });
-  const app = await buildApp({ batches: environment.batches, auth, sessionCookieSecure: true });
+  const app = await buildApp({
+    batches: environment.batches,
+    auth,
+    sessionCookieSecure: true,
+    publicOrigin: 'https://pink.example.invalid',
+  });
   t.after(() => app.close());
 
   const login = await app.inject({
@@ -93,10 +98,60 @@ test('session cookie Secure is explicit and authenticated mutations reject a cro
   const sameOrigin = await app.inject({
     method: 'POST',
     url: '/api/auth/logout',
-    headers: { cookie, host: 'pink.local', origin: 'http://pink.local' },
+    headers: {
+      cookie,
+      host: '127.0.0.1:3000',
+      origin: 'https://pink.example.invalid',
+      'x-forwarded-host': 'attacker.example.invalid',
+      'x-forwarded-proto': 'http',
+    },
   });
   assert.equal(sameOrigin.statusCode, 204);
   assert.match(sameOrigin.headers['set-cookie'] as string, /; Secure/);
+});
+
+test('readiness is public, checks the database dependency, and keeps liveness independent', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const auth = new AuthService(environment.database);
+  let ready = true;
+  const app = await buildApp({
+    batches: environment.batches,
+    auth,
+    readiness: () => {
+      if (!ready) throw new Error('database unavailable');
+    },
+  });
+  t.after(() => app.close());
+
+  assert.equal((await app.inject({ method: 'GET', url: '/api/ready' })).statusCode, 200);
+  ready = false;
+  const unavailable = await app.inject({ method: 'GET', url: '/api/ready' });
+  assert.equal(unavailable.statusCode, 503);
+  assert.deepEqual(unavailable.json(), { status: 'not_ready' });
+  assert.equal((await app.inject({ method: 'GET', url: '/api/health' })).statusCode, 200);
+});
+
+test('unknown errors return a fixed message and correlation id instead of internal details', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const auth = new AuthService(environment.database);
+  await auth.provisionBootstrapUser({ username: 'errors@example.invalid', password: 'error test password' });
+  const app = await buildApp({ batches: environment.batches, auth });
+  t.after(() => app.close());
+  const login = await app.inject({
+    method: 'POST',
+    url: '/api/auth/login',
+    payload: { username: 'errors@example.invalid', password: 'error test password' },
+  });
+  const cookie = cookieFrom(login);
+  environment.batches.getCatalog = async () => { throw new Error('sensitive internal detail'); };
+
+  const response = await app.inject({ method: 'GET', url: '/api/catalog', headers: { cookie } });
+  assert.equal(response.statusCode, 500);
+  const payload = response.json() as { error: { code: string; message: string; errorId: string } };
+  assert.equal(payload.error.code, 'INTERNAL_ERROR');
+  assert.equal(payload.error.message, '服务暂时无法完成请求，请稍后重试。');
+  assert.match(payload.error.errorId, /^[0-9a-f-]{36}$/);
+  assert.doesNotMatch(response.body, /sensitive internal detail/);
 });
 
 test('owner scoping hides other accounts, enforces one active batch, and logout or expiry invalidates a session', async (t) => {

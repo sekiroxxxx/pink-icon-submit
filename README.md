@@ -37,6 +37,7 @@ PINK_ICON_CATALOG_SOURCE_REPOSITORY=sud-global/pink-codicons # 可选
 PINK_ICON_CATALOG_REFRESH_MS=60000                         # 可选，默认 60 秒
 PINK_ICON_WORKER_ENABLED=false                              # 可选，默认 false；仅 true 执行队列任务
 PINK_ICON_SESSION_COOKIE_SECURE=false                       # localhost HTTP 可显式 false；HTTPS 部署必须 true
+PINK_ICON_PUBLIC_ORIGIN=http://127.0.0.1:3000               # 可选；生产 HTTPS 必填，且只能是纯 origin
 PINK_ICON_BOOTSTRAP_USERNAME=designer@example.invalid       # 启动时预置内部账号；与密码成对配置
 PINK_ICON_BOOTSTRAP_PASSWORD=<deployment-secret>            # 仅环境注入，不写入数据库明文或日志
 ```
@@ -58,15 +59,16 @@ PINK_ICON_GIT_COMMITTER_NAME=PinK Icon Bot
 PINK_ICON_GIT_COMMITTER_EMAIL=<approved-bot-email>
 PINK_ICON_WORKER_ENABLED=false
 PINK_ICON_SESSION_COOKIE_SECURE=false                        # 本地 HTTP/Vite 代理体验
+PINK_ICON_PUBLIC_ORIGIN=http://127.0.0.1:5173                # 可选；开发时固定浏览器来源
 PINK_ICON_BOOTSTRAP_USERNAME=designer@example.invalid
 PINK_ICON_BOOTSTRAP_PASSWORD=<deployment-secret>
 ```
 
 `PINK_ICON_BOOTSTRAP_USERNAME` 与 `PINK_ICON_BOOTSTRAP_PASSWORD` 要么同时省略，要么同时配置；用户名必须是邮箱形式。服务只在账号不存在时创建它，不会在每次启动时轮换既有账号密码。唯一例外是 migration 自动创建的 `legacy-bootstrap@internal.invalid`：它初始为禁用占位账号，只有明确用同名 bootstrap 配置启动时才会写入现代密码哈希并可登录查看保留的旧数据。
 
-`PINK_ICON_SESSION_COOKIE_SECURE` 只能为 `true` 或 `false`，默认 `false` 以支持 localhost HTTP 体验；生产 HTTPS 部署必须显式设为 `true`，不会根据 `NODE_ENV` 推断。会话 Cookie 固定为 HttpOnly、SameSite=Lax；已登录的状态变更请求若携带 `Origin`，服务会拒绝非同源或无效来源。受控非浏览器调用可不带 `Origin`。
+`PINK_ICON_SESSION_COOKIE_SECURE` 只能为 `true` 或 `false`，默认 `false` 以支持 localhost HTTP 体验；生产 HTTPS 部署必须显式设为 `true`，不会根据 `NODE_ENV` 推断。此时必须同时配置 HTTPS 的 `PINK_ICON_PUBLIC_ORIGIN`。该值必须是规范的纯 origin，例如 `https://icons.example.internal`，不能包含尾部 `/`、路径、query、hash 或凭据。会话 Cookie 固定为 HttpOnly、SameSite=Lax；已登录的状态变更请求若携带 `Origin`，服务只与该显式 origin 比较，不信任 `X-Forwarded-Host` 或 `X-Forwarded-Proto`。受控非浏览器调用可不带 `Origin`。
 
-HTTPS 生产部署示例：`PINK_ICON_SESSION_COOKIE_SECURE=true`。Vite 本地开发页面经 `http://127.0.0.1:5173` 代理 API 到 `http://127.0.0.1:3000` 时应保持 `false`，否则浏览器不会在 HTTP 下回传会话 Cookie。
+HTTPS 生产部署示例：`PINK_ICON_SESSION_COOKIE_SECURE=true`、`PINK_ICON_PUBLIC_ORIGIN=https://icons.example.internal`。Vite 本地开发页面经 `http://127.0.0.1:5173` 代理 API 到 `http://127.0.0.1:3000` 时应保持 `false`，否则浏览器不会在 HTTP 下回传会话 Cookie。
 
 远程模式只允许上述 R2/R3 配对，启动时验证 target/push remote URL、R3 的直接 fork parent 和 `bot/` 前缀。Token 只用于后端 GitHub API Authorization header 和临时 `GIT_ASKPASS` 子进程；不写入 remote URL、数据库、前端、命令参数或错误消息。
 
@@ -106,7 +108,44 @@ npm run dev
 npm run web:dev
 ```
 
-开发时先在一个终端运行 `npm run dev`，再在另一个终端运行 `npm run web:dev`。Vite 页面默认在 `http://127.0.0.1:5173` 提供，并代理 `/api` 到 `http://127.0.0.1:3000`；可用 `PINK_ICON_SUBMIT_API_URL` 修改代理目标。生产静态托管与 Docker 部署留在阶段 4。
+开发时先在一个终端运行 `npm run dev`，再在另一个终端运行 `npm run web:dev`。Vite 页面默认在 `http://127.0.0.1:5173` 提供，并代理 `/api` 到 `http://127.0.0.1:3000`；可用 `PINK_ICON_SUBMIT_API_URL` 修改代理目标。
+
+### 生产同源启动契约
+
+生产发布必须先在同一版本目录执行 `npm ci` 和 `npm run build`，再执行 `npm start`。`npm start` 仅启动一个 Node 进程，同时托管 `web/dist`、API、`/` 和 `/workbench` SPA 入口；缺少 `web/dist/index.html` 时会拒绝启动。源码开发的 `npm run dev` 不要求已有 Web 构建，仍与 Vite 分开运行。
+
+Node 只监听内部 HTTP 地址，由 HTTPS 反向代理对外提供唯一 origin。最小 Nginx 入口如下；应用不会根据转发头推断安全来源：
+
+```nginx
+server {
+  listen 443 ssl;
+  server_name icons.example.internal;
+
+  location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+  }
+}
+```
+
+对应环境至少包含：
+
+```text
+PINK_ICON_SUBMIT_HOST=127.0.0.1
+PINK_ICON_SUBMIT_PORT=3000
+PINK_ICON_SESSION_COOKIE_SECURE=true
+PINK_ICON_PUBLIC_ORIGIN=https://icons.example.internal
+```
+
+`GET /api/health` 是不访问依赖的进程存活探针；`GET /api/ready` 会验证 SQLite 已初始化且仍可查询，但不会因为一个合法的长时间 Worker 任务而报错。两者均公开且不返回业务数据。服务日志以结构化 JSON 写到 stdout/stderr；未知 500 只向浏览器返回固定中文消息和 `errorId`，内部错误详情仅记录在服务日志中。
+
+生产形态本地验收：
+
+```powershell
+npm.cmd run build
+npm.cmd run test:production
+```
 
 用真实阶段 1 v2 的本地 `pink-codicons` 源码验证 cached tarball、validate、plan、apply 和本地 diff：
 

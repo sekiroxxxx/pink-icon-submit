@@ -163,6 +163,8 @@ export interface AppConfig {
   workerPollIntervalMs: number;
   /** Explicit cookie transport policy; never inferred from NODE_ENV. */
   sessionCookieSecure: boolean;
+  /** Canonical browser origin used for CSRF checks behind an HTTPS reverse proxy. */
+  publicOrigin?: string;
   maxUploadBytes: number;
   bootstrapUser?: BootstrapUserCredentials;
 }

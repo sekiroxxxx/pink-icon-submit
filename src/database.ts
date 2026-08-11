@@ -403,6 +403,13 @@ export class BatchDatabase {
     this.db.close();
   }
 
+  assertReady(): void {
+    const result = this.db.prepare('SELECT 1 AS ready').get() as { ready: number };
+    if (result.ready !== 1) {
+      throw new Error('Database readiness query returned an unexpected result.');
+    }
+  }
+
   createUser(input: { id: string; username: string; passwordHash: string }): AuthenticatedUser {
     this.db.prepare(`
       INSERT INTO users (id, username, password_hash, created_at)

@@ -52,6 +52,27 @@ function sessionCookieSecure(value: string | undefined): boolean {
   throw new Error('PINK_ICON_SESSION_COOKIE_SECURE must be true or false.');
 }
 
+function publicOrigin(value: string | undefined): string | undefined {
+  const configured = value?.trim();
+  if (!configured) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(configured);
+  } catch {
+    throw new Error('PINK_ICON_PUBLIC_ORIGIN must be a valid HTTP(S) origin without a path, query, hash, or credentials.');
+  }
+  if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+    || parsed.origin !== configured
+    || parsed.username
+    || parsed.password
+    || parsed.pathname !== '/'
+    || parsed.search
+    || parsed.hash) {
+    throw new Error('PINK_ICON_PUBLIC_ORIGIN must be a valid HTTP(S) origin without a path, query, hash, or credentials.');
+  }
+  return configured;
+}
+
 function bootstrapUserFromEnv(environment: NodeJS.ProcessEnv): BootstrapUserCredentials | undefined {
   const username = environment.PINK_ICON_BOOTSTRAP_USERNAME?.trim();
   const password = environment.PINK_ICON_BOOTSTRAP_PASSWORD;
@@ -149,6 +170,11 @@ export function configFromEnv(environment = process.env): AppConfig {
     ? remoteDeliveryFromEnv(environment, targetRepository)
     : undefined;
   const bootstrapUser = bootstrapUserFromEnv(environment);
+  const secureCookie = sessionCookieSecure(environment.PINK_ICON_SESSION_COOKIE_SECURE);
+  const configuredPublicOrigin = publicOrigin(environment.PINK_ICON_PUBLIC_ORIGIN);
+  if (secureCookie && (!configuredPublicOrigin || !configuredPublicOrigin.startsWith('https://'))) {
+    throw new Error('PINK_ICON_SESSION_COOKIE_SECURE=true requires an https PINK_ICON_PUBLIC_ORIGIN.');
+  }
   const dataRoot = resolve(environment.PINK_ICON_SUBMIT_DATA_DIR ?? 'data');
   const resolvedRepositoryPath = resolve(repositoryPath);
   return {
@@ -170,7 +196,8 @@ export function configFromEnv(environment = process.env): AppConfig {
     catalogRefreshIntervalMs: positiveInteger(environment.PINK_ICON_CATALOG_REFRESH_MS, 60_000),
     workerEnabled: workerEnabled(environment.PINK_ICON_WORKER_ENABLED),
     workerPollIntervalMs: positiveInteger(environment.PINK_ICON_WORKER_POLL_MS, 1_000),
-    sessionCookieSecure: sessionCookieSecure(environment.PINK_ICON_SESSION_COOKIE_SECURE),
+    sessionCookieSecure: secureCookie,
+    ...(configuredPublicOrigin ? { publicOrigin: configuredPublicOrigin } : {}),
     maxUploadBytes: positiveInteger(environment.PINK_ICON_MAX_UPLOAD_BYTES, 1024 * 1024),
     ...(bootstrapUser ? { bootstrapUser } : {}),
   };

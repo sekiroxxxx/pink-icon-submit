@@ -128,9 +128,47 @@ test('session cookie transport is explicit: localhost defaults to false and inva
   };
 
   assert.equal(configFromEnv(environment).sessionCookieSecure, false);
-  assert.equal(configFromEnv({ ...environment, PINK_ICON_SESSION_COOKIE_SECURE: 'true' }).sessionCookieSecure, true);
+  assert.equal(configFromEnv({
+    ...environment,
+    PINK_ICON_SESSION_COOKIE_SECURE: 'true',
+    PINK_ICON_PUBLIC_ORIGIN: 'https://pink.example.invalid',
+  }).sessionCookieSecure, true);
   assert.equal(configFromEnv({ ...environment, PINK_ICON_SESSION_COOKIE_SECURE: 'false' }).sessionCookieSecure, false);
   assert.throws(() => configFromEnv({ ...environment, PINK_ICON_SESSION_COOKIE_SECURE: '1' }), /PINK_ICON_SESSION_COOKIE_SECURE/);
+  assert.throws(
+    () => configFromEnv({ ...environment, PINK_ICON_SESSION_COOKIE_SECURE: 'true' }),
+    /https PINK_ICON_PUBLIC_ORIGIN/,
+  );
+  assert.throws(
+    () => configFromEnv({
+      ...environment,
+      PINK_ICON_SESSION_COOKIE_SECURE: 'true',
+      PINK_ICON_PUBLIC_ORIGIN: 'http://pink.example.invalid',
+    }),
+    /https PINK_ICON_PUBLIC_ORIGIN/,
+  );
+});
+
+test('public origin must be an exact HTTP(S) origin without credentials, path, query, or hash', () => {
+  const environment = {
+    PINK_CODICONS_DIR: 'C:\\workspace\\target-clone',
+    PINK_ICON_EXECUTION_MODE: 'local',
+    PINK_ICON_STAGE1_SOURCE_DIR: 'C:\\workspace\\pink-codicons',
+    PINK_ICON_LOCAL_TARGET_REF: 'main',
+    PINK_ICON_TARGET_REPOSITORY: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test',
+  };
+
+  assert.equal(configFromEnv({ ...environment, PINK_ICON_PUBLIC_ORIGIN: 'https://pink.example.invalid:8443' }).publicOrigin, 'https://pink.example.invalid:8443');
+  for (const value of [
+    'ftp://pink.example.invalid',
+    'https://pink.example.invalid/',
+    'https://pink.example.invalid/app',
+    'https://pink.example.invalid?query=1',
+    'https://pink.example.invalid#hash',
+    'https://user@pink.example.invalid',
+  ]) {
+    assert.throws(() => configFromEnv({ ...environment, PINK_ICON_PUBLIC_ORIGIN: value }), /PINK_ICON_PUBLIC_ORIGIN/);
+  }
 });
 
 test('bootstrap credentials are optional but must be configured as a valid pair', () => {

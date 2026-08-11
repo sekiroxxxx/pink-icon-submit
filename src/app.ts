@@ -1,5 +1,10 @@
 import multipart from '@fastify/multipart';
-import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
+import { randomUUID } from 'node:crypto';
+import { access } from 'node:fs/promises';
+import { join } from 'node:path';
+
+import fastifyStatic from '@fastify/static';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 
 import { AuthService, sessionCookieName, sessionMaxAgeSeconds } from './auth.js';
 import { BatchService } from './batch-service.js';
@@ -155,7 +160,7 @@ function isMutation(request: FastifyRequest): boolean {
   return ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method);
 }
 
-function assertSameOriginWhenPresent(request: FastifyRequest): void {
+function assertSameOriginWhenPresent(request: FastifyRequest, publicOrigin?: string): void {
   const header = request.headers.origin;
   if (header === undefined) return;
   const origin = Array.isArray(header) ? header[0] : header;
@@ -164,8 +169,8 @@ function assertSameOriginWhenPresent(request: FastifyRequest): void {
     throw new AppError('CSRF_ORIGIN_INVALID', '请求来源无效，请从当前服务页面重新提交。', 403);
   }
   try {
-    const expected = new URL(`${request.protocol}://${host}`).origin;
-    if (new URL(origin).origin !== expected) {
+    const expected = publicOrigin ?? new URL(`${request.protocol}://${host}`).origin;
+    if (new URL(origin).origin !== expected || new URL(origin).origin !== origin) {
       throw new AppError('CSRF_ORIGIN_INVALID', '请求来源无效，请从当前服务页面重新提交。', 403);
     }
   } catch (error) {
@@ -190,13 +195,41 @@ export interface AppDependencies {
   batches: BatchService;
   auth: AuthService;
   sessionCookieSecure?: boolean;
+  publicOrigin?: string;
+  readiness?: () => void | Promise<void>;
+  logger?: boolean;
+  webRoot?: string;
+  requireWebRoot?: boolean;
 }
 
 export async function buildApp(dependencies: AppDependencies): Promise<FastifyInstance> {
-  const app = Fastify({ logger: false });
+  const app = Fastify({ logger: dependencies.logger ?? false });
   await app.register(multipart, { limits: { files: 1, fileSize: dependencies.batches.uploadLimit } });
 
-  app.setErrorHandler((error, _request, reply) => {
+  if (dependencies.webRoot) {
+    let webBuildAvailable = false;
+    try {
+      await access(join(dependencies.webRoot, 'index.html'));
+      webBuildAvailable = true;
+    } catch (error) {
+      if (dependencies.requireWebRoot) {
+        throw new Error(`Production web build is missing at ${dependencies.webRoot}. Run npm run build before npm start.`, { cause: error });
+      }
+    }
+    if (webBuildAvailable) {
+      await app.register(fastifyStatic, {
+        root: dependencies.webRoot,
+        index: false,
+      });
+      const sendSpa = async (_request: FastifyRequest, reply: FastifyReply) => reply.sendFile('index.html');
+      app.get('/', sendSpa);
+      app.get('/workbench', sendSpa);
+    }
+  } else if (dependencies.requireWebRoot) {
+    throw new Error('Production web build path is required.');
+  }
+
+  app.setErrorHandler((error, request, reply) => {
     if (isAppError(error)) {
       return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message, details: error.details } });
     }
@@ -208,21 +241,24 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         },
       });
     }
+    const errorId = randomUUID();
+    request.log.error({ err: error, errorId }, 'Unhandled request error');
     return reply.status(500).send({
       error: {
         code: 'INTERNAL_ERROR',
-        message: error instanceof Error ? error.message : 'Unexpected server error.',
+        message: '服务暂时无法完成请求，请稍后重试。',
+        errorId,
       },
     });
   });
 
   app.addHook('preHandler', async (request) => {
     const path = requestPath(request);
-    const isPublic = (request.method === 'GET' && path === '/api/health')
+    const isPublic = (request.method === 'GET' && (path === '/api/health' || path === '/api/ready'))
       || (request.method === 'POST' && path === '/api/auth/login');
     if (!path.startsWith('/api/')) return;
     if (isMutation(request)) {
-      assertSameOriginWhenPresent(request);
+      assertSameOriginWhenPresent(request, dependencies.publicOrigin);
     }
     if (isPublic) return;
     const user = dependencies.auth.authenticate(cookieValue(request, sessionCookieName));
@@ -233,6 +269,16 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   });
 
   app.get('/api/health', async () => ({ status: 'ok' }));
+
+  app.get('/api/ready', async (_request, reply) => {
+    try {
+      await dependencies.readiness?.();
+      return { status: 'ready' };
+    } catch (error) {
+      app.log.warn({ err: error }, 'Readiness check failed');
+      return reply.status(503).send({ status: 'not_ready' });
+    }
+  });
 
   app.post('/api/auth/login', async (request, reply) => {
     const session = await dependencies.auth.login(request.body);
