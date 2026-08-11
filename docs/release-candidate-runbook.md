@@ -33,6 +33,8 @@ git diff --check
 - data root 没有其他 RuntimeLease owner；
 - Token 只进入服务子进程环境，不进入命令行、URL、Git config、日志或数据库。
 
+还必须在与 Worker 相同的 clone 和子进程环境中完成 target `fetch` 与 push remote `ls-remote` 基础连通性检查。TLS、代理、DNS 或 GitHub 短暂失败应作为恢复场景记录，不能伪装成业务成功，也不能绕过 checkpoint 直接重放；应通过既有人工 retry 验证安全恢复和远程副作用唯一性。若同一操作持续失败、认证确定无效，或无法在不改变交付语义的前提下恢复，则停止试运行并修复宿主环境。Windows 部署需同时审计 system/global/local 的 `http.proxy`、`http.sslBackend` 和 credential helper；只允许在隔离 clone 中调整配置，不修改用户或系统全局配置来掩盖环境差异。
+
 同一候选至少连续完成以下批次：
 
 1. add 两批；
@@ -42,7 +44,7 @@ git diff --check
 5. Stage 1 失败后返回编辑并重新提交一批；
 6. 计划停止并重新启动服务后再提交两批。
 
-每批必须满足：`attempt=1`（校验修正批次允许重新提交产生的新 attempt）、最终 `PR_CREATED/COMPLETED`、branch SHA = DB commit = PR head、exact-head Draft PR 数量为 1、每个 branch 非 force push 恰好一次、无临时 worktree 或 RUNNING/QUEUED 残留。服务重启前后首页、工作台、历史和错误指引必须由浏览器实际检查，不能只读数据库代替。
+无基础设施故障的批次应以 `attempt=1` 完成；故障注入或真实短暂基础设施失败允许通过既有门禁产生后续 attempt，但必须证明恢复没有重复 validate/plan/apply/commit/push 或 PR 创建。每批最终必须满足：`PR_CREATED/COMPLETED`、branch SHA = DB commit = PR head、exact-head Draft PR 数量为 1、每个 branch 非 force push 恰好一次、无临时 worktree 或 RUNNING/QUEUED 残留。服务重启前后首页、工作台、历史和错误指引必须由浏览器实际检查，不能只读数据库代替。
 
 任何卡队列、重复 branch/PR、不可操作错误、凭据泄露或需要人工开关 Worker 的情况都会使候选失效；先修根因并生成新候选，不在原数据上堆补偿重试。
 
