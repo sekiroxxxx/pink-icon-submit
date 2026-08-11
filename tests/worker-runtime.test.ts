@@ -16,7 +16,7 @@ async function createSubmittedBatch(environment: TestEnvironment, suffix: string
     designName: `worker-runtime-${suffix}`,
     description: 'Worker runtime test icon',
   }, Buffer.from(environment.validSvg));
-  environment.batches.submit((await environment.batches.validateBatch(batch.id)).id);
+  await environment.batches.submit((await environment.batches.validateBatch(batch.id)).id);
   return batch.id;
 }
 
@@ -93,7 +93,7 @@ test('disabled Worker runtime leaves queued and running jobs untouched in API-on
     attempt: branchPushedJobBefore.attempt,
     error: branchPushedJobBefore.error,
   });
-  runtime.close();
+  await runtime.close();
 });
 
 test('enabled Worker runtime preserves topology preflight, recovery, and polling', async () => {
@@ -137,9 +137,14 @@ test('enabled Worker runtime preserves topology preflight, recovery, and polling
   });
 
   await waitFor(() => processNextCalls > 0);
-  runtime.close();
+  let closeFinished = false;
+  const closePromise = runtime.close().then(() => { closeFinished = true; });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(closeFinished, false);
   releaseFirstPoll();
   await firstPollFinished;
+  await closePromise;
+  assert.equal(closeFinished, true);
   const callsAfterClose = processNextCalls;
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(preflightCalls, 1);

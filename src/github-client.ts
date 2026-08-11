@@ -32,6 +32,10 @@ export interface GitHubPullRequestClient {
   }): Promise<GitHubPullRequest>;
 }
 
+export interface GitHubApiClientOptions {
+  timeoutMs?: number;
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -61,16 +65,18 @@ export class GitHubApiClient implements GitHubRepositoryReader, GitHubPullReques
   constructor(
     private readonly token: string,
     private readonly request: typeof fetch = fetch,
+    private readonly options: GitHubApiClientOptions = {},
   ) {}
 
   async getRepository(repository: string): Promise<GitHubRepositoryDetails> {
-    const response = await this.request(`https://api.github.com/repos/${repository}`, {
+    const { response, payload } = await this.requestJsonWithDeadline(`https://api.github.com/repos/${repository}`, {
       headers: {
         accept: 'application/vnd.github+json',
         authorization: `Bearer ${this.token}`,
         'x-github-api-version': '2022-11-28',
       },
-    }).catch(() => {
+    }, 'read GitHub repository metadata', 'GitHub repository metadata was not valid JSON.').catch((error: unknown) => {
+      if (error instanceof AppError) throw error;
       throw new AppError('GITHUB_API_REQUEST_FAILED', 'Unable to read GitHub repository metadata.', 502);
     });
     if (!response.ok) {
@@ -78,9 +84,6 @@ export class GitHubApiClient implements GitHubRepositoryReader, GitHubPullReques
         status: response.status,
       });
     }
-    const payload: unknown = await response.json().catch(() => {
-      throw new AppError('GITHUB_API_RESPONSE_INVALID', 'GitHub repository metadata was not valid JSON.', 502);
-    });
     if (!isObject(payload) || typeof payload.fork !== 'boolean') {
       throw new AppError('GITHUB_API_RESPONSE_INVALID', 'GitHub repository metadata was incomplete.', 502);
     }
@@ -95,13 +98,14 @@ export class GitHubApiClient implements GitHubRepositoryReader, GitHubPullReques
     url.searchParams.set('state', 'all');
     url.searchParams.set('head', head);
     url.searchParams.set('per_page', '100');
-    const response = await this.request(url, {
+    const { response, payload } = await this.requestJsonWithDeadline(url, {
       headers: {
         accept: 'application/vnd.github+json',
         authorization: `Bearer ${this.token}`,
         'x-github-api-version': '2022-11-28',
       },
-    }).catch(() => {
+    }, 'find an existing GitHub pull request', 'GitHub pull request lookup was not valid JSON.').catch((error: unknown) => {
+      if (error instanceof AppError) throw error;
       throw new AppError('GITHUB_API_REQUEST_FAILED', 'Unable to find an existing GitHub pull request.', 502);
     });
     if (!response.ok) {
@@ -109,9 +113,6 @@ export class GitHubApiClient implements GitHubRepositoryReader, GitHubPullReques
         status: response.status,
       });
     }
-    const payload: unknown = await response.json().catch(() => {
-      throw new AppError('GITHUB_API_RESPONSE_INVALID', 'GitHub pull request lookup was not valid JSON.', 502);
-    });
     if (!Array.isArray(payload)) {
       throw new AppError('GITHUB_API_RESPONSE_INVALID', 'GitHub pull request lookup was incomplete.', 502);
     }
@@ -135,7 +136,7 @@ export class GitHubApiClient implements GitHubRepositoryReader, GitHubPullReques
     base: string;
     body: string;
   }): Promise<GitHubPullRequest> {
-    const response = await this.request(`https://api.github.com/repos/${repository}/pulls`, {
+    const { response, payload } = await this.requestJsonWithDeadline(`https://api.github.com/repos/${repository}/pulls`, {
       method: 'POST',
       headers: {
         accept: 'application/vnd.github+json',
@@ -144,7 +145,8 @@ export class GitHubApiClient implements GitHubRepositoryReader, GitHubPullReques
         'x-github-api-version': '2022-11-28',
       },
       body: JSON.stringify({ ...input, draft: true }),
-    }).catch(() => {
+    }, 'create the GitHub Draft PR', 'GitHub Draft PR creation did not return valid JSON.').catch((error: unknown) => {
+      if (error instanceof AppError) throw error;
       throw new AppError('GITHUB_API_REQUEST_FAILED', 'Unable to create the GitHub Draft PR.', 502);
     });
     if (!response.ok) {
@@ -152,9 +154,45 @@ export class GitHubApiClient implements GitHubRepositoryReader, GitHubPullReques
         status: response.status,
       });
     }
-    const payload: unknown = await response.json().catch(() => {
-      throw new AppError('GITHUB_API_RESPONSE_INVALID', 'GitHub Draft PR creation did not return valid JSON.', 502);
-    });
     return pullRequestFromPayload(payload);
+  }
+
+  private async requestJsonWithDeadline(
+    input: string | URL,
+    init: RequestInit,
+    operation: string,
+    invalidJsonMessage: string,
+  ): Promise<{ response: Response; payload: unknown }> {
+    const timeoutMs = this.options.timeoutMs ?? 30_000;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new TypeError('GitHub timeoutMs must be a positive finite number.');
+    }
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new Error(`GitHub request timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+    timer.unref();
+    try {
+      const response = await this.request(input, { ...init, signal: controller.signal });
+      if (!response.ok) return { response, payload: undefined };
+      try {
+        return { response, payload: await response.json() as unknown };
+      } catch (error) {
+        if (timedOut) throw error;
+        throw new AppError('GITHUB_API_RESPONSE_INVALID', invalidJsonMessage, 502);
+      }
+    } catch (error) {
+      if (timedOut) {
+        throw new AppError('GITHUB_API_TIMEOUT', `Unable to ${operation} before the request deadline.`, 504, {
+          operation: `github ${operation}`,
+          stderr: `Timed out after ${timeoutMs}ms.`,
+        });
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

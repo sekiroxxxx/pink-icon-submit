@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { access, mkdir, readFile, readdir, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import test from 'node:test';
@@ -16,13 +16,13 @@ function registeredWorktreePaths(repositoryPath: string): string[] {
     .map((line) => resolve(line.slice('worktree '.length)));
 }
 
-function longBatchWorktreeRoot(): string {
-  return join(
-    tmpdir(),
-    `pink-long-data-${'x'.repeat(85)}`,
+async function longBatchWorktreeRoot(): Promise<{ root: string; cleanupRoot: string }> {
+  const cleanupRoot = await mkdtemp(join(tmpdir(), `pink-long-data-${'x'.repeat(60)}-`));
+  return { cleanupRoot, root: join(
+    cleanupRoot,
     `batches-${'y'.repeat(85)}`,
     'worktrees',
-  );
+  ) };
 }
 
 function isWithin(root: string, candidate: string): boolean {
@@ -80,10 +80,10 @@ test('git failures expose a sanitized logical command, exit code, and stderr dia
 
 test('uses a short owned system-temporary worktree for long data paths and removes it from Git', async (t) => {
   const environment = await createTestEnvironment(t, { executionMode: 'remote' });
-  const longRoot = longBatchWorktreeRoot();
+  const { root: longRoot, cleanupRoot } = await longBatchWorktreeRoot();
   await mkdir(longRoot, { recursive: true });
   t.after(async () => {
-    await rm(longRoot, { recursive: true, force: true });
+    await rm(cleanupRoot, { recursive: true, force: true });
   });
   const repository = new GitRepository(environment.config.repositoryPath, longRoot, {
     mode: 'remote',
@@ -115,10 +115,10 @@ test('uses a short owned system-temporary worktree for long data paths and remov
 
 test('cleans an owned short worktree after a callback failure without replacing the original error', async (t) => {
   const environment = await createTestEnvironment(t);
-  const longRoot = longBatchWorktreeRoot();
+  const { root: longRoot, cleanupRoot } = await longBatchWorktreeRoot();
   await mkdir(longRoot, { recursive: true });
   t.after(async () => {
-    await rm(longRoot, { recursive: true, force: true });
+    await rm(cleanupRoot, { recursive: true, force: true });
   });
   const repository = new GitRepository(environment.config.repositoryPath, longRoot, {
     mode: 'local',
@@ -146,10 +146,10 @@ test('cleans an owned short worktree after a callback failure without replacing 
 
 test('surfaces a temporary worktree removal failure without remote writes', async (t) => {
   const environment = await createTestEnvironment(t, { executionMode: 'remote' });
-  const longRoot = longBatchWorktreeRoot();
+  const { root: longRoot, cleanupRoot } = await longBatchWorktreeRoot();
   await mkdir(longRoot, { recursive: true });
   t.after(async () => {
-    await rm(longRoot, { recursive: true, force: true });
+    await rm(cleanupRoot, { recursive: true, force: true });
   });
   const repository = new GitRepository(environment.config.repositoryPath, longRoot, {
     mode: 'remote',
@@ -252,4 +252,68 @@ test('uses an ephemeral askpass helper without placing its token in files, comma
   );
   await assertAskPassDoesNotPersist(captured[1]);
   assert.equal(captured.length, 2);
+});
+
+test('Git children receive an allowlisted environment and authenticated timeout cleans askpass resources', async (t) => {
+  const environment = await createTestEnvironment(t, { executionMode: 'remote' });
+  const repository = new GitRepository(environment.config.repositoryPath, environment.config.temporaryRoot, {
+    mode: 'remote',
+    targetRemote: 'origin',
+    targetBranch: 'main',
+    commandTimeoutMs: 250,
+  });
+  const secretNames = ['PINK_ICON_GITHUB_TOKEN', 'PINK_ICON_BOOTSTRAP_PASSWORD', 'PINK_ICON_CATALOG_AUTH_TOKEN'];
+  const previous = new Map<string, string | undefined>();
+  for (const name of secretNames) {
+    previous.set(name, process.env[name]);
+    process.env[name] = `synthetic-${name.toLowerCase()}`;
+  }
+  t.after(() => {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  const root = await mkdtemp(join(tmpdir(), 'pink-git-env-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const captureScript = join(root, 'capture.cjs');
+  await writeFile(captureScript, "process.stdout.write(JSON.stringify(process.env));\n", 'utf8');
+  const controlled = repository as unknown as {
+    git(args: string[], commandEnvironment?: NodeJS.ProcessEnv): Promise<string>;
+    withAuthentication<T>(authentication: { username: string; token: string } | undefined, callback: (environment: NodeJS.ProcessEnv | undefined) => Promise<T>): Promise<T>;
+  };
+  const output = await controlled.git(['-c', `alias.capture=!\"${process.execPath}\" \"${captureScript}\"`, 'capture']);
+  const childEnvironment = JSON.parse(output) as NodeJS.ProcessEnv;
+  for (const name of secretNames) assert.equal(childEnvironment[name], undefined);
+  assert.ok(childEnvironment.PATH ?? childEnvironment.Path);
+  assert.ok(childEnvironment.TEMP ?? childEnvironment.TMP ?? childEnvironment.TMPDIR);
+
+  let askPassRoot = '';
+  await assert.rejects(
+    controlled.withAuthentication({ username: 'test-bot', token: 'synthetic-askpass-token' }, async (commandEnvironment) => {
+      assert.ok(commandEnvironment?.GIT_ASKPASS);
+      for (const name of secretNames) assert.equal(commandEnvironment[name], undefined);
+      askPassRoot = dirname(commandEnvironment.GIT_ASKPASS);
+      await controlled.git(['-c', `alias.hang=!\"${process.execPath}\" -e \"setInterval(() => {}, 1000)\"`, 'hang'], commandEnvironment);
+    }),
+    (error: unknown) => error instanceof AppError && error.code === 'GIT_COMMAND_TIMEOUT',
+  );
+  await assert.rejects(access(askPassRoot));
+
+  const registeredBefore = registeredWorktreePaths(environment.config.repositoryPath);
+  let timedOutWorktree = '';
+  let timedOutRoot = '';
+  await assert.rejects(
+    repository.withBaseWorktree(async (worktreePath) => {
+      timedOutWorktree = worktreePath;
+      timedOutRoot = dirname(worktreePath);
+      await controlled.git(['-c', `alias.hang=!\"${process.execPath}\" -e \"setInterval(() => {}, 1000)\"`, 'hang']);
+    }),
+    (error: unknown) => error instanceof AppError && error.code === 'GIT_COMMAND_TIMEOUT',
+  );
+  await assert.rejects(access(timedOutWorktree));
+  await assert.rejects(access(timedOutRoot));
+  assert.deepEqual(registeredWorktreePaths(environment.config.repositoryPath), registeredBefore);
+  assert.equal((await repository.head(environment.config.repositoryPath)).length, 40);
 });

@@ -11,7 +11,7 @@ export interface QueueWorker {
 }
 
 export interface WorkerRuntime {
-  close(): void;
+  close(): Promise<void>;
 }
 
 export interface WorkerRuntimeOptions {
@@ -25,7 +25,7 @@ export interface WorkerRuntimeOptions {
 }
 
 const disabledRuntime: WorkerRuntime = {
-  close() {},
+  async close() {},
 };
 
 export async function startWorkerRuntime(options: WorkerRuntimeOptions): Promise<WorkerRuntime> {
@@ -40,27 +40,33 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions): Promise
   }
 
   const worker = options.createWorker();
-  let workerRunning = false;
+  let closed = false;
+  let activePoll: Promise<void> | null = null;
   const pollWorker = async (): Promise<void> => {
-    if (workerRunning) {
+    if (closed || activePoll) {
       return;
     }
-    workerRunning = true;
-    try {
-      await worker.processNext();
-    } catch (error) {
-      options.onError(error);
-    } finally {
-      workerRunning = false;
-    }
+    const run = (async () => {
+      try {
+        await worker.processNext();
+      } catch (error) {
+        options.onError(error);
+      }
+    })();
+    activePoll = run;
+    await run.finally(() => {
+      if (activePoll === run) activePoll = null;
+    });
   };
 
   const timer = setInterval(() => {
     void pollWorker();
   }, options.pollIntervalMs);
   return {
-    close() {
+    async close() {
+      closed = true;
       clearInterval(timer);
+      await activePoll;
     },
   };
 }

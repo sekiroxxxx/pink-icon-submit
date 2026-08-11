@@ -19,6 +19,14 @@ import { BatchStorage } from '../src/storage.js';
 const sourceRepository = process.env.PINK_ICON_STAGE1_SOURCE_DIR;
 const validSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z"/></svg>';
 
+async function hasNoLegacyWorktrees(path: string): Promise<boolean> {
+  try {
+    return (await readdir(path)).length === 0;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+}
+
 async function createFixtureRegistry(t: test.TestContext, root: string, source: string, sourceCommit: string): Promise<string> {
   const packageRoot = join(root, 'catalog-package');
   const packageDirectory = join(packageRoot, 'package');
@@ -123,7 +131,7 @@ test('real Stage 1 v2 uses a cached npm tarball and local worktree without conta
     description: 'Platform integration icon',
   }, Buffer.from(validSvg));
   assert.equal((await batches.validateBatch(batch.id)).state, 'READY');
-  batches.submit(batch.id);
+  await batches.submit(batch.id);
 
   const { LocalDiffWorker } = await import('../src/worker.js');
   await new LocalDiffWorker(batches).processNext();
@@ -148,5 +156,5 @@ test('real Stage 1 v2 uses a cached npm tarball and local worktree without conta
     branch: 'main',
   });
   assert.equal(execFileSync('git', ['--git-dir', upstream, 'rev-parse', 'refs/heads/main'], { encoding: 'utf8' }).trim(), sourceCommit);
-  assert.deepEqual(await readdir(join(data, 'worktrees')), []);
+  assert.equal(await hasNoLegacyWorktrees(join(data, 'worktrees')), true);
 });

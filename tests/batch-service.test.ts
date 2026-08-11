@@ -70,15 +70,51 @@ class FailingClonePublishStorage extends BatchStorage {
 
   constructor(
     rootPath: string,
-    private readonly beforeFailure: (targetBatchId: string) => void,
+    private readonly beforeFailure: (targetBatchId: string) => void | Promise<void>,
   ) {
     super(rootPath);
   }
 
   override async publishStagedClone(_staging: StagedClone, targetBatchId: string): Promise<PublishedClone> {
     this.targetBatchId = targetBatchId;
-    this.beforeFailure(targetBatchId);
+    await this.beforeFailure(targetBatchId);
     throw new Error('Simulated clone publish failure.');
+  }
+}
+
+class BlockingUpdateStorage extends BatchStorage {
+  private armed = false;
+  private resolveStarted!: () => void;
+  private resolveWrite!: () => void;
+  private started = Promise.resolve();
+  private write = Promise.resolve();
+
+  arm(): void {
+    this.armed = true;
+    this.started = new Promise<void>((resolve) => {
+      this.resolveStarted = resolve;
+    });
+    this.write = new Promise<void>((resolve) => {
+      this.resolveWrite = resolve;
+    });
+  }
+
+  override async saveSvg(batchId: string, itemId: string, content: Buffer): Promise<string> {
+    const sourceFile = await super.saveSvg(batchId, itemId, content);
+    if (this.armed) {
+      this.armed = false;
+      this.resolveStarted();
+      await this.write;
+    }
+    return sourceFile;
+  }
+
+  waitForWrite(): Promise<void> {
+    return this.started;
+  }
+
+  finishWrite(): void {
+    this.resolveWrite();
   }
 }
 
@@ -163,7 +199,7 @@ test('validation makes the batch immutable until it completes and rejects queued
 
   iconBatch.finishValidation();
   assert.equal((await validation).state, 'READY');
-  assert.equal(batches.submit(batchId).state, 'QUEUED');
+  assert.equal((await batches.submit(batchId)).state, 'QUEUED');
   await assert.rejects(batches.validateBatch(batchId), { code: 'BATCH_NOT_VALIDATABLE' });
 });
 
@@ -180,7 +216,7 @@ test('DRAFT submission validates only local input requirements and does not requ
     description: 'Queues without a compatibility validation request.',
   }, Buffer.from(environment.validSvg));
 
-  const queued = environment.batches.submit(batch.id);
+  const queued = await environment.batches.submit(batch.id);
   assert.equal(queued.state, 'QUEUED');
   assert.equal(queued.validation, null);
   assert.equal(queued.designUrl, undefined);
@@ -209,7 +245,7 @@ test('a final validation failure at checkpoint NONE returns to editing and requi
   assert.equal(failed.delivery.checkpoint, 'NONE');
   assert.equal(failed.validation !== null, true);
 
-  const draft = environment.batches.returnToEdit(batch.id);
+  const draft = await environment.batches.returnToEdit(batch.id);
   assert.equal(draft.state, 'DRAFT');
   assert.equal(draft.items[0]?.id, item.id);
   assert.equal(draft.items[0]?.sourceFile, item.sourceFile);
@@ -219,10 +255,10 @@ test('a final validation failure at checkpoint NONE returns to editing and requi
   assert.equal(draft.baseCommit, null);
   assert.equal(draft.localDiff, null);
   assert.equal(draft.error, null);
-  assert.throws(() => environment.batches.submit(batch.id), {
+  await assert.rejects(() => environment.batches.submit(batch.id), {
     code: 'REPEATED_SUBMISSION_CONFIRMATION_REQUIRED',
   });
-  assert.equal(environment.batches.submit(batch.id, true).state, 'QUEUED');
+  assert.equal((await environment.batches.submit(batch.id, true)).state, 'QUEUED');
 });
 
 test('editing after a final validation failure permits a normal DRAFT resubmission', async (t) => {
@@ -239,7 +275,7 @@ test('editing after a final validation failure permits a normal DRAFT resubmissi
   }, Buffer.from(environment.validSvg));
   environment.database.queueJob(batch.id);
   await new LocalDiffWorker(environment.batches).processNext();
-  environment.batches.returnToEdit(batch.id);
+  await environment.batches.returnToEdit(batch.id);
 
   await environment.batches.updateItem(batch.id, item.id, {
     action: 'add',
@@ -248,7 +284,7 @@ test('editing after a final validation failure permits a normal DRAFT resubmissi
   }, undefined);
   assert.equal(environment.batches.getBatch(batch.id).validation, null);
   assert.equal(environment.batches.getBatch(batch.id).userStatus, 'draft');
-  assert.equal(environment.batches.submit(batch.id).state, 'QUEUED');
+  assert.equal((await environment.batches.submit(batch.id)).state, 'QUEUED');
 });
 
 test('a system final validation diagnostic requires developer handling instead of designer retry or return-to-edit', async (t) => {
@@ -275,8 +311,8 @@ test('a system final validation diagnostic requires developer handling instead o
 
   const failed = environment.batches.getBatch(batch.id);
   assert.equal(failed.userStatus, 'developer_attention');
-  assert.throws(() => environment.batches.returnToEdit(batch.id), { code: 'BATCH_NOT_EDITABLE' });
-  assert.throws(() => environment.batches.retry(batch.id), { code: 'BATCH_NOT_RETRYABLE' });
+  await assert.rejects(() => environment.batches.returnToEdit(batch.id), { code: 'BATCH_NOT_EDITABLE' });
+  await assert.rejects(() => environment.batches.retry(batch.id), { code: 'BATCH_NOT_RETRYABLE' });
 });
 
 test('cloning an immutable batch copies designer content without delivery or validation evidence', async (t) => {
@@ -570,8 +606,8 @@ for (const scenario of [
   },
   {
     name: 'submit',
-    mutate: (_environment: TestEnvironment, batches: BatchService, batchId: string) => {
-      batches.submit(batchId);
+    mutate: async (_environment: TestEnvironment, batches: BatchService, batchId: string) => {
+      await batches.submit(batchId);
     },
     expectedState: 'QUEUED',
   },
@@ -580,7 +616,7 @@ for (const scenario of [
     const environment = await createTestEnvironment(t);
     let batches!: BatchService;
     const storage = new FailingClonePublishStorage(environment.config.storageRoot, (batchId) => {
-      scenario.mutate(environment, batches, batchId);
+      return scenario.mutate(environment, batches, batchId);
     });
     batches = new BatchService(
       environment.database,
@@ -631,8 +667,8 @@ test('DRAFT content edits advance a monotonic revision after a same-millisecond 
   environment.database.failJob(batch.id, 'FINAL_VALIDATION_FAILED', 'Simulated final validation failure.');
   const failure = environment.batches.getBatch(batch.id).failureHistory.at(-1)!;
 
-  environment.batches.returnToEdit(batch.id);
-  assert.throws(() => environment.batches.submit(batch.id), {
+  await environment.batches.returnToEdit(batch.id);
+  await assert.rejects(() => environment.batches.submit(batch.id), {
     code: 'REPEATED_SUBMISSION_CONFIRMATION_REQUIRED',
   });
 
@@ -673,7 +709,7 @@ test('interrupted RUNNING jobs become retryable failures on startup recovery', a
     designName: 'recovery-test-icon',
     description: 'Recovery test icon',
   }, Buffer.from(environment.validSvg));
-  environment.batches.submit((await environment.batches.validateBatch(batchId)).id);
+  await environment.batches.submit((await environment.batches.validateBatch(batchId)).id);
   assert.equal(environment.database.claimNextJob()?.state, 'RUNNING');
 
   assert.equal(environment.database.recoverInterruptedJobs(), 1);
@@ -685,7 +721,7 @@ test('interrupted RUNNING jobs become retryable failures on startup recovery', a
     { attempt: 1, code: 'WORKER_INTERRUPTED' },
   ]);
 
-  const retried = environment.batches.retry(batchId);
+  const retried = await environment.batches.retry(batchId);
   assert.equal(retried.state, 'QUEUED');
   assert.equal(retried.job?.state, 'QUEUED');
   assert.equal(retried.job?.attempt, 2);
@@ -709,7 +745,7 @@ test('a checkpoint NONE infrastructure failure remains manually retryable withou
     stderr: 'temporary failure',
   });
 
-  const retried = environment.batches.retry(batchId);
+  const retried = await environment.batches.retry(batchId);
   assert.equal(retried.state, 'QUEUED');
   assert.equal(retried.job?.attempt, 2);
   assert.equal(retried.validation, null);
@@ -811,4 +847,40 @@ test('editing DRAFT batch metadata clears validation and the next validation use
   assert.deepEqual(iconBatch.requests[1]?.request.description, 'Updated metadata description');
   assert.deepEqual(iconBatch.requests[1]?.request.designUrl, 'https://design.example.invalid/updated');
   assert.equal(iconBatch.requests[1]?.svg, updatedSvg);
+});
+
+test('submit waits for an in-flight SVG update on the same batch', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const storage = new BlockingUpdateStorage(environment.config.storageRoot);
+  const batches = new BatchService(
+    environment.database,
+    storage,
+    environment.batches.repository,
+    environment.batches.iconBatch,
+    environment.config.maxUploadBytes,
+    catalogOptionsFromConfig(environment.config),
+    environment.config.targetRepository,
+  );
+  const batchId = await createBatch(batches);
+  const item = await batches.addItem(batchId, {
+    action: 'add',
+    designName: 'serialized-update-icon',
+    description: 'Original description',
+  }, Buffer.from(environment.validSvg));
+  storage.arm();
+
+  const update = batches.updateItem(batchId, item.id, {
+    action: 'add',
+    designName: 'serialized-update-icon',
+    description: 'Updated description',
+  }, Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M2 2h1v1H2z"/></svg>'));
+  await storage.waitForWrite();
+  const submit = batches.submit(batchId);
+
+  await Promise.resolve();
+  assert.equal(environment.database.getBatch(batchId).state, 'DRAFT');
+  storage.finishWrite();
+  await update;
+  assert.equal((await submit).state, 'QUEUED');
+  assert.equal(environment.database.getItem(batchId, item.id).description, 'Updated description');
 });

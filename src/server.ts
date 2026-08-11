@@ -11,8 +11,10 @@ import { GitHubApiClient } from './github-client.js';
 import { RemoteTopologyPreflight } from './remote-preflight.js';
 import { RemoteBranchWorker } from './remote-branch-worker.js';
 import { startWorkerRuntime } from './worker-runtime.js';
+import { RuntimeLease } from './runtime-lease.js';
 
 const config = configFromEnv();
+const runtimeLease = RuntimeLease.acquire(`${config.databasePath}.runtime-lock`);
 const repository = new GitRepository(config.repositoryPath, config.temporaryRoot, {
   mode: config.executionMode,
   ...(config.localTargetRef ? { localTargetRef: config.localTargetRef } : {}),
@@ -89,10 +91,26 @@ const workerRuntime = await startWorkerRuntime({
 console.info(`PinK Icon Worker ${config.workerEnabled ? 'enabled' : 'disabled (API-only mode)'}.`);
 
 app.addHook('onClose', async () => {
-  workerRuntime.close();
+  await workerRuntime.close();
   database.close();
+  runtimeLease.close();
 });
 
 const host = process.env.PINK_ICON_SUBMIT_HOST ?? '127.0.0.1';
 const port = Number(process.env.PINK_ICON_SUBMIT_PORT ?? '3000');
 await app.listen({ host, port });
+
+let shuttingDown = false;
+const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.info(`PinK Icon Submit received ${signal}; draining the active request and Worker task.`);
+  try {
+    await app.close();
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+  }
+};
+process.once('SIGINT', () => { void shutdown('SIGINT'); });
+process.once('SIGTERM', () => { void shutdown('SIGTERM'); });

@@ -881,20 +881,43 @@ export class BatchDatabase {
   }
 
   queueJob(batchId: string): StoredJob {
-    this.getBatch(batchId);
-    const timestamp = now();
-    this.db.prepare(`
-      INSERT INTO jobs (batch_id, state, attempt, created_at, updated_at)
-      VALUES (?, 'QUEUED', 1, ?, ?)
-      ON CONFLICT(batch_id) DO UPDATE SET
-        state = 'QUEUED',
-        attempt = jobs.attempt + 1,
-        error_code = NULL,
-        error_message = NULL,
-        updated_at = excluded.updated_at
-    `).run(batchId, timestamp, timestamp);
-    this.touchBatch(batchId, 'QUEUED');
-    return this.getJob(batchId)!;
+    const queue = this.db.transaction(() => {
+      const batch = this.getBatch(batchId);
+      const existingJob = this.getJob(batchId);
+      const initialSubmission = existingJob === null && (batch.state === 'DRAFT' || batch.state === 'READY');
+      const requeue = existingJob?.state === 'FAILED'
+        && (batch.state === 'DRAFT' || batch.state === 'READY' || batch.state === 'FAILED');
+      if (!initialSubmission && !requeue) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} cannot be queued from batch ${batch.state} and job ${existingJob?.state ?? 'missing'}.`, 409);
+      }
+
+      const timestamp = now();
+      const jobResult = initialSubmission
+        ? this.db.prepare(`
+            INSERT INTO jobs (batch_id, state, attempt, created_at, updated_at)
+            VALUES (?, 'QUEUED', 1, ?, ?)
+          `).run(batchId, timestamp, timestamp)
+        : this.db.prepare(`
+            UPDATE jobs
+            SET state = 'QUEUED', attempt = attempt + 1,
+                error_code = NULL, error_message = NULL, updated_at = ?
+            WHERE batch_id = ? AND state = 'FAILED'
+          `).run(timestamp, batchId);
+      if (jobResult.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} job changed before it could be queued.`, 409);
+      }
+
+      const batchResult = this.db.prepare(`
+        UPDATE batches
+        SET state = 'QUEUED', error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ? AND state = ?
+      `).run(timestamp, batchId, batch.state);
+      if (batchResult.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} changed before it could be queued.`, 409);
+      }
+      return this.getJob(batchId)!;
+    });
+    return queue();
   }
 
   claimNextJob(): StoredJob | null {
@@ -914,16 +937,27 @@ export class BatchDatabase {
   }
 
   completeJob(batchId: string, plan: unknown, baseCommit: string, localDiff: unknown): void {
-    const timestamp = now();
-    this.db.prepare(`
-      UPDATE jobs SET state = 'COMPLETED', error_code = NULL, error_message = NULL, updated_at = ? WHERE batch_id = ?
-    `).run(timestamp, batchId);
-    this.db.prepare(`
-      UPDATE batches
-      SET state = 'LOCAL_DIFF_READY', plan_json = ?, base_commit = ?, local_diff_json = ?,
-          error_code = NULL, error_message = NULL, updated_at = ?
-      WHERE id = ?
-    `).run(JSON.stringify(plan), baseCommit, JSON.stringify(localDiff), timestamp, batchId);
+    const complete = this.db.transaction(() => {
+      const timestamp = now();
+      const jobResult = this.db.prepare(`
+        UPDATE jobs
+        SET state = 'COMPLETED', error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE batch_id = ? AND state = 'RUNNING'
+      `).run(timestamp, batchId);
+      if (jobResult.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} does not have a running job to complete.`, 409);
+      }
+      const batchResult = this.db.prepare(`
+        UPDATE batches
+        SET state = 'LOCAL_DIFF_READY', plan_json = ?, base_commit = ?, local_diff_json = ?,
+            error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ? AND state = 'RUNNING'
+      `).run(JSON.stringify(plan), baseCommit, JSON.stringify(localDiff), timestamp, batchId);
+      if (batchResult.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} is not running and cannot complete.`, 409);
+      }
+    });
+    complete();
   }
 
   recordCommitPrepared(

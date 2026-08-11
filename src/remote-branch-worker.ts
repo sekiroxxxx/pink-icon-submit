@@ -174,13 +174,19 @@ export class RemoteBranchWorker {
       this.options.authentication,
     );
     if (batch.delivery.checkpoint === 'COMMIT_PREPARED' && remoteHead === null) {
-      return false;
-    }
-    if (remoteHead !== batch.delivery.commitSha) {
-      throw new AppError('REMOTE_BRANCH_DIVERGED', `Remote branch ${batch.delivery.branch} no longer matches this batch commit.`, 409);
-    }
-    if (batch.delivery.checkpoint === 'COMMIT_PREPARED') {
+      await this.batches.repository.pushCommit(
+        this.options.pushRemote,
+        batch.delivery.branch,
+        batch.delivery.commitSha,
+        this.options.authentication,
+      );
       this.batches.database.recordBranchPushed(batch.id);
+      batch = this.batches.database.getBatch(batch.id);
+    } else if (remoteHead !== batch.delivery.commitSha) {
+      throw new AppError('REMOTE_BRANCH_DIVERGED', `Remote branch ${batch.delivery.branch} no longer matches this batch commit.`, 409);
+    } else if (batch.delivery.checkpoint === 'COMMIT_PREPARED') {
+      this.batches.database.recordBranchPushed(batch.id);
+      batch = this.batches.database.getBatch(batch.id);
     }
     if (this.options.deliveryPhase === 'branch') {
       this.batches.database.completeBranchPushedJob(batch.id);

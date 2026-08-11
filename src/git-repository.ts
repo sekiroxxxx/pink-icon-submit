@@ -1,9 +1,9 @@
-import { spawn } from 'node:child_process';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { AppError, sanitizeDiagnosticText } from './errors.js';
+import { runSubprocess, subprocessEnvironment, SubprocessTimeoutError } from './subprocess.js';
 import type { ExecutionMode } from './types.js';
 
 export interface GitCommitIdentity {
@@ -22,6 +22,7 @@ export interface GitRepositoryOptions {
   targetBranch?: string;
   remoteAuthentication?: GitHubTokenAuthentication;
   localTargetRef?: string;
+  commandTimeoutMs?: number;
 }
 
 interface OwnedTemporaryWorktree {
@@ -219,7 +220,7 @@ export class GitRepository {
         await chmod(askPassCommand, 0o700);
       }
       return await callback({
-        ...process.env,
+        ...subprocessEnvironment(),
         GIT_ASKPASS: askPassCommand,
         GIT_TERMINAL_PROMPT: '0',
         PINK_ICON_GIT_ASKPASS_USERNAME: authentication.username,
@@ -231,21 +232,20 @@ export class GitRepository {
   }
 
   private async git(args: string[], environment?: NodeJS.ProcessEnv): Promise<string> {
-    const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve, reject) => {
-      const processHandle = spawn('git', args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-        ...(environment ? { env: environment } : {}),
-      });
-      let stdout = '';
-      let stderr = '';
-      processHandle.stdout.setEncoding('utf8');
-      processHandle.stderr.setEncoding('utf8');
-      processHandle.stdout.on('data', (chunk: string) => { stdout += chunk; });
-      processHandle.stderr.on('data', (chunk: string) => { stderr += chunk; });
-      processHandle.once('error', reject);
-      processHandle.once('close', (exitCode) => resolve({ exitCode: exitCode ?? 1, stdout, stderr }));
-    });
+    const timeoutMs = this.options.commandTimeoutMs ?? 120_000;
+    let result;
+    try {
+      result = await runSubprocess('git', args, { environment, timeoutMs });
+    } catch (error) {
+      if (error instanceof SubprocessTimeoutError) {
+        throw new AppError('GIT_COMMAND_TIMEOUT', 'Git command exceeded its deadline.', 504, {
+          operation: gitOperation(args),
+          command: sanitizeDiagnosticText(['git', ...args].join(' '), 1_000),
+          stderr: `Timed out after ${error.timeoutMs}ms.`,
+        });
+      }
+      throw error;
+    }
     if (result.exitCode !== 0) {
       throw new AppError('GIT_COMMAND_FAILED', 'Git command failed.', 502, {
         operation: gitOperation(args),

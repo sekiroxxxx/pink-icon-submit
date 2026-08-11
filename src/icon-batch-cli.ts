@@ -1,12 +1,13 @@
-import { spawn } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { AppError } from './errors.js';
+import { runSubprocess, SubprocessTimeoutError } from './subprocess.js';
 import type { IconBatchResult } from './types.js';
 
 export interface IconBatchCliOptions {
   sourceDirectory?: string;
+  timeoutMs?: number;
 }
 
 export interface IconBatchV2Input {
@@ -58,6 +59,13 @@ export class IconBatchCli {
     try {
       result = await this.execute(this.nodeExecutable, [join(sourceDirectory, 'scripts', 'icon-batch.mjs'), ...args], cwd);
     } catch (error) {
+      if (error instanceof SubprocessTimeoutError) {
+        throw new AppError('ICON_BATCH_COMMAND_TIMEOUT', 'icon-batch exceeded its deadline.', 504, {
+          operation: `stage1 ${command}`,
+          command: commandText,
+          stderr: `Timed out after ${error.timeoutMs}ms.`,
+        });
+      }
       throw new AppError('ICON_BATCH_COMMAND_START_FAILED', 'Unable to start the icon-batch command.', 502, {
         operation: `stage1 ${command}`,
         command: commandText,
@@ -109,6 +117,13 @@ export class IconBatchCli {
     try {
       result = await this.execute(this.nodeExecutable, [this.npmCliPath, 'ci', '--include=dev', '--ignore-scripts', '--no-audit', '--no-fund'], repositoryPath);
     } catch (error) {
+      if (error instanceof SubprocessTimeoutError) {
+        throw new AppError('ICON_BATCH_DEPENDENCY_INSTALL_TIMEOUT', 'npm ci exceeded its deadline.', 504, {
+          operation: 'stage1 dependencies',
+          command: installCommand,
+          message: `Timed out after ${error.timeoutMs}ms.`,
+        });
+      }
       throw new AppError('ICON_BATCH_DEPENDENCY_INSTALL_FAILED', 'Unable to start npm ci for the temporary worktree.', 502, {
         operation: 'stage1 dependencies',
         command: installCommand,
@@ -126,20 +141,6 @@ export class IconBatchCli {
   }
 
   private async execute(executable: string, args: string[], cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-    return new Promise((resolve, reject) => {
-      const processHandle = spawn(executable, args, {
-        cwd,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-      });
-      let stdout = '';
-      let stderr = '';
-      processHandle.stdout.setEncoding('utf8');
-      processHandle.stderr.setEncoding('utf8');
-      processHandle.stdout.on('data', (chunk: string) => { stdout += chunk; });
-      processHandle.stderr.on('data', (chunk: string) => { stderr += chunk; });
-      processHandle.once('error', reject);
-      processHandle.once('close', (exitCode) => resolve({ exitCode: exitCode ?? 1, stdout, stderr }));
-    });
+    return runSubprocess(executable, args, { cwd, timeoutMs: this.options.timeoutMs ?? 300_000 });
   }
 }

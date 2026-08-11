@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { AppError } from '../src/errors.js';
 import { GitHubApiClient } from '../src/github-client.js';
 
 test('GitHub PR lookup uses the authenticated target repository query and recognizes the machine marker', async () => {
@@ -85,5 +86,39 @@ test('GitHub Draft PR creation sends a draft body without putting the token in t
       title: 'test', head: 'sud-icon-bot:bot/test', base: 'main', body: 'test',
     }),
     (error: unknown) => error instanceof Error && !error.message.includes(token),
+  );
+});
+
+test('GitHub requests abort at their deadline and a later request can complete', async () => {
+  let calls = 0;
+  const client = new GitHubApiClient('test-only-token', (_input, init) => {
+    calls += 1;
+    if (calls > 1) {
+      return Promise.resolve(new Response(JSON.stringify({ fork: false }), { status: 200 }));
+    }
+    return new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    });
+  }, { timeoutMs: 100 });
+
+  await assert.rejects(
+    client.getRepository('example/repository'),
+    (error: unknown) => error instanceof AppError && error.code === 'GITHUB_API_TIMEOUT',
+  );
+  assert.deepEqual(await client.getRepository('example/repository'), { fork: false, parentFullName: null });
+});
+
+test('GitHub deadline remains active while the response body is being read', async () => {
+  const client = new GitHubApiClient('test-only-token', async (_input, init) => ({
+    ok: true,
+    status: 200,
+    json: () => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    }),
+  }) as Response, { timeoutMs: 100 });
+
+  await assert.rejects(
+    client.getRepository('example/repository'),
+    (error: unknown) => error instanceof AppError && error.code === 'GITHUB_API_TIMEOUT',
   );
 });

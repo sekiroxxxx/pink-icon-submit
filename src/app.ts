@@ -308,12 +308,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post('/api/batches/:batchId/submit', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.submit(batchId, submitConfirmation(request.body), authenticatedUser(request).id);
+    return await dependencies.batches.submit(batchId, submitConfirmation(request.body), authenticatedUser(request).id);
   });
 
   app.post('/api/batches/:batchId/return-to-edit', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.returnToEdit(batchId, authenticatedUser(request).id);
+    return await dependencies.batches.returnToEdit(batchId, authenticatedUser(request).id);
   });
 
   app.post('/api/batches/:batchId/clone', async (request, reply) => {
@@ -329,7 +329,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post('/api/batches/:batchId/retry', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.retry(batchId, authenticatedUser(request).id);
+    return await dependencies.batches.retry(batchId, authenticatedUser(request).id);
   });
 
   return app;
