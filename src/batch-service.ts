@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { BatchDatabase } from './database.js';
+import { BatchDatabase, type CreatedClone } from './database.js';
 import { CatalogSnapshotCache } from './catalog-snapshot.js';
 import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
@@ -355,9 +355,10 @@ export class BatchService {
     const staged = await this.storage.stageCloneSvgs(source.id, clonedItems.flatMap((item) => item.originalSourceFile
       ? [{ sourceFile: item.originalSourceFile, targetItemId: item.id }]
       : []));
+    let created: CreatedClone | undefined;
     let published: PublishedClone | undefined;
     try {
-      this.database.createClonedBatch(
+      created = this.database.createClonedBatch(
         clonedId,
         {
           title: source.title,
@@ -378,24 +379,25 @@ export class BatchService {
       );
       published = await this.storage.publishStagedClone(staged, clonedId);
     } catch (error) {
-      await this.discardFailedClone(clonedId, cloneOwnerId, staged, published, error);
+      await this.discardFailedClone(created, staged, published, error);
       throw error;
     }
     return this.database.getDetails(clonedId);
   }
 
   private async discardFailedClone(
-    clonedId: string,
-    ownerId: string,
+    created: CreatedClone | undefined,
     staged: { directory: string },
     published: PublishedClone | undefined,
     originalError: unknown,
   ): Promise<void> {
     const cleanupErrors: unknown[] = [];
-    try {
-      this.database.discardUnpublishedClone(clonedId, ownerId);
-    } catch (error) {
-      if (!(error instanceof AppError && error.code === 'BATCH_NOT_FOUND')) cleanupErrors.push(error);
+    if (created) {
+      try {
+        this.database.discardCreatedClone(created);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
     }
     const cleanupTasks = [() => this.storage.discardCloneStaging(staged)];
     if (published) {
@@ -409,7 +411,7 @@ export class BatchService {
       }
     }
     if (cleanupErrors.length > 0) {
-      throw new AggregateError([originalError, ...cleanupErrors], `Clone ${clonedId} failed and its owned resources could not be fully cleaned up.`);
+      throw new AggregateError([originalError, ...cleanupErrors], 'Clone failed and its owned resources could not be fully cleaned up.');
     }
   }
 

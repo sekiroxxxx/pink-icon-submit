@@ -1,4 +1,4 @@
-import { fireEvent, render as renderBase, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render as renderBase, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import { afterEach, expect, test, vi } from 'vitest';
@@ -1161,17 +1161,27 @@ test.each([
   saveProfile();
   const initial = batch({ id: target.id, executionMode: 'remote', state: 'RUNNING', userStatus: 'processing' });
   const stalePoll = deferred<Response>();
+  const pollRegistered = deferred<void>();
+  const pollStarted = deferred<void>();
+  const hydrationStarted = deferred<void>();
   let reads = 0;
   let poll: (() => void) | undefined;
   vi.spyOn(window, 'setInterval').mockImplementation(((callback: TimerHandler, delay?: number) => {
-    if (delay === 1_500) poll = callback as () => void;
+    if (delay === 1_500) {
+      poll = callback as () => void;
+      pollRegistered.resolve();
+    }
     return 1 as unknown as number;
   }) as typeof window.setInterval);
   vi.spyOn(window, 'clearInterval').mockImplementation(() => undefined);
   const fetchMock = vi.fn((path: string) => {
     if (path === `/api/batches/${initial.id}`) {
       reads += 1;
-      if (reads === 1) return stalePoll.promise;
+      if (reads === 1) {
+        pollStarted.resolve();
+        return stalePoll.promise;
+      }
+      hydrationStarted.resolve();
       return Promise.resolve(jsonResponse(target));
     }
     throw new Error(`Unexpected request: ${path}`);
@@ -1179,18 +1189,23 @@ test.each([
   stubFetch(fetchMock, [summary({ id: initial.id, title: initial.title, userStatus: 'processing' })], initial);
 
   render(<App />);
-  await screen.findAllByRole('button', { name: '查看处理中' });
-  await waitFor(() => expect(poll).toBeTypeOf('function'));
-  poll!();
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-  window.history.replaceState({}, '', `/workbench?batch=${initial.id}`);
-  fireEvent.popState(window);
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-  await screen.findByRole('heading', { name: expectedHeading });
+  await pollRegistered.promise;
+  await act(async () => {
+    poll!();
+    await pollStarted.promise;
+  });
+  await act(async () => {
+    window.history.replaceState({}, '', `/workbench?batch=${initial.id}`);
+    fireEvent.popState(window);
+    await hydrationStarted.promise;
+  });
+  expect(screen.getByRole('heading', { name: expectedHeading })).toBeTruthy();
 
-  stalePoll.resolve(jsonResponse(initial));
-  await Promise.resolve();
-  await waitFor(() => expect(screen.getByRole('heading', { name: expectedHeading })).toBeTruthy());
+  await act(async () => {
+    stalePoll.resolve(jsonResponse(initial));
+    await Promise.resolve();
+  });
+  expect(screen.getByRole('heading', { name: expectedHeading })).toBeTruthy();
 });
 
 test('a completed Draft PR returns the current workbench to home and keeps its result available', async () => {

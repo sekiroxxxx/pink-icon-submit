@@ -27,6 +27,8 @@ import type {
 
 export const legacyBootstrapUserId = 'legacy-bootstrap';
 
+const createdCloneMarker: unique symbol = Symbol('created clone ownership');
+
 export interface UserCredentialRecord extends AuthenticatedUser {
   passwordHash: string;
 }
@@ -41,6 +43,14 @@ interface ClonedBatchItem {
   id: string;
   input: CreateItemInput;
   sourceFile: string | null;
+}
+
+/** Internal compensation handle returned only after the clone INSERT commits. */
+export interface CreatedClone {
+  readonly id: string;
+  readonly ownerId: string;
+  readonly rowId: number;
+  readonly [createdCloneMarker]: true;
 }
 
 interface BatchRow {
@@ -487,7 +497,7 @@ export class BatchDatabase {
     ownerId: string,
     items: ReadonlyArray<ClonedBatchItem>,
     enforceSingleActiveOwner = false,
-  ): StoredBatch {
+  ): CreatedClone {
     const create = this.db.transaction(() => {
       if (enforceSingleActiveOwner) this.assertNoActiveBatchForOwner(ownerId);
       const timestamp = now();
@@ -532,37 +542,34 @@ export class BatchDatabase {
           timestamp,
         );
       }
+      const row = this.db.prepare('SELECT rowid AS row_id FROM batches WHERE id = ? AND owner_id = ?').get(id, ownerId) as { row_id: number } | undefined;
+      if (!row) {
+        throw new AppError('CLONE_CREATION_CONFLICT', `Batch ${id} was not created for this clone.`, 409);
+      }
+      return { id, ownerId, rowId: row.row_id, [createdCloneMarker]: true as const };
     });
-    create();
-    return this.getBatch(id);
+    return create();
   }
 
-  discardUnpublishedClone(id: string, ownerId: string): void {
+  discardCreatedClone(created: CreatedClone): void {
+    if (created[createdCloneMarker] !== true) {
+      throw new AppError('CLONE_CLEANUP_CONFLICT', 'Clone cleanup requires a creation ownership handle.', 409);
+    }
     const discard = this.db.transaction(() => {
-      const row = this.db.prepare(`
-        SELECT state, owner_id, validation_json, plan_json, base_commit, local_diff_json,
-          error_code, delivery_checkpoint, delivery_branch, delivery_commit_sha, pr_number
-        FROM batches WHERE id = ?
-      `).get(id) as (Pick<BatchRow,
-        'state' | 'validation_json' | 'plan_json' | 'base_commit' | 'local_diff_json' | 'error_code'
-        | 'delivery_checkpoint' | 'delivery_branch' | 'delivery_commit_sha' | 'pr_number'> & { owner_id: string }) | undefined;
-      if (!row
-        || row.owner_id !== ownerId
-        || row.state !== 'DRAFT'
-        || row.validation_json !== null
-        || row.plan_json !== null
-        || row.base_commit !== null
-        || row.local_diff_json !== null
-        || row.error_code !== null
-        || row.delivery_checkpoint !== 'NONE'
-        || row.delivery_branch !== null
-        || row.delivery_commit_sha !== null
-        || row.pr_number !== null) {
-        throw new AppError('CLONE_CLEANUP_CONFLICT', `Batch ${id} is not an unpublished clone.`, 409);
-      }
-      const result = this.db.prepare('DELETE FROM batches WHERE id = ? AND owner_id = ?').run(id, ownerId);
+      const result = this.db.prepare(`
+        DELETE FROM batches
+        WHERE id = ? AND owner_id = ? AND rowid = ?
+          AND state = 'DRAFT'
+          AND validation_json IS NULL AND warning_ack_request_sha256 IS NULL
+          AND plan_json IS NULL AND base_commit IS NULL AND local_diff_json IS NULL
+          AND error_code IS NULL AND error_message IS NULL
+          AND delivery_checkpoint = 'NONE'
+          AND delivery_branch IS NULL AND delivery_commit_sha IS NULL
+          AND pr_number IS NULL AND pr_url IS NULL AND pr_state IS NULL
+          AND pr_is_draft IS NULL AND pr_created_at IS NULL AND handoff_at IS NULL
+      `).run(created.id, created.ownerId, created.rowId);
       if (result.changes !== 1) {
-        throw new AppError('CLONE_CLEANUP_CONFLICT', `Batch ${id} could not be discarded.`, 409);
+        throw new AppError('CLONE_CLEANUP_CONFLICT', `Batch ${created.id} could not be discarded.`, 409);
       }
     });
     discard();

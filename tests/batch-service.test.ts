@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -366,6 +367,93 @@ test('a target directory that appears before clone publish is never deleted afte
   assert.equal(batches.getActiveBatch('legacy-bootstrap'), null);
   assert.deepEqual(batches.listBatches(20).map((batch) => batch.id), [source.id]);
   assert.equal((await readdir(environment.config.storageRoot)).some((entry) => entry.startsWith('.clone-')), false);
+});
+
+test('a same-owner database ID collision never compensates away the existing batch, items, or files', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const source = await environment.batches.createBatch({
+    title: 'Database collision source',
+    description: 'An existing same-owner ID must win over clone compensation.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  await environment.batches.addItem(source.id, {
+    action: 'add',
+    designName: 'database-collision-source-icon',
+    description: 'Source SVG for the attempted clone.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(source.id);
+  environment.database.claimNextJob();
+  environment.database.failJob(source.id, 'CATALOG_INTEGRITY_MISMATCH', 'Terminal source fixture.');
+
+  const database = environment.database;
+  const originalCreate = database.createClonedBatch.bind(database);
+  const originalDiscard = database.discardCreatedClone.bind(database);
+  let collisionId: string | undefined;
+  let discardCalls = 0;
+  database.createClonedBatch = ((id, input, catalogBaseline, targetRepository, executionContext, ownerId, items, enforceSingleActiveOwner) => {
+    collisionId = id;
+    database.createBatch(id, {
+      title: 'Existing same-owner draft',
+      description: 'This row was not created by the clone attempt.',
+      submitter: input.submitter,
+    }, catalogBaseline, targetRepository, executionContext, ownerId, enforceSingleActiveOwner);
+    database.insertItem(id, 'item-existing-collision', {
+      action: 'add',
+      designName: 'existing-collision-icon',
+      description: 'Keep the existing item intact.',
+    }, 'uploads/item-existing-collision.svg');
+    mkdirSync(join(environment.config.storageRoot, id, 'uploads'), { recursive: true });
+    writeFileSync(join(environment.config.storageRoot, id, 'uploads/item-existing-collision.svg'), 'existing clone collision file\n');
+    return originalCreate(id, input, catalogBaseline, targetRepository, executionContext, ownerId, items, enforceSingleActiveOwner);
+  }) as typeof database.createClonedBatch;
+  database.discardCreatedClone = ((created) => {
+    discardCalls += 1;
+    return originalDiscard(created);
+  }) as typeof database.discardCreatedClone;
+  t.after(() => {
+    database.createClonedBatch = originalCreate;
+    database.discardCreatedClone = originalDiscard;
+  });
+
+  await assert.rejects(() => environment.batches.cloneBatch(source.id));
+
+  assert.ok(collisionId);
+  assert.equal(discardCalls, 0);
+  const existing = database.getDetails(collisionId);
+  assert.equal(existing.title, 'Existing same-owner draft');
+  assert.deepEqual(existing.items.map((item) => item.id), ['item-existing-collision']);
+  assert.equal(await readFile(join(environment.config.storageRoot, collisionId, 'uploads/item-existing-collision.svg'), 'utf8'), 'existing clone collision file\n');
+});
+
+test('a stale clone ownership handle cannot delete a later same-owner row with the reused batch ID', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const input = {
+    title: 'Clone handle fixture',
+    description: 'Database row identity must survive sequential ID reuse.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  };
+  const catalogBaseline = {
+    packageName: '@pink/codicons', requestedTag: 'beta', version: '0.0.46-test.1', integrity: 'sha512-test',
+    sourceRepository: 'sud-global/pink-codicons', sourceCommit: 'a'.repeat(40),
+  };
+  const targetRepository = { repository: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test', branch: 'main' as const };
+  const executionContext = { executionMode: 'local' as const, pushRepository: null, pushBranchPrefix: null };
+  const batchId = 'ICON-20260811-C0FFEE00';
+  const created = environment.database.createClonedBatch(
+    batchId, input, catalogBaseline, targetRepository, executionContext, 'legacy-bootstrap', [], false,
+  );
+  environment.database.discardCreatedClone(created);
+
+  // Ensure the next same-ID row receives a different SQLite row identity even
+  // on SQLite builds that otherwise reuse the highest deleted rowid.
+  environment.database.createBatch('ICON-20260811-F11E0000', input, catalogBaseline, targetRepository, executionContext);
+  environment.database.createBatch(batchId, {
+    ...input,
+    title: 'Later same-owner row',
+  }, catalogBaseline, targetRepository, executionContext);
+
+  assert.throws(() => environment.database.discardCreatedClone(created), { code: 'CLONE_CLEANUP_CONFLICT' });
+  assert.equal(environment.database.getBatch(batchId).title, 'Later same-owner row');
 });
 
 test('DRAFT content edits advance a monotonic revision after a same-millisecond final validation failure', async (t) => {
