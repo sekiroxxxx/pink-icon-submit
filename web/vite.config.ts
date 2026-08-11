@@ -13,7 +13,6 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: process.env.PINK_ICON_SUBMIT_API_URL ?? 'http://127.0.0.1:3000',
-        changeOrigin: true,
       },
     },
   },

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { readFile, readdir, rm } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 
 import { BatchService } from '../src/batch-service.js';
 import { catalogOptionsFromConfig } from '../src/config.js';
 import { IconBatchCli } from '../src/icon-batch-cli.js';
+import { BatchStorage, type PublishedClone, type StagedClone } from '../src/storage.js';
 import { LocalDiffWorker } from '../src/worker.js';
 import type { IconBatchResult } from '../src/types.js';
 import { createTestEnvironment } from './helpers.js';
@@ -42,6 +43,21 @@ class BlockingIconBatchCli extends IconBatchCli {
 
   finishValidation(): void {
     this.resolveValidation();
+  }
+}
+
+class CollidingCloneStorage extends BatchStorage {
+  collisionDirectory: string | undefined;
+
+  constructor(private readonly rootPath: string) {
+    super(rootPath);
+  }
+
+  override async publishStagedClone(staging: StagedClone, targetBatchId: string): Promise<PublishedClone> {
+    this.collisionDirectory = join(this.rootPath, targetBatchId);
+    await mkdir(this.collisionDirectory, { recursive: true });
+    await writeFile(join(this.collisionDirectory, 'pre-existing.txt'), 'do not remove\n');
+    return super.publishStagedClone(staging, targetBatchId);
   }
 }
 
@@ -312,6 +328,44 @@ test('a later source SVG failure cleans staged clone files without changing the 
   assert.equal(retained.state, 'FAILED');
   assert.equal(environment.batches.getActiveBatch('legacy-bootstrap'), null);
   assert.deepEqual(await readdir(environment.config.storageRoot), [source.id]);
+});
+
+test('a target directory that appears before clone publish is never deleted after rename fails', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const storage = new CollidingCloneStorage(environment.config.storageRoot);
+  const batches = new BatchService(
+    environment.database,
+    storage,
+    environment.batches.repository,
+    new IconBatchCli(),
+    environment.config.maxUploadBytes,
+    catalogOptionsFromConfig(environment.config),
+    environment.config.targetRepository,
+  );
+  const source = await batches.createBatch({
+    title: 'Publish collision source',
+    description: 'An unrelated target directory must survive a failed rename.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  await batches.addItem(source.id, {
+    action: 'add',
+    designName: 'publish-collision-icon',
+    description: 'Source SVG for a clone rename collision.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(source.id);
+  environment.database.claimNextJob();
+  environment.database.failJob(source.id, 'CATALOG_INTEGRITY_MISMATCH', 'Terminal source fixture.');
+
+  await assert.rejects(() => batches.cloneBatch(source.id), (error) => {
+    assert.ok(storage.collisionDirectory, `clone failed before publish: ${error}`);
+    return true;
+  });
+
+  assert.ok(storage.collisionDirectory);
+  assert.equal(await readFile(join(storage.collisionDirectory, 'pre-existing.txt'), 'utf8'), 'do not remove\n');
+  assert.equal(batches.getActiveBatch('legacy-bootstrap'), null);
+  assert.deepEqual(batches.listBatches(20).map((batch) => batch.id), [source.id]);
+  assert.equal((await readdir(environment.config.storageRoot)).some((entry) => entry.startsWith('.clone-')), false);
 });
 
 test('DRAFT content edits advance a monotonic revision after a same-millisecond final validation failure', async (t) => {

@@ -4,6 +4,8 @@ import { join, relative, resolve } from 'node:path';
 import { AppError } from './errors.js';
 import type { StoredBatch, StoredItem } from './types.js';
 
+const publishedCloneMarker: unique symbol = Symbol('published clone ownership');
+
 export class BatchStorage {
   constructor(private readonly rootDirectory: string) {}
 
@@ -49,11 +51,17 @@ export class BatchStorage {
     }
   }
 
-  async publishStagedClone(staging: StagedClone, targetBatchId: string): Promise<void> {
+  /**
+   * A PublishedClone is returned only after this call's staging directory has
+   * successfully become the target directory.  Callers must retain it before
+   * they are allowed to remove that target on an error path.
+   */
+  async publishStagedClone(staging: StagedClone, targetBatchId: string): Promise<PublishedClone> {
     const root = this.storageRoot();
     this.assertOwnedPath(staging.directory, root);
     const target = this.resolveBatchDirectory(targetBatchId);
     await rename(staging.directory, target);
+    return { directory: target, [publishedCloneMarker]: true };
   }
 
   async discardCloneStaging(staging: StagedClone): Promise<void> {
@@ -61,9 +69,12 @@ export class BatchStorage {
     await rm(staging.directory, { recursive: true, force: true });
   }
 
-  async discardClonedBatch(batchId: string): Promise<void> {
-    const directory = this.resolveBatchDirectory(batchId);
-    await rm(directory, { recursive: true, force: true });
+  async discardPublishedClone(published: PublishedClone): Promise<void> {
+    if (published[publishedCloneMarker] !== true) {
+      throw new AppError('STORAGE_PATH_INVALID', 'Clone cleanup requires a published ownership handle.', 500);
+    }
+    this.assertOwnedPath(published.directory, this.storageRoot());
+    await rm(published.directory, { recursive: true, force: true });
   }
 
   async writeRequest(batch: StoredBatch, items: StoredItem[]): Promise<string> {
@@ -152,4 +163,10 @@ export class BatchStorage {
 
 export interface StagedClone {
   directory: string;
+}
+
+/** Opaque ownership handle issued only after a successful staging rename. */
+export interface PublishedClone {
+  readonly directory: string;
+  readonly [publishedCloneMarker]: true;
 }
