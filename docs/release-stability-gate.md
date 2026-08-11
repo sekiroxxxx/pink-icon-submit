@@ -49,3 +49,5 @@ Explicitly excluded:
 
 The production repository may be configured only after every applicable row is
 proven and the remaining rows are explicitly marked not required with evidence.
+The operational sequence and rollback boundary are defined in
+[the release candidate runbook](./release-candidate-runbook.md).

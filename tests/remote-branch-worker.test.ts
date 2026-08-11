@@ -40,6 +40,27 @@ async function recordBareRemoteReceives(t: test.TestContext, environment: TestEn
   };
 }
 
+async function bareRemoteReceiveRefs(environment: TestEnvironment): Promise<string[]> {
+  const receiveLogPath = join(dirname(environment.pushRepositoryPath!), 'test-bare-receive.log');
+  try {
+    return (await readFile(receiveLogPath, 'utf8'))
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => line.trim().split(/\s+/)[2]!)
+      .filter(Boolean);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+function registeredWorktrees(repositoryPath: string): string[] {
+  return execFileSync('git', ['-C', repositoryPath, 'worktree', 'list', '--porcelain'], { encoding: 'utf8' })
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('worktree '))
+    .map((line) => line.slice('worktree '.length));
+}
+
 async function hasNoLegacyTemporaryEntries(path: string): Promise<boolean> {
   try {
     return (await readdir(path)).length === 0;
@@ -206,6 +227,73 @@ test('remote worker creates one Draft PR only while the target base remains curr
   assert.equal(remoteHead(environment.pushRepositoryPath!, 'main'), environment.config.targetRepository.branch === 'main'
     ? execFileSync('git', ['-C', environment.config.repositoryPath, 'rev-parse', 'upstream/main'], { encoding: 'utf8' }).trim()
     : '');
+});
+
+test('remote delivery soak creates one branch and one Draft PR for each of five queued batches', async (t) => {
+  const environment = await createTestEnvironment(t, { executionMode: 'remote' });
+  await recordBareRemoteReceives(t, environment);
+  const github = new FakeGitHubPullRequestClient();
+  const worker = workerFor(environment, github);
+  const initialWorktrees = registeredWorktrees(environment.config.repositoryPath);
+  const batchIds: string[] = [];
+
+  for (let index = 1; index <= 5; index += 1) {
+    const batch = await environment.batches.createBatch({
+      title: `Remote soak batch ${index}`,
+      description: 'Exercise repeated remote delivery against persistent external boundaries.',
+      designUrl: `https://design.example.invalid/remote-soak-${index}`,
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    });
+    await environment.batches.addItem(batch.id, {
+      action: 'add',
+      designName: `remote-soak-icon-${index}`,
+      description: `Remote soak icon ${index}`,
+    }, Buffer.from(environment.validSvg));
+    environment.database.queueJob(batch.id);
+    batchIds.push(batch.id);
+  }
+
+  const processedBatchIds: string[] = [];
+  for (let index = 0; index < batchIds.length; index += 1) {
+    const result = await worker.processNext();
+    assert.equal(result.processed, true);
+    if (result.processed) processedBatchIds.push(result.batchId);
+  }
+  assert.deepEqual([...processedBatchIds].sort(), [...batchIds].sort());
+  assert.deepEqual(await worker.processNext(), { processed: false });
+  assert.equal(environment.database.claimNextJob(), null);
+
+  const receiveRefs = await bareRemoteReceiveRefs(environment);
+  assert.equal(receiveRefs.length, batchIds.length);
+  for (const batchId of batchIds) {
+    const completed = environment.batches.getBatch(batchId);
+    const branch = `bot/${batchId}`;
+    const head = `sud-icon-bot:${branch}`;
+    const exactHeadPullRequests = github.pullRequests.filter((entry) => entry.head === head);
+
+    assert.equal(completed.state, 'PR_CREATED');
+    assert.equal(completed.delivery.checkpoint, 'PR_CREATED');
+    assert.equal(completed.job?.state, 'COMPLETED');
+    assert.equal(completed.job?.attempt, 1);
+    assert.equal(completed.delivery.branch, branch);
+    assert.equal(completed.delivery.commitSha, remoteHead(environment.pushRepositoryPath!, branch));
+    assert.equal(receiveRefs.filter((ref) => ref === `refs/heads/${branch}`).length, 1);
+    assert.equal(exactHeadPullRequests.length, 1);
+    assert.equal(exactHeadPullRequests[0]?.pullRequest.isDraft, true);
+    assert.deepEqual(
+      await github.findPullRequest(
+        environment.config.targetRepository.repository,
+        head,
+        `<!-- pink-icon-submit:batch=${batchId} -->`,
+      ),
+      { matching: exactHeadPullRequests[0]?.pullRequest, conflicting: null },
+    );
+    assert.equal(completed.delivery.pullRequest?.number, exactHeadPullRequests[0]?.pullRequest.number);
+  }
+
+  assert.equal(github.pullRequests.length, batchIds.length);
+  assert.deepEqual(registeredWorktrees(environment.config.repositoryPath), initialWorktrees);
+  assert.equal(await hasNoLegacyTemporaryEntries(environment.config.temporaryRoot), true);
 });
 
 test('remote worker runs and persists final Stage 1 validation before committing or pushing', async (t) => {
