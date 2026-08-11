@@ -4,10 +4,10 @@ PinK 图标自动 Draft PR MVP 的独立编排服务。当前包含 Fastify、SQ
 
 ## 边界
 
-- 新增名称、最终目标、mapping、alias 与 codepoint 规则只调用 `pink-codicons/scripts/icon-batch.mjs`；服务端不自行分配 codepoint。
+- 最终新增名称、目标、mapping、alias 与 codepoint 规则只调用 `pink-codicons/scripts/icon-batch.mjs`；服务端不自行分配 codepoint。
 - 设计提交页的图标目录直接读取 `@pink/codicons@beta` 的 npm tarball：只解析 `src/template/mapping.json` 和 `src/icons/*.svg`，验证 npm 的 sha512 SRI，并按 integrity 的 SHA-256 缓存解析后的不可变快照和原始 `.tgz`。不会安装该包、执行包脚本或本地构建设计目录。
 - 创建批次时会冻结 npm 的 `catalogBaseline`（包名、tag、精确版本、SRI、来源仓库和 commit）及目标仓库；后续校验、plan 和 apply 始终使用该批次对应的缓存 tarball。
-- 目录展示基于 npm 发布物；名称预览、最终校验和本地 diff 基于目标 Git ref。`local` 模式只解析本地 ref，绝不执行 `git fetch`；本地 Stage 1 源码只提供 CLI 实现，不能替代 npm catalog 基线。
+- 目录展示以及 replace/delete 的 target alias 规范化均基于 npm 发布物；设计阶段不访问目标 Git。最终校验和本地 diff 才基于目标 Git ref。`local` 模式只解析本地 ref，绝不执行 `git fetch`；本地 Stage 1 源码只提供 CLI 实现，不能替代 npm catalog 基线。
 - local Worker 只在临时 worktree 生成本地 diff；remote Worker 会在 R3 创建一个 `bot/<batchId>` commit、普通 push，并向 R2/main 创建一个 GitHub Draft PR。
 - 前端只负责批次表单、SVG 预览、目录选择和状态展示；不解析 mapping、不分配 codepoint、不持有 GitHub Token。
 - 服务使用内部预置账号和 HttpOnly、SameSite=Lax 会话 Cookie。除健康检查和登录外，所有 catalog 与批次 API 都要求登录；批次、历史和唯一活动批次均按 `owner_id` 在服务端隔离。浏览器不再用 localStorage 决定账号或活动批次，只保留无安全含义的界面状态。
