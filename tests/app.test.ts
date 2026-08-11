@@ -2,11 +2,23 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { buildApp } from '../src/app.js';
+import { AuthService, sessionCookieName } from '../src/auth.js';
 import { createTestEnvironment } from './helpers.js';
+
+async function buildAuthenticatedApp(environment: Awaited<ReturnType<typeof createTestEnvironment>>) {
+  const auth = new AuthService(environment.database);
+  await auth.provisionBootstrapUser({ username: 'designer@example.invalid', password: 'test-password' });
+  const session = await auth.login({ username: 'designer@example.invalid', password: 'test-password' });
+  const app = await buildApp({ batches: environment.batches, auth });
+  app.addHook('onRequest', async (request) => {
+    if (!request.headers.cookie) request.headers.cookie = `${sessionCookieName}=${session.token}`;
+  });
+  return { app, user: session.user };
+}
 
 test('batch API stores uploads, validates through icon-batch, and exposes catalog', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
 
   const created = await app.inject({
@@ -62,7 +74,7 @@ test('batch API stores uploads, validates through icon-batch, and exposes catalo
 
 test('DRAFT items can be updated and deleted', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
 
   const created = await app.inject({
@@ -109,7 +121,7 @@ test('DRAFT items can be updated and deleted', async (t) => {
 
 test('DRAFT batch metadata can be updated and clears obsolete validation, but READY batches remain immutable', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
 
   const created = await app.inject({
@@ -164,20 +176,9 @@ test('DRAFT batch metadata can be updated and clears obsolete validation, but RE
   assert.equal(validated.statusCode, 409);
   assert.equal((validated.json() as { error: { code: string } }).error.code, 'BATCH_EMPTY');
 
-  const readyBatch = await app.inject({
-    method: 'POST',
-    url: '/api/batches',
-    payload: {
-      title: 'Ready title',
-      description: 'Ready description',
-      designUrl: 'https://design.example.invalid/ready',
-      submitter: { name: 'Designer', email: 'designer@example.invalid' },
-    },
-  });
-  const readyBatchId = (readyBatch.json() as { id: string }).id;
   await app.inject({
     method: 'POST',
-    url: `/api/batches/${readyBatchId}/items`,
+    url: `/api/batches/${batchId}/items`,
     payload: {
       action: 'add',
       designName: 'ready-metadata-icon',
@@ -185,12 +186,12 @@ test('DRAFT batch metadata can be updated and clears obsolete validation, but RE
       svgBase64: Buffer.from(environment.validSvg).toString('base64'),
     },
   });
-  const validation = await app.inject({ method: 'POST', url: `/api/batches/${readyBatchId}/validate` });
+  const validation = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/validate` });
   assert.equal(validation.statusCode, 200);
 
   const rejected = await app.inject({
     method: 'PUT',
-    url: `/api/batches/${readyBatchId}`,
+    url: `/api/batches/${batchId}`,
     payload: {
       title: 'Not allowed',
       description: 'Not allowed',
@@ -203,7 +204,7 @@ test('DRAFT batch metadata can be updated and clears obsolete validation, but RE
 
 test('delete replacement must select a different existing catalog icon', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
   const created = await app.inject({
     method: 'POST',
@@ -232,7 +233,7 @@ test('delete replacement must select a different existing catalog icon', async (
 
 test('catalog page returns canonical icons with SVG thumbnails and normalizes aliases', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
 
   const page = await app.inject({ method: 'GET', url: '/api/catalog/page?query=existing&group=common&page=1&pageSize=24' });
@@ -288,7 +289,7 @@ test('catalog page returns canonical icons with SVG thumbnails and normalizes al
 
 test('name preview delegates normalization and catalog collision checks to icon-batch', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
 
   const preview = await app.inject({ method: 'GET', url: '/api/names/preview?name=ExistingAlias' });
@@ -320,7 +321,7 @@ test('name preview delegates normalization and catalog collision checks to icon-
 
 test('validation warnings are retained for developer review without blocking submission', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
   const created = await app.inject({
     method: 'POST',
@@ -353,7 +354,7 @@ test('validation warnings are retained for developer review without blocking sub
 
 test('catalog pages reuse the immutable npm snapshot across repeated reads', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
 
   const first = await app.inject({ method: 'GET', url: '/api/catalog/page?page=1&pageSize=24' });
@@ -368,23 +369,10 @@ test('catalog pages reuse the immutable npm snapshot across repeated reads', asy
   assert.deepEqual(environment.registryRequests, { metadata: 1, tarball: 1 });
 });
 
-test('batch creation rejects invalid designer email and design links', async (t) => {
+test('batch creation derives the submitter from the authenticated account and rejects invalid design links', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
-
-  const invalidEmail = await app.inject({
-    method: 'POST',
-    url: '/api/batches',
-    payload: {
-      title: 'Invalid email',
-      description: 'Validation',
-      designUrl: 'https://design.example.invalid/email',
-      submitter: { name: 'Designer', email: 'not-an-email' },
-    },
-  });
-  assert.equal(invalidEmail.statusCode, 400);
-  assert.equal((invalidEmail.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
 
   const invalidUrl = await app.inject({
     method: 'POST',
@@ -411,11 +399,26 @@ test('batch creation rejects invalid designer email and design links', async (t)
   });
   assert.equal(malformedHttps.statusCode, 400);
   assert.equal((malformedHttps.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
+
+  const spoofedSubmitter = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Authenticated submitter',
+      description: 'The account identity must override request-provided submitter data.',
+      submitter: { name: 'Spoofed', email: 'spoofed@example.invalid' },
+    },
+  });
+  assert.equal(spoofedSubmitter.statusCode, 201);
+  assert.deepEqual((spoofedSubmitter.json() as { submitter: unknown }).submitter, {
+    name: 'designer',
+    email: 'designer@example.invalid',
+  });
 });
 
 test('oversized multipart SVG returns UPLOAD_TOO_LARGE', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
 
   const boundary = '----pink-icon-submit-oversized';
@@ -450,7 +453,7 @@ test('oversized multipart SVG returns UPLOAD_TOO_LARGE', async (t) => {
 
 test('multipart item payload must be an object', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
   const created = await app.inject({
     method: 'POST',
@@ -483,7 +486,7 @@ test('multipart item payload must be an object', async (t) => {
 
 test('DRAFT API delivery accepts an optional design link and queues without the legacy validate endpoint', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
 
   const created = await app.inject({
@@ -519,14 +522,14 @@ test('DRAFT API delivery accepts an optional design link and queues without the 
 
 test('batch list returns user-only summaries with stable bounds, ordering, and recovery status', async (t) => {
   const environment = await createTestEnvironment(t);
-  const app = await buildApp({ batches: environment.batches });
+  const { app, user } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
 
   const seed = await environment.batches.createBatch({
     title: 'Seed batch',
     description: 'Supplies the frozen protocol context for direct fixture rows.',
     submitter: { name: 'Designer', email: 'designer@example.invalid' },
-  });
+  }, user.id);
   const localContext = {
     executionMode: seed.executionMode ?? 'local' as const,
     pushRepository: seed.pushRepository,
@@ -536,7 +539,7 @@ test('batch list returns user-only summaries with stable bounds, ordering, and r
     title,
     description: `${title} description`,
     submitter: { name: 'Designer', email: 'designer@example.invalid' },
-  }, seed.catalogBaseline!, seed.targetRepository!, context);
+  }, seed.catalogBaseline!, seed.targetRepository!, context, user.id);
   for (let index = 0; index < 21; index += 1) {
     create(`ICON-HOME-${String(index).padStart(2, '0')}`, `Batch ${index}`);
   }

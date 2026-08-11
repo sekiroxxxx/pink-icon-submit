@@ -3,12 +3,13 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import { AppError, sanitizeDiagnosticText } from './errors.js';
-import { userStatusForBatch } from './batch-lifecycle.js';
+import { isActiveBatch, lifecycleSnapshot, userStatusForBatch } from './batch-lifecycle.js';
 import type {
   BatchExecutionContext,
   BatchDetails,
   BatchSummary,
   BatchState,
+  AuthenticatedUser,
   CatalogBaseline,
   CreateBatchInput,
   CreateItemInput,
@@ -23,6 +24,35 @@ import type {
   TargetRepository,
   WorkerFailureDiagnostic,
 } from './types.js';
+
+export const legacyBootstrapUserId = 'legacy-bootstrap';
+
+const createdCloneMarker: unique symbol = Symbol('created clone ownership');
+
+export interface UserCredentialRecord extends AuthenticatedUser {
+  passwordHash: string;
+}
+
+interface SessionInput {
+  tokenHash: string;
+  userId: string;
+  expiresAt: string;
+}
+
+interface ClonedBatchItem {
+  id: string;
+  input: CreateItemInput;
+  sourceFile: string | null;
+}
+
+/** Internal compensation handle returned only after the clone INSERT commits. */
+export interface CreatedClone {
+  readonly id: string;
+  readonly ownerId: string;
+  readonly nonce: string;
+  readonly revision: string;
+  readonly [createdCloneMarker]: true;
+}
 
 interface BatchRow {
   id: string;
@@ -53,8 +83,16 @@ interface BatchRow {
   local_diff_json: string | null;
   error_code: string | null;
   error_message: string | null;
+  clone_creation_nonce: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface UserRow {
+  id: string;
+  username: string;
+  password_hash: string;
+  created_at: string;
 }
 
 interface ItemRow {
@@ -212,6 +250,8 @@ function storedRemoteDelivery(row: BatchRow): RemoteDeliveryState {
 function toBatch(row: BatchRow): StoredBatch {
   const validation = parseJson(row.validation_json);
   const requestSha256 = validationRequestSha256(validation);
+  const delivery = storedRemoteDelivery(row);
+  const error = row.error_code && row.error_message ? { code: row.error_code, message: row.error_message } : null;
   return {
     id: row.id,
     title: row.title,
@@ -223,14 +263,22 @@ function toBatch(row: BatchRow): StoredBatch {
     executionMode: storedExecutionMode(row.execution_mode),
     pushRepository: row.push_repository,
     pushBranchPrefix: row.push_branch_prefix,
-    delivery: storedRemoteDelivery(row),
+    delivery,
     state: row.state,
     validation,
     warningsAcknowledged: requestSha256 !== null && row.warning_ack_request_sha256 === requestSha256,
     plan: parseJson(row.plan_json),
     baseCommit: row.base_commit,
     localDiff: parseJson(row.local_diff_json),
-    error: row.error_code && row.error_message ? { code: row.error_code, message: row.error_message } : null,
+    error,
+    userStatus: userStatusForBatch({
+      state: row.state,
+      executionMode: storedExecutionMode(row.execution_mode),
+      baseCommit: row.base_commit,
+      validation,
+      errorCode: error?.code ?? null,
+      delivery,
+    }),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -355,36 +403,202 @@ export class BatchDatabase {
     this.db.close();
   }
 
+  createUser(input: { id: string; username: string; passwordHash: string }): AuthenticatedUser {
+    this.db.prepare(`
+      INSERT INTO users (id, username, password_hash, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(input.id, input.username, input.passwordHash, now());
+    return { id: input.id, username: input.username };
+  }
+
+  findUserByUsername(username: string): UserCredentialRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(username) as UserRow | undefined;
+    return row ? toUser(row) : undefined;
+  }
+
+  updateUserPasswordHash(userId: string, passwordHash: string): void {
+    const result = this.db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, userId);
+    if (result.changes !== 1) {
+      throw new AppError('USER_NOT_FOUND', 'Bootstrap user no longer exists.', 404);
+    }
+  }
+
+  createSession(input: SessionInput): void {
+    const create = this.db.transaction(() => {
+      this.db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now());
+      this.db.prepare(`
+        INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(input.tokenHash, input.userId, input.expiresAt, now());
+    });
+    create();
+  }
+
+  findSessionUser(tokenHash: string, currentTime: string): AuthenticatedUser | undefined {
+    const row = this.db.prepare(`
+      SELECT users.id, users.username
+      FROM sessions JOIN users ON users.id = sessions.user_id
+      WHERE sessions.token_hash = ? AND sessions.expires_at > ?
+    `).get(tokenHash, currentTime) as Pick<UserRow, 'id' | 'username'> | undefined;
+    return row ? { id: row.id, username: row.username } : undefined;
+  }
+
+  deleteSession(tokenHash: string): void {
+    this.db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+  }
+
   createBatch(
     id: string,
     input: CreateBatchInput,
     catalogBaseline: CatalogBaseline,
     targetRepository: TargetRepository,
     executionContext: BatchExecutionContext,
+    ownerId = legacyBootstrapUserId,
+    enforceSingleActiveOwner = false,
   ): StoredBatch {
-    const timestamp = now();
-    this.db.prepare(`
-      INSERT INTO batches (
-        id, title, description, design_url, submitter_name, submitter_email,
-        catalog_baseline_json, target_repository_json, execution_mode, push_repository, push_branch_prefix,
-        state, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?)
-    `).run(
-      id,
-      input.title,
-      input.description,
-      input.designUrl ?? '',
-      input.submitter.name,
-      input.submitter.email,
-      JSON.stringify(catalogBaseline),
-      JSON.stringify(targetRepository),
-      executionContext.executionMode,
-      executionContext.pushRepository,
-      executionContext.pushBranchPrefix,
-      timestamp,
-      timestamp,
-    );
+    const create = this.db.transaction(() => {
+      if (enforceSingleActiveOwner) this.assertNoActiveBatchForOwner(ownerId);
+      const timestamp = now();
+      this.db.prepare(`
+        INSERT INTO batches (
+          id, owner_id, title, description, design_url, submitter_name, submitter_email,
+          catalog_baseline_json, target_repository_json, execution_mode, push_repository, push_branch_prefix,
+          state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?)
+      `).run(
+        id,
+        ownerId,
+        input.title,
+        input.description,
+        input.designUrl ?? '',
+        input.submitter.name,
+        input.submitter.email,
+        JSON.stringify(catalogBaseline),
+        JSON.stringify(targetRepository),
+        executionContext.executionMode,
+        executionContext.pushRepository,
+        executionContext.pushBranchPrefix,
+        timestamp,
+        timestamp,
+      );
+    });
+    create();
     return this.getBatch(id);
+  }
+
+  /**
+   * Clone creation writes the DRAFT row and all of its design inputs in one
+   * transaction.  It deliberately has no delivery evidence to copy.
+   */
+  createClonedBatch(
+    id: string,
+    input: CreateBatchInput,
+    catalogBaseline: CatalogBaseline,
+    targetRepository: TargetRepository,
+    executionContext: BatchExecutionContext,
+    ownerId: string,
+    items: ReadonlyArray<ClonedBatchItem>,
+    cloneCreationNonce: string,
+    enforceSingleActiveOwner = false,
+  ): CreatedClone {
+    const create = this.db.transaction(() => {
+      if (enforceSingleActiveOwner) this.assertNoActiveBatchForOwner(ownerId);
+      const timestamp = now();
+      this.db.prepare(`
+        INSERT INTO batches (
+          id, owner_id, title, description, design_url, submitter_name, submitter_email,
+          catalog_baseline_json, target_repository_json, execution_mode, push_repository, push_branch_prefix,
+          state, clone_creation_nonce, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?)
+      `).run(
+        id,
+        ownerId,
+        input.title,
+        input.description,
+        input.designUrl ?? '',
+        input.submitter.name,
+        input.submitter.email,
+        JSON.stringify(catalogBaseline),
+        JSON.stringify(targetRepository),
+        executionContext.executionMode,
+        executionContext.pushRepository,
+        executionContext.pushBranchPrefix,
+        cloneCreationNonce,
+        timestamp,
+        timestamp,
+      );
+      const insertItem = this.db.prepare(`
+        INSERT INTO items (
+          id, batch_id, action, design_name, target_name, description, reason, replacement_name, source_file, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const item of items) {
+        insertItem.run(
+          item.id,
+          id,
+          item.input.action,
+          item.input.designName ?? null,
+          item.input.targetName ?? null,
+          item.input.description ?? null,
+          item.input.reason ?? null,
+          item.input.replacementName ?? null,
+          item.sourceFile,
+          timestamp,
+        );
+      }
+      const row = this.db.prepare(`
+        SELECT clone_creation_nonce, updated_at FROM batches
+        WHERE id = ? AND owner_id = ? AND clone_creation_nonce = ?
+      `).get(id, ownerId, cloneCreationNonce) as Pick<BatchRow, 'clone_creation_nonce' | 'updated_at'> | undefined;
+      if (!row || row.clone_creation_nonce !== cloneCreationNonce) {
+        throw new AppError('CLONE_CREATION_CONFLICT', `Batch ${id} was not created for this clone.`, 409);
+      }
+      return { id, ownerId, nonce: cloneCreationNonce, revision: row.updated_at, [createdCloneMarker]: true as const };
+    });
+    return create();
+  }
+
+  /**
+   * A successful storage publication retires the one-time compensation handle
+   * without changing the batch's content revision.
+   */
+  completeClonePublication(created: CreatedClone): void {
+    if (created[createdCloneMarker] !== true) {
+      throw new AppError('CLONE_CLEANUP_CONFLICT', 'Clone publication requires a creation ownership handle.', 409);
+    }
+    const result = this.db.prepare(`
+      UPDATE batches
+      SET clone_creation_nonce = NULL
+      WHERE id = ? AND owner_id = ? AND clone_creation_nonce = ?
+    `).run(created.id, created.ownerId, created.nonce);
+    if (result.changes !== 1) {
+      throw new AppError('CLONE_CLEANUP_CONFLICT', `Batch ${created.id} could not complete clone publication.`, 409);
+    }
+  }
+
+  discardCreatedClone(created: CreatedClone): void {
+    if (created[createdCloneMarker] !== true) {
+      throw new AppError('CLONE_CLEANUP_CONFLICT', 'Clone cleanup requires a creation ownership handle.', 409);
+    }
+    const discard = this.db.transaction(() => {
+      const result = this.db.prepare(`
+        DELETE FROM batches
+        WHERE id = ? AND owner_id = ? AND clone_creation_nonce = ? AND updated_at = ?
+          AND state = 'DRAFT'
+          AND validation_json IS NULL AND warning_ack_request_sha256 IS NULL
+          AND plan_json IS NULL AND base_commit IS NULL AND local_diff_json IS NULL
+          AND error_code IS NULL AND error_message IS NULL
+          AND delivery_checkpoint = 'NONE'
+          AND delivery_branch IS NULL AND delivery_commit_sha IS NULL
+          AND pr_number IS NULL AND pr_url IS NULL AND pr_state IS NULL
+          AND pr_is_draft IS NULL AND pr_created_at IS NULL AND handoff_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = batches.id)
+      `).run(created.id, created.ownerId, created.nonce, created.revision);
+      if (result.changes !== 1) {
+        throw new AppError('CLONE_CLEANUP_CONFLICT', `Batch ${created.id} could not be discarded.`, 409);
+      }
+    });
+    discard();
   }
 
   updateBatchMetadata(batchId: string, input: Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>): StoredBatch {
@@ -447,6 +661,22 @@ export class BatchDatabase {
     return toBatch(row);
   }
 
+  getBatchForOwner(id: string, ownerId: string): StoredBatch {
+    const row = this.db.prepare('SELECT * FROM batches WHERE id = ? AND owner_id = ?').get(id, ownerId) as BatchRow | undefined;
+    if (!row) {
+      throw new AppError('BATCH_NOT_FOUND', `Unknown batch: ${id}`, 404);
+    }
+    return toBatch(row);
+  }
+
+  getBatchOwnerId(id: string): string {
+    const row = this.db.prepare('SELECT owner_id FROM batches WHERE id = ?').get(id) as { owner_id: string | null } | undefined;
+    if (!row || !row.owner_id) {
+      throw new AppError('BATCH_NOT_FOUND', `Unknown batch: ${id}`, 404);
+    }
+    return row.owner_id;
+  }
+
   getDetails(id: string): BatchDetails {
     const batch = this.getBatch(id);
     const items = (this.db.prepare('SELECT * FROM items WHERE batch_id = ? ORDER BY created_at, id').all(id) as ItemRow[]).map(toItem);
@@ -454,7 +684,20 @@ export class BatchDatabase {
     return { ...batch, items, job, failureHistory: this.getFailureHistory(id) };
   }
 
-  listBatchSummaries(limit: number): BatchSummary[] {
+  getDetailsForOwner(id: string, ownerId: string): BatchDetails {
+    this.getBatchForOwner(id, ownerId);
+    return this.getDetails(id);
+  }
+
+  getActiveBatchForOwner(ownerId: string): BatchDetails | null {
+    const rows = this.db.prepare('SELECT * FROM batches WHERE owner_id = ? ORDER BY created_at DESC, id DESC').all(ownerId) as BatchRow[];
+    const active = rows.map(toBatch).find((batch) => isActiveBatch(lifecycleSnapshot(batch)));
+    return active ? this.getDetails(active.id) : null;
+  }
+
+  listBatchSummaries(limit: number, ownerId?: string): BatchSummary[] {
+    const ownerFilter = ownerId ? 'WHERE batches.owner_id = ?' : '';
+    const parameters: Array<string | number> = ownerId ? [ownerId, limit] : [limit];
     return (this.db.prepare(`
       SELECT
         batches.id,
@@ -479,10 +722,11 @@ export class BatchDatabase {
         COALESCE(SUM(CASE WHEN items.action = 'delete' THEN 1 ELSE 0 END), 0) AS delete_count
       FROM batches
       LEFT JOIN items ON items.batch_id = batches.id
+      ${ownerFilter}
       GROUP BY batches.id
       ORDER BY batches.created_at DESC, batches.id DESC
       LIMIT ?
-    `).all(limit) as BatchSummaryRow[]).map(toBatchSummary);
+    `).all(...parameters) as BatchSummaryRow[]).map(toBatchSummary);
   }
 
   getItems(batchId: string): StoredItem[] {
@@ -605,7 +849,7 @@ export class BatchDatabase {
   returnToDraftForEditing(batchId: string): void {
     const result = this.db.prepare(`
       UPDATE batches
-      SET state = 'DRAFT', validation_json = NULL, warning_ack_request_sha256 = NULL,
+      SET state = 'DRAFT', warning_ack_request_sha256 = NULL,
           plan_json = NULL, base_commit = NULL, local_diff_json = NULL,
           error_code = NULL, error_message = NULL
       WHERE id = ? AND state = 'FAILED' AND delivery_checkpoint = 'NONE'
@@ -950,6 +1194,13 @@ export class BatchDatabase {
     }
   }
 
+  private assertNoActiveBatchForOwner(ownerId: string): void {
+    const rows = this.db.prepare('SELECT * FROM batches WHERE owner_id = ?').all(ownerId) as BatchRow[];
+    if (rows.map(toBatch).some((batch) => isActiveBatch(lifecycleSnapshot(batch)))) {
+      throw new AppError('ACTIVE_BATCH_EXISTS', '当前账号已有尚未完成的批次，请先继续处理。', 409);
+    }
+  }
+
   private migrate(): void {
     this.db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)');
     this.applyMigration(1, () => {
@@ -1063,6 +1314,39 @@ export class BatchDatabase {
         CREATE INDEX IF NOT EXISTS job_failures_batch_id_id ON job_failures(batch_id, id);
       `);
     });
+    this.applyMigration(5, () => {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+          password_hash TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+          token_hash TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          expires_at TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
+      `);
+      this.db.prepare(`
+        INSERT OR IGNORE INTO users (id, username, password_hash, created_at)
+        VALUES (?, 'legacy-bootstrap@internal.invalid', 'disabled', ?)
+      `).run(legacyBootstrapUserId, now());
+      const columns = this.batchColumnNames();
+      if (!columns.has('owner_id')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN owner_id TEXT');
+      }
+      this.db.prepare('UPDATE batches SET owner_id = ? WHERE owner_id IS NULL OR owner_id = ?').run(legacyBootstrapUserId, '');
+      this.db.exec('CREATE INDEX IF NOT EXISTS batches_owner_created_at ON batches(owner_id, created_at DESC, id DESC)');
+    });
+    this.applyMigration(6, () => {
+      const columns = this.batchColumnNames();
+      if (!columns.has('clone_creation_nonce')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN clone_creation_nonce TEXT');
+      }
+    });
   }
 
   private applyMigration(version: number, apply: () => void): void {
@@ -1081,4 +1365,12 @@ export class BatchDatabase {
     const columns = this.db.prepare('PRAGMA table_info(batches)').all() as Array<{ name: string }>;
     return new Set(columns.map((column) => column.name));
   }
+}
+
+function toUser(row: UserRow): UserCredentialRecord {
+  return {
+    id: row.id,
+    username: row.username,
+    passwordHash: row.password_hash,
+  };
 }

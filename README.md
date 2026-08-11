@@ -10,7 +10,9 @@ PinK 图标自动 Draft PR MVP 的独立编排服务。当前包含 Fastify、SQ
 - 目录展示基于 npm 发布物；名称预览、最终校验和本地 diff 基于目标 Git ref。`local` 模式只解析本地 ref，绝不执行 `git fetch`；本地 Stage 1 源码只提供 CLI 实现，不能替代 npm catalog 基线。
 - local Worker 只在临时 worktree 生成本地 diff；remote Worker 会在 R3 创建一个 `bot/<batchId>` commit、普通 push，并向 R2/main 创建一个 GitHub Draft PR。
 - 前端只负责批次表单、SVG 预览、目录选择和状态展示；不解析 mapping、不分配 codepoint、不持有 GitHub Token。
-- 首页显示当前浏览器的一个活动批次及最近 20 条批次摘要；活动批次 ID 只存于浏览器 localStorage，不代表后端全局锁或跨设备同步。`GET /api/batches?limit=20` 是当前单部署内部 MVP 的只读列表，没有认证或按设计师隔离，部署时不应将其作为多用户历史记录产品使用。
+- 服务使用内部预置账号和 HttpOnly、SameSite=Lax 会话 Cookie。除健康检查和登录外，所有 catalog 与批次 API 都要求登录；批次、历史和唯一活动批次均按 `owner_id` 在服务端隔离。浏览器不再用 localStorage 决定账号或活动批次，只保留无安全含义的界面状态。
+- 这是内部 MVP，不提供注册、找回密码、角色、团队共享或管理员界面。每个账号只能有一个非终态活动批次；该约束由创建和基于旧批次新建的数据库事务执行。
+- 升级前已有的匿名批次不会删除：migration 会将其归入 `legacy-bootstrap@internal.invalid`。它默认不可登录，避免自动暴露给新账号；如需查看或处理保留历史，运维可显式用该账号名配置 bootstrap 密码以启用该唯一历史账号。
 - 本地批次状态为 `DRAFT → VALIDATING → READY → QUEUED → RUNNING → LOCAL_DIFF_READY`。远程交付依次经过 `COMMIT_PREPARED → BRANCH_PUSHED → PR_CREATING → PR_CREATED`；`PR_CREATED` 为开发接管终态，平台不再 push 或修改该分支。进程重启时遗留的 `VALIDATING` 批次会安全退回 `DRAFT`；仅在 Worker 显式启用时，遗留的 `RUNNING` job 才会标记为 `FAILED/WORKER_INTERRUPTED`，且已 `PR_CREATED` 的交接不会被降级或重试。
 
 ## 配置
@@ -34,6 +36,9 @@ PINK_ICON_CATALOG_AUTH_TOKEN=...                           # 私有 registry 需
 PINK_ICON_CATALOG_SOURCE_REPOSITORY=sud-global/pink-codicons # 可选
 PINK_ICON_CATALOG_REFRESH_MS=60000                         # 可选，默认 60 秒
 PINK_ICON_WORKER_ENABLED=false                              # 可选，默认 false；仅 true 执行队列任务
+PINK_ICON_SESSION_COOKIE_SECURE=false                       # localhost HTTP 可显式 false；HTTPS 部署必须 true
+PINK_ICON_BOOTSTRAP_USERNAME=designer@example.invalid       # 启动时预置内部账号；与密码成对配置
+PINK_ICON_BOOTSTRAP_PASSWORD=<deployment-secret>            # 仅环境注入，不写入数据库明文或日志
 ```
 
 P3 开发期远程模式（创建 R3 的 `bot/<batchId>` 分支和 R2 的 Draft PR）：
@@ -52,7 +57,16 @@ PINK_ICON_GITHUB_TOKEN=<deployment-secret>
 PINK_ICON_GIT_COMMITTER_NAME=PinK Icon Bot
 PINK_ICON_GIT_COMMITTER_EMAIL=<approved-bot-email>
 PINK_ICON_WORKER_ENABLED=false
+PINK_ICON_SESSION_COOKIE_SECURE=false                        # 本地 HTTP/Vite 代理体验
+PINK_ICON_BOOTSTRAP_USERNAME=designer@example.invalid
+PINK_ICON_BOOTSTRAP_PASSWORD=<deployment-secret>
 ```
+
+`PINK_ICON_BOOTSTRAP_USERNAME` 与 `PINK_ICON_BOOTSTRAP_PASSWORD` 要么同时省略，要么同时配置；用户名必须是邮箱形式。服务只在账号不存在时创建它，不会在每次启动时轮换既有账号密码。唯一例外是 migration 自动创建的 `legacy-bootstrap@internal.invalid`：它初始为禁用占位账号，只有明确用同名 bootstrap 配置启动时才会写入现代密码哈希并可登录查看保留的旧数据。
+
+`PINK_ICON_SESSION_COOKIE_SECURE` 只能为 `true` 或 `false`，默认 `false` 以支持 localhost HTTP 体验；生产 HTTPS 部署必须显式设为 `true`，不会根据 `NODE_ENV` 推断。会话 Cookie 固定为 HttpOnly、SameSite=Lax；已登录的状态变更请求若携带 `Origin`，服务会拒绝非同源或无效来源。受控非浏览器调用可不带 `Origin`。
+
+HTTPS 生产部署示例：`PINK_ICON_SESSION_COOKIE_SECURE=true`。Vite 本地开发页面经 `http://127.0.0.1:5173` 代理 API 到 `http://127.0.0.1:3000` 时应保持 `false`，否则浏览器不会在 HTTP 下回传会话 Cookie。
 
 远程模式只允许上述 R2/R3 配对，启动时验证 target/push remote URL、R3 的直接 fork parent 和 `bot/` 前缀。Token 只用于后端 GitHub API Authorization header 和临时 `GIT_ASKPASS` 子进程；不写入 remote URL、数据库、前端、命令参数或错误消息。
 
@@ -101,4 +115,4 @@ $env:PINK_ICON_STAGE1_SOURCE_DIR = 'C:\path\to\pink-codicons'
 npm.cmd run test:integration
 ```
 
-当前 API：`GET /api/catalog`、`GET /api/catalog/page`、`GET /api/catalog/icons/:name/svg`、`GET /api/names/preview`、`GET /api/batches?limit=20`、`POST /api/batches`、`POST /api/batches/:id/items`、`PUT /api/batches/:id/items/:itemId`、`DELETE /api/batches/:id/items/:itemId`、`POST /api/batches/:id/validate`、`POST /api/batches/:id/submit`、`POST /api/batches/:id/warnings/acknowledge`、`GET /api/batches/:id`、`POST /api/batches/:id/retry`。
+当前 API：公开的 `GET /api/health`、`POST /api/auth/login`；受会话保护的 `POST /api/auth/logout`、`GET /api/auth/me`、`GET /api/catalog`、`GET /api/catalog/page`、`GET /api/catalog/icons/:name/svg`、`GET /api/names/preview`、`GET /api/batches?limit=20`、`GET /api/batches/active`、`POST /api/batches`、`PUT /api/batches/:id`、`POST /api/batches/:id/items`、`PUT /api/batches/:id/items/:itemId`、`DELETE /api/batches/:id/items/:itemId`、`POST /api/batches/:id/validate`、`POST /api/batches/:id/submit`、`POST /api/batches/:id/return-to-edit`、`POST /api/batches/:id/clone`、`GET /api/batches/:id`、`POST /api/batches/:id/retry`。

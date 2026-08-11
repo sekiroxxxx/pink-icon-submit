@@ -29,3 +29,14 @@ test('unknown diagnostics use a safe Chinese fallback while retaining technical 
   expect(displayed.itemName).toBeNull();
   expect(displayed.technical).toEqual({ code: 'FUTURE_RULE', message: 'Future validator message.' });
 });
+
+test('a Stage 1 path locates the relevant item and user-facing field without changing the diagnostic payload', () => {
+  const displayed = displayDiagnostic({
+    code: 'SVG_MULTIPLE_COLORS',
+    message: 'SVG contains more than one literal paint color.',
+    path: 'items[0].sourceFile',
+  }, items);
+  expect(displayed.itemName).toBe('新增图标：new-icon');
+  expect(displayed.location).toBe('字段：SVG 文件');
+  expect(displayed.technical).toEqual({ code: 'SVG_MULTIPLE_COLORS', message: 'SVG contains more than one literal paint color.' });
+});

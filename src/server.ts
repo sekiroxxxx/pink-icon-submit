@@ -1,4 +1,5 @@
 import { buildApp } from './app.js';
+import { AuthService } from './auth.js';
 import { BatchService } from './batch-service.js';
 import { catalogOptionsFromConfig, configFromEnv } from './config.js';
 import { BatchDatabase } from './database.js';
@@ -26,6 +27,10 @@ const repository = new GitRepository(config.repositoryPath, config.temporaryRoot
 });
 
 const database = new BatchDatabase(config.databasePath);
+const auth = new AuthService(database);
+if (config.bootstrapUser) {
+  await auth.provisionBootstrapUser(config.bootstrapUser);
+}
 const batches = new BatchService(
   database,
   new BatchStorage(config.storageRoot),
@@ -41,7 +46,7 @@ const batches = new BatchService(
   },
 );
 database.recoverInterruptedValidations();
-const app = await buildApp({ batches });
+const app = await buildApp({ batches, auth, sessionCookieSecure: config.sessionCookieSecure });
 let github: GitHubApiClient | undefined;
 const remoteGithub = (): GitHubApiClient => {
   if (!config.remoteDelivery) {

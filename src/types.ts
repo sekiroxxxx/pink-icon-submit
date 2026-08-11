@@ -31,6 +31,17 @@ export interface Submitter {
   email: string;
 }
 
+/** The only user record exposed to the browser. Password and session data are never serialized. */
+export interface AuthenticatedUser {
+  id: string;
+  username: string;
+}
+
+export interface BootstrapUserCredentials {
+  username: string;
+  password: string;
+}
+
 export interface CreateBatchInput {
   title: string;
   description: string;
@@ -62,6 +73,11 @@ export interface StoredBatch extends CreateBatchInput {
   baseCommit: string | null;
   localDiff: unknown | null;
   error: { code: string; message: string } | null;
+  /**
+   * A server-derived, user-facing lifecycle classification.  Clients consume
+   * this instead of trying to reproduce delivery/checkpoint error rules.
+   */
+  userStatus: UserBatchStatus;
   createdAt: string;
   updatedAt: string;
 }
@@ -145,7 +161,10 @@ export interface AppConfig {
   catalogRefreshIntervalMs: number;
   workerEnabled: boolean;
   workerPollIntervalMs: number;
+  /** Explicit cookie transport policy; never inferred from NODE_ENV. */
+  sessionCookieSecure: boolean;
   maxUploadBytes: number;
+  bootstrapUser?: BootstrapUserCredentials;
 }
 
 export interface IconBatchResult {

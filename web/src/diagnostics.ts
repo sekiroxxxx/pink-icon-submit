@@ -5,6 +5,7 @@ export interface DisplayDiagnostic {
   reason: string;
   suggestion: string;
   itemName: string | null;
+  location: string | null;
   technical: { code: string; message: string };
 }
 
@@ -62,6 +63,27 @@ function itemName(item: ApiItem | undefined): string | null {
   return name ? `${action}：${name}` : null;
 }
 
+function itemFromDiagnostic(diagnostic: Diagnostic, items: ApiItem[]): ApiItem | undefined {
+  if (diagnostic.itemId) return items.find((item) => item.id === diagnostic.itemId);
+  const itemIndex = diagnostic.path?.match(/(?:^|[.[])items\[(\d+)\]/)?.[1];
+  return itemIndex === undefined ? undefined : items[Number(itemIndex)];
+}
+
+function locationFromPath(path: string | undefined): string | null {
+  if (!path) return null;
+  const field = path.match(/(?:\.|\[)\s*(designName|targetName|description|reason|replacementName|sourceFile|designUrl|title)\s*\]?$/)?.[1];
+  const label = field === 'designName' ? '期望图标名称'
+    : field === 'targetName' ? '目标图标'
+      : field === 'description' ? '说明'
+        : field === 'reason' ? '删除原因'
+          : field === 'replacementName' ? '替代图标'
+            : field === 'sourceFile' ? 'SVG 文件'
+              : field === 'designUrl' ? '设计稿链接'
+                : field === 'title' ? '变更标题'
+                  : undefined;
+  return label ? `字段：${label}` : `定位：${path}`;
+}
+
 export function displayDiagnostic(diagnostic: Diagnostic, items: ApiItem[]): DisplayDiagnostic {
   const copy = diagnosticCopy[diagnostic.code] ?? {
     title: '发现需要进一步确认的校验问题',
@@ -70,7 +92,8 @@ export function displayDiagnostic(diagnostic: Diagnostic, items: ApiItem[]): Dis
   };
   return {
     ...copy,
-    itemName: itemName(diagnostic.itemId ? items.find((item) => item.id === diagnostic.itemId) : undefined),
+    itemName: itemName(itemFromDiagnostic(diagnostic, items)),
+    location: locationFromPath(diagnostic.path),
     technical: { code: diagnostic.code, message: diagnostic.message },
   };
 }
