@@ -34,7 +34,35 @@ async function waitFor(url, child, output) {
   throw new Error(`Production server did not become ready.\n${output()}`);
 }
 
-test('built npm start serves the SPA and accepts HTTPS-origin authenticated writes', async (t) => {
+function spawnProductionServer(environment) {
+  const child = spawn(process.execPath, ['dist/server.js'], {
+    cwd: resolve('.'),
+    env: environment,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
+  return { child, output: () => `${stdout}\n${stderr}` };
+}
+
+async function waitForExit(child, output, timeoutMs = 10_000) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolveExit, reject) => {
+    const timeout = setTimeout(() => {
+      child.off('exit', onExit);
+      reject(new Error(`Production server did not exit.\n${output()}`));
+    }, timeoutMs);
+    const onExit = () => {
+      clearTimeout(timeout);
+      resolveExit();
+    };
+    child.once('exit', onExit);
+  });
+}
+
+test('built npm start serves authenticated writes, rejects a second owner, and restarts after shutdown', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'pink-production-smoke-'));
   const data = join(root, 'data');
   const repository = join(root, 'repository');
@@ -47,9 +75,7 @@ test('built npm start serves the SPA and accepts HTTPS-origin authenticated writ
   const inherited = Object.fromEntries([
     'PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'TEMP', 'TMP', 'COMSPEC', 'PATHEXT', 'USERPROFILE',
   ].flatMap((name) => process.env[name] === undefined ? [] : [[name, process.env[name]]]));
-  const child = spawn(process.execPath, ['dist/server.js'], {
-    cwd: resolve('.'),
-    env: {
+  const environment = {
       ...inherited,
       PINK_CODICONS_DIR: repository,
       PINK_ICON_EXECUTION_MODE: 'local',
@@ -64,26 +90,24 @@ test('built npm start serves the SPA and accepts HTTPS-origin authenticated writ
       PINK_ICON_PUBLIC_ORIGIN: publicOrigin,
       PINK_ICON_BOOTSTRAP_USERNAME: username,
       PINK_ICON_BOOTSTRAP_PASSWORD: password,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
-  child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
-  const output = () => `${stdout}\n${stderr}`;
+  };
+  const processes = [];
+  const primary = spawnProductionServer(environment);
+  processes.push(primary);
   t.after(async () => {
-    if (child.exitCode === null) child.kill('SIGTERM');
-    await Promise.race([
-      new Promise((resolveExit) => child.once('exit', resolveExit)),
-      new Promise((resolveTimeout) => setTimeout(resolveTimeout, 5_000)),
-    ]);
-    if (child.exitCode === null) child.kill('SIGKILL');
+    for (const process of processes) {
+      if (process.child.exitCode === null && process.child.signalCode === null) process.child.kill('SIGTERM');
+      try {
+        await waitForExit(process.child, process.output, 5_000);
+      } catch {
+        process.child.kill('SIGKILL');
+      }
+    }
     await rm(root, { recursive: true, force: true });
   });
 
   const base = `http://127.0.0.1:${port}`;
-  await waitFor(`${base}/api/health`, child, output);
+  await waitFor(`${base}/api/health`, primary.child, primary.output);
   const ready = await fetch(`${base}/api/ready`);
   assert.equal(ready.status, 200);
 
@@ -111,5 +135,22 @@ test('built npm start serves the SPA and accepts HTTPS-origin authenticated writ
     headers: { cookie, origin: publicOrigin },
   });
   assert.equal(logout.status, 204, await logout.text());
-  assert.doesNotMatch(output(), /production-smoke-password/);
+  assert.doesNotMatch(primary.output(), /production-smoke-password/);
+
+  const secondPort = await availablePort();
+  const duplicate = spawnProductionServer({ ...environment, PINK_ICON_SUBMIT_PORT: String(secondPort) });
+  processes.push(duplicate);
+  await waitForExit(duplicate.child, duplicate.output);
+  assert.notEqual(duplicate.child.exitCode, 0);
+  assert.match(duplicate.output(), /already owns this data directory/i);
+  assert.doesNotMatch(duplicate.output(), /production-smoke-password/);
+
+  primary.child.kill('SIGTERM');
+  await waitForExit(primary.child, primary.output);
+
+  const replacement = spawnProductionServer(environment);
+  processes.push(replacement);
+  await waitFor(`${base}/api/ready`, replacement.child, replacement.output);
+  assert.equal((await fetch(`${base}/api/ready`)).status, 200);
+  assert.doesNotMatch(replacement.output(), /production-smoke-password/);
 });
