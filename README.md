@@ -11,6 +11,7 @@ PinK 图标自动 Draft PR MVP 的独立编排服务。当前包含 Fastify、SQ
 - local Worker 只在临时 worktree 生成本地 diff；remote Worker 会在 R3 创建一个 `bot/<batchId>` commit、普通 push，并向 R2/main 创建一个 GitHub Draft PR。
 - 前端只负责批次表单、SVG 预览、目录选择和状态展示；不解析 mapping、不分配 codepoint、不持有 GitHub Token。
 - 服务使用内部预置账号和 HttpOnly、SameSite=Lax 会话 Cookie。除健康检查和登录外，所有 catalog 与批次 API 都要求登录；批次、历史和唯一活动批次均按 `owner_id` 在服务端隔离。浏览器不再用 localStorage 决定账号或活动批次，只保留无安全含义的界面状态。
+- 工作台在第一项变更加入队列时创建账号草稿并立即保存 Item；返回首页、刷新、服务重启或重新登录后都从服务端活动批次恢复。未加入队列的 SVG 和表单输入仍是临时编辑状态，不会跨页面保留。
 - 这是内部 MVP，不提供注册、找回密码、角色、团队共享或管理员界面。每个账号只能有一个非终态活动批次；该约束由创建和基于旧批次新建的数据库事务执行。
 - 升级前已有的匿名批次不会删除：migration 会将其归入 `legacy-bootstrap@internal.invalid`。它默认不可登录，避免自动暴露给新账号；如需查看或处理保留历史，运维可显式用该账号名配置 bootstrap 密码以启用该唯一历史账号。
 - 本地批次状态为 `DRAFT → VALIDATING → READY → QUEUED → RUNNING → LOCAL_DIFF_READY`。远程交付依次经过 `COMMIT_PREPARED → BRANCH_PUSHED → PR_CREATING → PR_CREATED`；`PR_CREATED` 为开发接管终态，平台不再 push 或修改该分支。进程重启时遗留的 `VALIDATING` 批次会安全退回 `DRAFT`；仅在 Worker 显式启用时，遗留的 `RUNNING` job 才会标记为 `FAILED/WORKER_INTERRUPTED`，且已 `PR_CREATED` 的交接不会被降级或重试。
