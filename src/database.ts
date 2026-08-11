@@ -26,6 +26,9 @@ import type {
 } from './types.js';
 
 export const legacyBootstrapUserId = 'legacy-bootstrap';
+export const legacyBootstrapPendingPasswordHash = 'bootstrap-pending';
+export const disabledUserPasswordHash = 'disabled';
+export const currentSchemaVersion = 7;
 
 const createdCloneMarker: unique symbol = Symbol('created clone ownership');
 
@@ -394,9 +397,15 @@ export class BatchDatabase {
   constructor(databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
     this.db = new Database(databasePath);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('foreign_keys = ON');
-    this.migrate();
+    try {
+      this.assertSupportedSchemaVersion();
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('foreign_keys = ON');
+      this.migrate();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   close(): void {
@@ -967,6 +976,21 @@ export class BatchDatabase {
     complete();
   }
 
+  replaceUserPasswordAndSessions(username: string, passwordHash: string): AuthenticatedUser | undefined {
+    const replace = this.db.transaction(() => {
+      const user = this.findUserByUsername(username);
+      if (!user) return undefined;
+      this.db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, user.id);
+      this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);
+      return { id: user.id, username: user.username };
+    });
+    return replace();
+  }
+
+  disableUserAndDeleteSessions(username: string): AuthenticatedUser | undefined {
+    return this.replaceUserPasswordAndSessions(username, disabledUserPasswordHash);
+  }
+
   recordCommitPrepared(
     batchId: string,
     plan: unknown,
@@ -1373,8 +1397,8 @@ export class BatchDatabase {
       `);
       this.db.prepare(`
         INSERT OR IGNORE INTO users (id, username, password_hash, created_at)
-        VALUES (?, 'legacy-bootstrap@internal.invalid', 'disabled', ?)
-      `).run(legacyBootstrapUserId, now());
+        VALUES (?, 'legacy-bootstrap@internal.invalid', ?, ?)
+      `).run(legacyBootstrapUserId, legacyBootstrapPendingPasswordHash, now());
       const columns = this.batchColumnNames();
       if (!columns.has('owner_id')) {
         this.db.exec('ALTER TABLE batches ADD COLUMN owner_id TEXT');
@@ -1388,6 +1412,23 @@ export class BatchDatabase {
         this.db.exec('ALTER TABLE batches ADD COLUMN clone_creation_nonce TEXT');
       }
     });
+    this.applyMigration(7, () => {
+      this.db.prepare(`
+        UPDATE users SET password_hash = ?
+        WHERE id = ? AND password_hash = ?
+      `).run(legacyBootstrapPendingPasswordHash, legacyBootstrapUserId, disabledUserPasswordHash);
+    });
+  }
+
+  private assertSupportedSchemaVersion(): void {
+    const migrationTable = this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+    ).get();
+    if (!migrationTable) return;
+    const schema = this.db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number | null };
+    if (schema.version !== null && schema.version > currentSchemaVersion) {
+      throw new Error(`Database schema version ${schema.version} is newer than supported version ${currentSchemaVersion}.`);
+    }
   }
 
   private applyMigration(version: number, apply: () => void): void {

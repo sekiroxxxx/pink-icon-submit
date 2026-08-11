@@ -1,11 +1,242 @@
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { BatchDatabase } from '../src/database.js';
+import {
+  BatchDatabase,
+  disabledUserPasswordHash,
+  legacyBootstrapPendingPasswordHash,
+  legacyBootstrapUserId,
+} from '../src/database.js';
+
+function createMinimalLegacyFixture(databasePath: string, version: 1 | 2 | 3 | 4): void {
+  const legacy = new Database(databasePath);
+  legacy.exec(`
+    CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+    CREATE TABLE batches (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      design_url TEXT NOT NULL,
+      submitter_name TEXT NOT NULL,
+      submitter_email TEXT NOT NULL,
+      state TEXT NOT NULL,
+      validation_json TEXT,
+      warning_ack_request_sha256 TEXT,
+      plan_json TEXT,
+      base_commit TEXT,
+      local_diff_json TEXT,
+      error_code TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE items (
+      id TEXT PRIMARY KEY,
+      batch_id TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+      action TEXT NOT NULL,
+      design_name TEXT,
+      target_name TEXT,
+      description TEXT,
+      reason TEXT,
+      replacement_name TEXT,
+      source_file TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE jobs (
+      batch_id TEXT PRIMARY KEY REFERENCES batches(id) ON DELETE CASCADE,
+      state TEXT NOT NULL,
+      attempt INTEGER NOT NULL,
+      error_code TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  if (version >= 2) {
+    legacy.exec('ALTER TABLE batches ADD COLUMN catalog_baseline_json TEXT; ALTER TABLE batches ADD COLUMN target_repository_json TEXT;');
+  }
+  if (version >= 3) {
+    legacy.exec(`
+      ALTER TABLE batches ADD COLUMN execution_mode TEXT;
+      ALTER TABLE batches ADD COLUMN push_repository TEXT;
+      ALTER TABLE batches ADD COLUMN push_branch_prefix TEXT;
+      ALTER TABLE batches ADD COLUMN delivery_checkpoint TEXT NOT NULL DEFAULT 'NONE';
+      ALTER TABLE batches ADD COLUMN delivery_branch TEXT;
+      ALTER TABLE batches ADD COLUMN delivery_commit_sha TEXT;
+      ALTER TABLE batches ADD COLUMN pr_number INTEGER;
+      ALTER TABLE batches ADD COLUMN pr_url TEXT;
+      ALTER TABLE batches ADD COLUMN pr_state TEXT;
+      ALTER TABLE batches ADD COLUMN pr_is_draft INTEGER;
+      ALTER TABLE batches ADD COLUMN pr_created_at TEXT;
+      ALTER TABLE batches ADD COLUMN handoff_at TEXT;
+    `);
+  }
+  if (version >= 4) {
+    legacy.exec(`
+      CREATE TABLE job_failures (
+        id INTEGER PRIMARY KEY,
+        batch_id TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+        attempt INTEGER NOT NULL,
+        error_code TEXT NOT NULL,
+        error_message TEXT NOT NULL,
+        operation TEXT,
+        command_text TEXT,
+        exit_code INTEGER,
+        stderr_summary TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX job_failures_batch_id_id ON job_failures(batch_id, id);
+    `);
+  }
+  const insertMigration = legacy.prepare('INSERT INTO schema_migrations (version) VALUES (?)');
+  for (let migration = 1; migration <= version; migration += 1) insertMigration.run(migration);
+  legacy.prepare(`
+    INSERT INTO batches (
+      id, title, description, design_url, submitter_name, submitter_email, state,
+      validation_json, warning_ack_request_sha256, plan_json, base_commit, local_diff_json,
+      error_code, error_message, created_at, updated_at
+    ) VALUES (?, ?, ?, '', ?, ?, 'DRAFT', NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+  `).run(
+    `ICON-V${version}`,
+    `Version ${version} batch`,
+    `Preserve version ${version} data.`,
+    'Legacy Designer',
+    'legacy@example.invalid',
+    '2026-01-01T00:00:00.000Z',
+    '2026-01-01T00:03:00.000Z',
+  );
+  legacy.prepare(`
+    INSERT INTO items (id, batch_id, action, design_name, description, source_file, created_at)
+    VALUES (?, ?, 'add', ?, ?, ?, ?)
+  `).run(`item-v${version}`, `ICON-V${version}`, `icon-v${version}`, `Version ${version} item.`, `uploads/v${version}.svg`, '2026-01-01T00:01:00.000Z');
+  legacy.prepare(`
+    INSERT INTO jobs (batch_id, state, attempt, error_code, error_message, created_at, updated_at)
+    VALUES (?, 'FAILED', ?, 'LEGACY_FAILURE', 'Preserved failure.', ?, ?)
+  `).run(`ICON-V${version}`, version, '2026-01-01T00:02:00.000Z', '2026-01-01T00:03:00.000Z');
+  if (version >= 2) {
+    legacy.prepare('UPDATE batches SET catalog_baseline_json = ?, target_repository_json = ? WHERE id = ?').run(
+      JSON.stringify({ packageName: '@pink/codicons', requestedTag: 'beta', version: `0.0.${version}`, integrity: 'sha512-test', sourceRepository: 'sud-global/pink-codicons', sourceCommit: 'a'.repeat(40) }),
+      JSON.stringify({ repository: 'owner/icons', branch: 'main' }),
+      `ICON-V${version}`,
+    );
+  }
+  if (version >= 3) {
+    legacy.prepare("UPDATE batches SET execution_mode = 'local', delivery_checkpoint = 'NONE' WHERE id = ?").run(`ICON-V${version}`);
+  }
+  if (version >= 4) {
+    legacy.prepare(`
+      INSERT INTO job_failures (batch_id, attempt, error_code, error_message, created_at)
+      VALUES (?, ?, 'LEGACY_FAILURE', 'Preserved failure.', ?)
+    `).run(`ICON-V${version}`, version, '2026-01-01T00:03:00.000Z');
+  }
+  legacy.close();
+}
+
+for (const version of [1, 2, 3, 4] as const) {
+  test(`migrates a v${version} fixture to the current schema without losing owned records`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), `pink-icon-submit-v${version}-migration-`));
+    const databasePath = join(root, 'legacy.sqlite');
+    t.after(async () => rm(root, { recursive: true, force: true }));
+    createMinimalLegacyFixture(databasePath, version);
+
+    const migrated = new BatchDatabase(databasePath);
+    const details = migrated.getDetails(`ICON-V${version}`);
+    assert.equal(details.title, `Version ${version} batch`);
+    assert.equal(details.items.length, 1);
+    assert.equal(details.items[0]?.id, `item-v${version}`);
+    assert.equal(details.items[0]?.sourceFile, `uploads/v${version}.svg`);
+    assert.equal(details.job?.attempt, version);
+    assert.equal(details.job?.error?.code, 'LEGACY_FAILURE');
+    assert.equal(details.failureHistory.length, version >= 4 ? 1 : 0);
+    assert.equal(migrated.getDetailsForOwner(`ICON-V${version}`, 'legacy-bootstrap').id, `ICON-V${version}`);
+    if (version >= 2) {
+      assert.equal(details.catalogBaseline?.version, `0.0.${version}`);
+      assert.deepEqual(details.targetRepository, { repository: 'owner/icons', branch: 'main' });
+    }
+    if (version >= 3) assert.equal(details.executionMode, 'local');
+    migrated.close();
+
+    const inspection = new Database(databasePath, { readonly: true });
+    assert.deepEqual(
+      inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
+      [1, 2, 3, 4, 5, 6, 7].map((migration) => ({ version: migration })),
+    );
+    inspection.close();
+  });
+}
+
+test('refuses to open a database created by a newer schema version', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'pink-icon-submit-future-schema-'));
+  const databasePath = join(root, 'future.sqlite');
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const future = new Database(databasePath);
+  future.pragma('journal_mode = DELETE');
+  future.exec('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO schema_migrations (version) VALUES (8);');
+  future.close();
+  const originalDatabase = await readFile(databasePath);
+  const originalFiles = await readdir(root);
+
+  assert.throws(
+    () => new BatchDatabase(databasePath),
+    /Database schema version 8 is newer than supported version 7/,
+  );
+  assert.deepEqual(await readFile(databasePath), originalDatabase);
+  assert.deepEqual(await readdir(root), originalFiles);
+  const inspection = new Database(databasePath, { readonly: true });
+  assert.equal(inspection.pragma('journal_mode', { simple: true }), 'delete');
+  assert.deepEqual(inspection.prepare('SELECT version FROM schema_migrations').all(), [{ version: 8 }]);
+  assert.equal(inspection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'batches'").get(), undefined);
+  inspection.close();
+});
+
+test('migrates the v6 legacy placeholder hash without changing disabled users or stored data', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'pink-icon-submit-v6-placeholder-'));
+  const databasePath = join(root, 'v6.sqlite');
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const v6 = new Database(databasePath);
+  v6.exec(`
+    CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+    INSERT INTO schema_migrations (version) VALUES (1), (2), (3), (4), (5), (6);
+    CREATE TABLE users (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE preserved_evidence (value TEXT NOT NULL);
+    INSERT INTO preserved_evidence (value) VALUES ('v6 evidence');
+  `);
+  const insertUser = v6.prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)');
+  insertUser.run(legacyBootstrapUserId, 'legacy-bootstrap@internal.invalid', disabledUserPasswordHash, '2026-01-01T00:00:00.000Z');
+  insertUser.run('disabled-designer', 'disabled@example.invalid', disabledUserPasswordHash, '2026-01-02T00:00:00.000Z');
+  v6.close();
+
+  const migrated = new BatchDatabase(databasePath);
+  migrated.close();
+
+  const inspection = new Database(databasePath, { readonly: true });
+  assert.equal(
+    (inspection.prepare('SELECT password_hash FROM users WHERE id = ?').get(legacyBootstrapUserId) as { password_hash: string }).password_hash,
+    legacyBootstrapPendingPasswordHash,
+  );
+  assert.equal(
+    (inspection.prepare('SELECT password_hash FROM users WHERE id = ?').get('disabled-designer') as { password_hash: string }).password_hash,
+    disabledUserPasswordHash,
+  );
+  assert.equal(
+    (inspection.prepare('SELECT value FROM preserved_evidence').get() as { value: string }).value,
+    'v6 evidence',
+  );
+  assert.deepEqual(
+    inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
+    [1, 2, 3, 4, 5, 6, 7].map((version) => ({ version })),
+  );
+  inspection.close();
+});
 
 test('migrates a real v1-v4 fixture to ownership without losing batch, item, job, failure, or handoff evidence', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'pink-icon-submit-migration-'));
@@ -223,7 +454,7 @@ test('migrates a real v1-v4 fixture to ownership without losing batch, item, job
     'push_branch_prefix',
     'push_repository',
   ]);
-  assert.deepEqual(migrations, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
+  assert.deepEqual(migrations, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }]);
   assert.notEqual(jobFailuresTable, undefined);
   assert.notEqual(usersTable, undefined);
   assert.notEqual(sessionsTable, undefined);

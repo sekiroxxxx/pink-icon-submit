@@ -66,6 +66,21 @@ PINK_ICON_BOOTSTRAP_PASSWORD=<deployment-secret>
 
 `PINK_ICON_BOOTSTRAP_USERNAME` 与 `PINK_ICON_BOOTSTRAP_PASSWORD` 要么同时省略，要么同时配置；用户名必须是邮箱形式。服务只在账号不存在时创建它，不会在每次启动时轮换既有账号密码。唯一例外是 migration 自动创建的 `legacy-bootstrap@internal.invalid`：它初始为禁用占位账号，只有明确用同名 bootstrap 配置启动时才会写入现代密码哈希并可登录查看保留的旧数据。
 
+### 账号运维
+
+生产构建完成后，使用 CLI 创建账号、轮换密码或停用账号。执行前必须停止服务进程，并始终指向同一个持久化数据目录；服务仍持有该目录时 CLI 会拒绝操作。用户名可以作为命令参数；密码只能通过 `PINK_ICON_MANAGE_USER_PASSWORD` 环境变量提供，不能写入命令行。
+
+```powershell
+$env:PINK_ICON_SUBMIT_DATA_DIR = 'C:\path\to\persistent-data'
+$env:PINK_ICON_MANAGE_USER_PASSWORD = '<temporary-secret>'
+npm run user -- create designer@example.invalid
+npm run user -- rotate-password designer@example.invalid
+Remove-Item Env:PINK_ICON_MANAGE_USER_PASSWORD
+npm run user -- disable designer@example.invalid
+```
+
+`create` 遇到已有账号会失败；`rotate-password` 和 `disable` 遇到不存在的账号会失败。轮换密码或停用账号会立即撤销该账号的全部 Session。登录失败限速在单个服务进程内按规范化用户名生效，用于限制连续失败导致的 scrypt 计算；它不替代反向代理层的连接和 IP 限速。
+
 `PINK_ICON_SESSION_COOKIE_SECURE` 只能为 `true` 或 `false`，默认 `false` 以支持 localhost HTTP 体验；生产 HTTPS 部署必须显式设为 `true`，不会根据 `NODE_ENV` 推断。此时必须同时配置 HTTPS 的 `PINK_ICON_PUBLIC_ORIGIN`。该值必须是规范的纯 origin，例如 `https://icons.example.internal`，不能包含尾部 `/`、路径、query、hash 或凭据。会话 Cookie 固定为 HttpOnly、SameSite=Lax；已登录的状态变更请求若携带 `Origin`，服务只与该显式 origin 比较，不信任 `X-Forwarded-Host` 或 `X-Forwarded-Proto`。受控非浏览器调用可不带 `Origin`。
 
 HTTPS 生产部署示例：`PINK_ICON_SESSION_COOKIE_SECURE=true`、`PINK_ICON_PUBLIC_ORIGIN=https://icons.example.internal`。Vite 本地开发页面经 `http://127.0.0.1:5173` 代理 API 到 `http://127.0.0.1:3000` 时应保持 `false`，否则浏览器不会在 HTTP 下回传会话 Cookie。

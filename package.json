@@ -10,6 +10,8 @@
     "dev": "tsx watch src/server.ts",
     "web:dev": "vite --config web/vite.config.ts",
     "start": "node dist/server.js",
+    "user": "node dist/manage-user.js",
+    "data": "node dist/manage-data.js",
     "build": "tsc -p tsconfig.json && npm run web:build",
     "web:build": "vite build --config web/vite.config.ts",
     "check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json",

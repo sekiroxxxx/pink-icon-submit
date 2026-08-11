@@ -301,3 +301,72 @@ test('an explicit bootstrap secret can activate the retained legacy account with
   assert.match(passwordHash, /^scrypt\$/);
   assert.doesNotMatch(passwordHash, /migration-only-password/);
 });
+
+test('login rate limiting uses normalized usernames, resets after success, and expires with its window', async (t) => {
+  const environment = await createTestEnvironment(t);
+  let currentTime = 1_000;
+  const auth = new AuthService(environment.database, {
+    loginFailureLimit: 2,
+    loginFailureWindowMs: 500,
+    now: () => currentTime,
+  });
+  await auth.provisionBootstrapUser({ username: 'limited@example.invalid', password: 'correct password' });
+
+  const invalid = { code: 'LOGIN_INVALID', message: '账号或密码不正确。' };
+  await assert.rejects(
+    auth.login({ username: 'LIMITED@example.invalid', password: 'wrong one' }),
+    (error: unknown) => {
+      assert.deepEqual({ code: (error as { code: string }).code, message: (error as Error).message }, invalid);
+      return true;
+    },
+  );
+  await assert.rejects(auth.login({ username: ' limited@example.invalid ', password: 'wrong two' }));
+  await assert.rejects(
+    auth.login({ username: 'limited@example.invalid', password: 'correct password' }),
+    (error: unknown) => {
+      assert.deepEqual({ code: (error as { code: string }).code, message: (error as Error).message }, invalid);
+      return true;
+    },
+  );
+
+  currentTime += 500;
+  const afterWindow = await auth.login({ username: 'limited@example.invalid', password: 'correct password' });
+  assert.equal(afterWindow.user.username, 'limited@example.invalid');
+
+  await assert.rejects(auth.login({ username: 'limited@example.invalid', password: 'wrong again' }));
+  const afterFailure = await auth.login({ username: 'limited@example.invalid', password: 'correct password' });
+  assert.equal(afterFailure.user.username, 'limited@example.invalid');
+  await assert.rejects(auth.login({ username: 'limited@example.invalid', password: 'wrong after reset' }));
+  const afterReset = await auth.login({ username: 'limited@example.invalid', password: 'correct password' });
+  assert.equal(afterReset.user.username, 'limited@example.invalid');
+
+  await assert.rejects(
+    auth.login({ username: 'missing@example.invalid', password: 'anything' }),
+    (error: unknown) => {
+      assert.deepEqual({ code: (error as { code: string }).code, message: (error as Error).message }, invalid);
+      return true;
+    },
+  );
+});
+
+test('login failure tracking remains bounded without evicting an active account limit', async (t) => {
+  const environment = await createTestEnvironment(t);
+  let currentTime = 1_000;
+  const auth = new AuthService(environment.database, {
+    loginFailureLimit: 2,
+    loginFailureMaximumEntries: 2,
+    loginFailureWindowMs: 500,
+    now: () => currentTime,
+  });
+  await auth.provisionBootstrapUser({ username: 'target@example.invalid', password: 'correct password' });
+  await assert.rejects(auth.login({ username: 'target@example.invalid', password: 'wrong one' }));
+  await assert.rejects(auth.login({ username: 'target@example.invalid', password: 'wrong two' }));
+  await assert.rejects(auth.login({ username: 'filler@example.invalid', password: 'wrong' }));
+  await assert.rejects(auth.login({ username: 'overflow@example.invalid', password: 'wrong' }));
+  assert.equal((auth as unknown as { loginFailures: Map<string, unknown> }).loginFailures.size, 2);
+  await assert.rejects(auth.login({ username: 'target@example.invalid', password: 'correct password' }));
+
+  currentTime += 500;
+  const login = await auth.login({ username: 'target@example.invalid', password: 'correct password' });
+  assert.equal(login.user.username, 'target@example.invalid');
+});
