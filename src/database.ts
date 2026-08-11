@@ -212,6 +212,8 @@ function storedRemoteDelivery(row: BatchRow): RemoteDeliveryState {
 function toBatch(row: BatchRow): StoredBatch {
   const validation = parseJson(row.validation_json);
   const requestSha256 = validationRequestSha256(validation);
+  const delivery = storedRemoteDelivery(row);
+  const error = row.error_code && row.error_message ? { code: row.error_code, message: row.error_message } : null;
   return {
     id: row.id,
     title: row.title,
@@ -223,14 +225,22 @@ function toBatch(row: BatchRow): StoredBatch {
     executionMode: storedExecutionMode(row.execution_mode),
     pushRepository: row.push_repository,
     pushBranchPrefix: row.push_branch_prefix,
-    delivery: storedRemoteDelivery(row),
+    delivery,
     state: row.state,
     validation,
     warningsAcknowledged: requestSha256 !== null && row.warning_ack_request_sha256 === requestSha256,
     plan: parseJson(row.plan_json),
     baseCommit: row.base_commit,
     localDiff: parseJson(row.local_diff_json),
-    error: row.error_code && row.error_message ? { code: row.error_code, message: row.error_message } : null,
+    error,
+    userStatus: userStatusForBatch({
+      state: row.state,
+      executionMode: storedExecutionMode(row.execution_mode),
+      baseCommit: row.base_commit,
+      validation,
+      errorCode: error?.code ?? null,
+      delivery,
+    }),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -605,7 +615,7 @@ export class BatchDatabase {
   returnToDraftForEditing(batchId: string): void {
     const result = this.db.prepare(`
       UPDATE batches
-      SET state = 'DRAFT', validation_json = NULL, warning_ack_request_sha256 = NULL,
+      SET state = 'DRAFT', warning_ack_request_sha256 = NULL,
           plan_json = NULL, base_commit = NULL, local_diff_json = NULL,
           error_code = NULL, error_message = NULL
       WHERE id = ? AND state = 'FAILED' AND delivery_checkpoint = 'NONE'

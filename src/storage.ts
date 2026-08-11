@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import { AppError } from './errors.js';
@@ -13,6 +13,11 @@ export class BatchStorage {
     await mkdir(resolve(outputPath, '..'), { recursive: true });
     await writeFile(outputPath, content);
     return relativePath;
+  }
+
+  async copySvg(sourceBatchId: string, sourceFile: string, targetBatchId: string, targetItemId: string): Promise<string> {
+    const content = await readFile(this.resolveBatchPath(sourceBatchId, sourceFile));
+    return this.saveSvg(targetBatchId, targetItemId, content);
   }
 
   async writeRequest(batch: StoredBatch, items: StoredItem[]): Promise<string> {

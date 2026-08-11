@@ -204,6 +204,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return dependencies.batches.returnToEdit(batchId);
   });
 
+  app.post('/api/batches/:batchId/clone', async (request, reply) => {
+    const { batchId } = request.params as { batchId: string };
+    const cloned = await dependencies.batches.cloneBatch(batchId);
+    return reply.status(201).send(cloned);
+  });
+
   app.get('/api/batches/:batchId', async (request) => {
     const { batchId } = request.params as { batchId: string };
     return dependencies.batches.getBatch(batchId);

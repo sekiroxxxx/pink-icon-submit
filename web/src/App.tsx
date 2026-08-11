@@ -497,6 +497,7 @@ function DiagnosticList({ title, diagnostics, tone, items }: { title: string; di
           <li key={`${diagnostic.code}-${diagnostic.itemId ?? index}`}>
             <strong>{displayed.title}</strong>
             {displayed.itemName && <span>对应图标：{displayed.itemName}</span>}
+            {displayed.location && <span>{displayed.location}</span>}
             <span>{displayed.reason}</span>
             <span>建议：{displayed.suggestion}</span>
             <details><summary>技术详情</summary><p>规则：<code>{displayed.technical.code}</code></p><p>{displayed.technical.message}</p></details>
@@ -509,42 +510,21 @@ function DiagnosticList({ title, diagnostics, tone, items }: { title: string; di
 
 function isFinalValidationFailure(batch: BatchDetails): boolean {
   return batch.state === 'FAILED'
-    && batch.delivery.checkpoint === 'NONE'
-    && batch.validation?.valid === false;
+    && batch.userStatus === 'needs_changes';
 }
 
-const retryableDraftPullRequestErrorCodes = new Set([
-  'GIT_COMMAND_FAILED',
-  'GITHUB_API_REQUEST_FAILED',
-  'GITHUB_API_RESPONSE_INVALID',
-  'WORKER_INTERRUPTED',
-]);
-
 function canResumeDraftPullRequest(batch: BatchDetails): boolean {
-  return batch.state === 'FAILED'
-    && batch.executionMode === 'remote'
+  return batch.userStatus === 'delivery_retryable'
     && (batch.delivery.checkpoint === 'BRANCH_PUSHED' || batch.delivery.checkpoint === 'PR_CREATING')
-    && batch.error !== null
-    && retryableDraftPullRequestErrorCodes.has(batch.error.code)
-    && Boolean(batch.baseCommit?.trim())
-    && Boolean(batch.delivery.branch?.trim())
-    && Boolean(batch.delivery.commitSha?.trim())
     && batch.delivery.pullRequest === null;
 }
 
 function canRetryDelivery(batch: BatchDetails): boolean {
-  if (batch.state !== 'FAILED' || isFinalValidationFailure(batch)) return false;
-  if (batch.delivery.checkpoint === 'NONE' || batch.delivery.checkpoint === 'COMMIT_PREPARED') return true;
-  return canResumeDraftPullRequest(batch);
+  return batch.userStatus === 'delivery_retryable';
 }
 
 function batchStatus(batch: BatchDetails): UserBatchStatus {
-  if (batch.state === 'PR_CREATED') return 'submitted_review';
-  if (batch.state === 'LOCAL_DIFF_READY') return 'local_complete';
-  if (batch.state === 'DRAFT') return 'draft';
-  if (batch.state !== 'FAILED') return 'processing';
-  if (isFinalValidationFailure(batch)) return 'needs_changes';
-  return canRetryDelivery(batch) ? 'delivery_retryable' : 'developer_attention';
+  return batch.userStatus;
 }
 
 function summaryStatus(batch: BatchSummary): UserBatchStatus {
@@ -623,8 +603,10 @@ function HomePage({
     ? { label: '新建图标变更', onClick: onNew }
     : activeStatus === 'draft'
       ? { label: '继续编辑', onClick: onOpenActive }
-      : activeStatus === 'needs_changes'
-        ? { label: '返回修改', onClick: onReturnToEdit }
+    : activeStatus === 'needs_changes'
+        ? activeBatch.state === 'DRAFT'
+          ? { label: '继续编辑', onClick: onOpenActive }
+          : { label: '返回修改', onClick: onReturnToEdit }
         : activeStatus === 'processing'
           ? { label: '查看处理中', onClick: onOpenActive }
           : { label: '恢复交付', onClick: onOpenActive };
@@ -679,6 +661,7 @@ function DeliveryStatusCard({
   repeatedSubmissionConfirmation,
   onReturnToEdit,
   onRetry,
+  onClone,
   onConfirmRepeatedSubmission,
 }: {
   batch: BatchDetails;
@@ -688,15 +671,20 @@ function DeliveryStatusCard({
   repeatedSubmissionConfirmation: boolean;
   onReturnToEdit: () => void;
   onRetry: () => void;
+  onClone: () => void;
   onConfirmRepeatedSubmission: () => void;
 }) {
   const finalValidationFailure = isFinalValidationFailure(batch);
+  const retainedValidation = batch.userStatus === 'needs_changes' && batch.validation?.valid === false;
   const draftPullRequestRecoveryFailure = batch.state === 'FAILED'
     && (batch.delivery.checkpoint === 'BRANCH_PUSHED' || batch.delivery.checkpoint === 'PR_CREATING');
   const canResumeDraftPr = canResumeDraftPullRequest(batch);
   const localResult = batch.state === 'LOCAL_DIFF_READY'
     && (batch.executionMode === 'local' || batch.executionMode === null);
   const draftPr = batch.delivery.pullRequest;
+  const cloneableTerminal = batch.userStatus === 'developer_attention'
+    || batch.userStatus === 'submitted_review'
+    || batch.userStatus === 'local_complete';
   let headline = '本次交付尚未提交';
   let description = '你可以继续编辑本次变更，然后确认提交。';
 
@@ -708,18 +696,23 @@ function DeliveryStatusCard({
     description = batch.executionMode === null
       ? '此历史批次不会自动创建 PR；如需自动提 PR，请新建批次。'
       : '此模式不会创建 PR。';
-  } else if (finalValidationFailure) {
+  } else if (retainedValidation) {
     headline = '需要修改';
-    description = '最终校验发现需要修正的问题。返回编辑后修改内容，再次确认提交。';
+    description = batch.state === 'DRAFT'
+      ? '最终校验发现需要修正的问题。修改内容后，旧诊断会自动失效。'
+      : '最终校验发现需要修正的问题。返回编辑后修改内容，再次确认提交。';
   } else if (canResumeDraftPr) {
     headline = '分支已推送，Draft PR 创建失败';
     description = '图标变更已安全推送。你可以仅重新尝试创建 Draft PR，不会重新提交图标变更。';
   } else if (draftPullRequestRecoveryFailure) {
     headline = 'Draft PR 创建无法自动恢复';
     description = '当前交付状态需要开发处理；平台不会重新提交图标变更。';
-  } else if (batch.state === 'FAILED') {
-    headline = '交付失败';
-    description = '本次交付没有完成。请在确认技术问题后，手动重新尝试交付。';
+  } else if (batch.userStatus === 'developer_attention') {
+    headline = '需要开发处理';
+    description = '本次失败不是可由设计内容直接修正的问题。请联系开发处理，或基于当前设计新建批次。';
+  } else if (batch.userStatus === 'delivery_retryable') {
+    headline = '交付暂时失败';
+    description = '本次交付暂未完成。确认技术问题后可手动重新尝试，不会自动重复交付。';
   } else if (batch.state === 'QUEUED') {
     headline = '已提交';
     description = '已接收本次设计，正在等待最终校验。';
@@ -746,7 +739,8 @@ function DeliveryStatusCard({
         <details><summary>技术详情</summary><p>规则：<code>{batch.error.code}</code></p><p>{batch.error.message}</p></details>
       )}
       {finalValidationFailure && !readOnly && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onReturnToEdit}>返回编辑并修正</button></div>}
-      {batch.state === 'FAILED' && !finalValidationFailure && (!draftPullRequestRecoveryFailure || canResumeDraftPr) && !readOnly && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onRetry}>{canResumeDraftPr ? '重新尝试创建 Draft PR' : '重新尝试交付'}</button></div>}
+      {batch.state === 'FAILED' && canRetryDelivery(batch) && (!draftPullRequestRecoveryFailure || canResumeDraftPr) && !readOnly && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onRetry}>{canResumeDraftPr ? '重新尝试创建 Draft PR' : '重新尝试交付'}</button></div>}
+      {cloneableTerminal && <div className="post-validation-actions"><button className="button secondary" type="button" disabled={busy} onClick={onClone}>基于此新建批次</button></div>}
       {repeatedSubmissionConfirmation && batch.state === 'DRAFT' && !readOnly && (
         <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onConfirmRepeatedSubmission}>仍要按原内容再次提交</button></div>
       )}
@@ -1096,7 +1090,19 @@ export function App() {
     const requiresPolling = Boolean(batch && activeBatchId === batch.id && batchStatus(batch) === 'processing');
     if (!requiresPolling || !batch) return undefined;
     const timer = window.setInterval(() => {
-      void api.getBatch(batch.id).then(setBatch).catch((error: unknown) => setNotice(error instanceof Error ? error.message : '无法刷新批次状态。'));
+      const pollVersion = workbenchHydrationVersion.current + 1;
+      workbenchHydrationVersion.current = pollVersion;
+      const batchId = batch.id;
+      void api.getBatch(batchId)
+        .then((refreshed) => {
+          if (workbenchHydrationVersion.current !== pollVersion || activeBatchIdRef.current !== batchId) return;
+          setBatch(refreshed);
+        })
+        .catch((error: unknown) => {
+          if (workbenchHydrationVersion.current === pollVersion && activeBatchIdRef.current === batchId) {
+            setNotice(error instanceof Error ? error.message : '无法刷新批次状态。');
+          }
+        });
     }, 1_500);
     return () => window.clearInterval(timer);
   }, [activeBatchId, batch]);
@@ -1282,6 +1288,8 @@ export function App() {
 
   const submitReview = async () => {
     if (!profile || !validateReview()) return;
+    let mutationVersion = workbenchHydrationVersion.current + 1;
+    workbenchHydrationVersion.current = mutationVersion;
     setReviewOpen(false);
     setBusy(true);
     setRepeatedSubmissionConfirmation(false);
@@ -1295,20 +1303,27 @@ export function App() {
       };
       if (!currentBatch) {
         currentBatch = await api.createBatch({ ...metadata, submitter: { name: profile.name, email: profile.email } });
+        if (workbenchHydrationVersion.current !== mutationVersion) return;
         setBrowserActiveBatch(currentBatch.id);
+        mutationVersion = workbenchHydrationVersion.current;
         setBatch(currentBatch);
       } else {
         currentBatch = await api.updateBatch(currentBatch.id, metadata);
+        if (workbenchHydrationVersion.current !== mutationVersion) return;
         setBatch(currentBatch);
       }
       const saved = await syncChanges(currentBatch.id);
+      if (workbenchHydrationVersion.current !== mutationVersion) return;
       setChanges(saved);
-      setBatch(await api.submitBatch(currentBatch.id));
+      const submitted = await api.submitBatch(currentBatch.id);
+      if (workbenchHydrationVersion.current !== mutationVersion) return;
+      setBatch(submitted);
       void refreshBatchSummaries();
     } catch (error) {
       if (currentBatch) {
         try {
           const restored = await api.getBatch(currentBatch.id);
+          if (workbenchHydrationVersion.current !== mutationVersion) return;
           setBatch(restored);
           setChanges((current) => reconcileDraftChanges(restored, current));
           setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
@@ -1329,9 +1344,13 @@ export function App() {
 
   const retry = async () => {
     if (!batch || !viewingActiveBatch) return;
+    const mutationVersion = workbenchHydrationVersion.current + 1;
+    workbenchHydrationVersion.current = mutationVersion;
     setBusy(true);
     try {
-      setBatch(await api.retryBatch(batch.id));
+      const retried = await api.retryBatch(batch.id);
+      if (workbenchHydrationVersion.current !== mutationVersion) return;
+      setBatch(retried);
       setNotice('已重新安排本次交付。');
       void refreshBatchSummaries();
     } catch (error) {
@@ -1343,9 +1362,12 @@ export function App() {
 
   const returnToEdit = async (): Promise<boolean> => {
     if (!batch || !viewingActiveBatch) return false;
+    const mutationVersion = workbenchHydrationVersion.current + 1;
+    workbenchHydrationVersion.current = mutationVersion;
     setBusy(true);
     try {
       const restored = await api.returnToEdit(batch.id);
+      if (workbenchHydrationVersion.current !== mutationVersion) return false;
       hydrateWorkbenchFromDetails(restored, '已返回编辑。请修正内容后再次确认提交。');
       void refreshBatchSummaries();
       return true;
@@ -1359,9 +1381,13 @@ export function App() {
 
   const confirmRepeatedSubmission = async () => {
     if (!batch || !viewingActiveBatch) return;
+    const mutationVersion = workbenchHydrationVersion.current + 1;
+    workbenchHydrationVersion.current = mutationVersion;
     setBusy(true);
     try {
-      setBatch(await api.submitBatch(batch.id, true));
+      const submitted = await api.submitBatch(batch.id, true);
+      if (workbenchHydrationVersion.current !== mutationVersion) return;
+      setBatch(submitted);
       setRepeatedSubmissionConfirmation(false);
       setNotice('已按原内容再次提交，正在等待最终校验。');
       void refreshBatchSummaries();
@@ -1412,6 +1438,28 @@ export function App() {
     void refreshBatchSummaries();
   };
 
+  const cloneBatch = async () => {
+    if (!batch) return;
+    const mutationVersion = workbenchHydrationVersion.current + 1;
+    workbenchHydrationVersion.current = mutationVersion;
+    setBusy(true);
+    try {
+      const cloned = await api.cloneBatch(batch.id);
+      if (workbenchHydrationVersion.current !== mutationVersion) return;
+      setBusy(false);
+      setBrowserActiveBatch(cloned.id);
+      hydrateWorkbenchFromDetails(cloned, '已基于原批次创建新的草稿。请确认内容后重新提交。');
+      navigate({ view: 'workbench' });
+      void refreshBatchSummaries();
+    } catch (error) {
+      if (workbenchHydrationVersion.current === mutationVersion) {
+        setNotice(error instanceof Error ? `无法新建批次：${error.message}` : '无法基于当前批次新建。');
+      }
+    } finally {
+      if (workbenchHydrationVersion.current === mutationVersion) setBusy(false);
+    }
+  };
+
   const returnHome = () => {
     navigate({ view: 'home' });
     void refreshBatchSummaries();
@@ -1445,6 +1493,7 @@ export function App() {
           repeatedSubmissionConfirmation={repeatedSubmissionConfirmation}
           onReturnToEdit={() => void returnToEdit()}
           onRetry={() => void retry()}
+          onClone={() => void cloneBatch()}
           onConfirmRepeatedSubmission={() => void confirmRepeatedSubmission()}
         /> : notice && <p className="notice" aria-live="polite">{notice}</p>}
 
@@ -1491,7 +1540,7 @@ export function App() {
 
         <section className="changes-card" aria-label="本次变更"><div><h2>本次变更 {changes.length} 项</h2><p>{changes.length === 0 ? '把一项操作加入队列后，会在这里同时显示所有待改动图标。' : '确认前可移除任何一项变更。'}</p></div><div className="change-list">{changes.map((change) => <ChangeCard key={change.clientId} change={change} disabled={!editable || busy} onRemove={() => void removeChange(change)} />)}</div><div className="changes-actions"><button className="button primary" type="button" disabled={!editable || busy || changes.length === 0} onClick={() => { setReviewErrors({}); setReviewOpen(true); }}>确认本次变更</button></div></section>
 
-        {batch && isFinalValidationFailure(batch) && <DiagnosticList title="需要修正的问题" diagnostics={batch.validation?.errors ?? []} tone="error" items={batch.items} />}
+        {batch && batch.userStatus === 'needs_changes' && batch.validation?.valid === false && <DiagnosticList title="需要修正的问题" diagnostics={batch.validation.errors} tone="error" items={batch.items} />}
       </main>}
       {identityOpen && <IdentityDialog profile={profile} onSave={saveProfile} onClose={profile ? () => setIdentityOpen(false) : undefined} />}
       {reviewOpen && profile && <ReviewDrawer changes={changes} form={batchForm} profile={profile} errors={reviewErrors} confirmed={confirmed} busy={busy} onChange={updateBatchMetadata} onConfirmedChange={setConfirmed} onClose={() => setReviewOpen(false)} onSubmit={() => void submitReview()} />}

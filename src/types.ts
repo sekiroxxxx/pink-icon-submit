@@ -62,6 +62,11 @@ export interface StoredBatch extends CreateBatchInput {
   baseCommit: string | null;
   localDiff: unknown | null;
   error: { code: string; message: string } | null;
+  /**
+   * A server-derived, user-facing lifecycle classification.  Clients consume
+   * this instead of trying to reproduce delivery/checkpoint error rules.
+   */
+  userStatus: UserBatchStatus;
   createdAt: string;
   updatedAt: string;
 }

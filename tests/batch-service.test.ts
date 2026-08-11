@@ -159,7 +159,8 @@ test('a final validation failure at checkpoint NONE returns to editing and requi
   assert.equal(draft.state, 'DRAFT');
   assert.equal(draft.items[0]?.id, item.id);
   assert.equal(draft.items[0]?.sourceFile, item.sourceFile);
-  assert.equal(draft.validation, null);
+  assert.deepEqual(draft.validation, failed.validation);
+  assert.equal(draft.userStatus, 'needs_changes');
   assert.equal(draft.plan, null);
   assert.equal(draft.baseCommit, null);
   assert.equal(draft.localDiff, null);
@@ -191,7 +192,71 @@ test('editing after a final validation failure permits a normal DRAFT resubmissi
     designName: 'corrected-final-validation-icon',
     description: 'Changed designer input.',
   }, undefined);
+  assert.equal(environment.batches.getBatch(batch.id).validation, null);
+  assert.equal(environment.batches.getBatch(batch.id).userStatus, 'draft');
   assert.equal(environment.batches.submit(batch.id).state, 'QUEUED');
+});
+
+test('a system final validation diagnostic requires developer handling instead of designer retry or return-to-edit', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const batch = await environment.batches.createBatch({
+    title: 'System final validation failure',
+    description: 'Repository mapping diagnostics are not designer-editable.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  await environment.batches.addItem(batch.id, {
+    action: 'add',
+    designName: 'mapping-diagnostic-icon',
+    description: 'Keeps a source SVG for the persisted failure.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(batch.id);
+  environment.database.claimNextJob();
+  environment.database.recordFinalValidation(batch.id, {
+    valid: false,
+    requestSha256: 'a'.repeat(64),
+    errors: [{ code: 'MAPPING_SOURCE_INVALID', message: 'Target mapping is invalid.' }],
+    warnings: [],
+  }, 'b'.repeat(40));
+  environment.database.failJob(batch.id, 'FINAL_VALIDATION_FAILED', 'Target mapping is invalid.');
+
+  const failed = environment.batches.getBatch(batch.id);
+  assert.equal(failed.userStatus, 'developer_attention');
+  assert.throws(() => environment.batches.returnToEdit(batch.id), { code: 'BATCH_NOT_EDITABLE' });
+  assert.throws(() => environment.batches.retry(batch.id), { code: 'BATCH_NOT_RETRYABLE' });
+});
+
+test('cloning an immutable batch copies designer content without delivery or validation evidence', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const source = await environment.batches.createBatch({
+    title: 'Copy terminal design',
+    description: 'Copies designer-visible metadata and uploaded SVG only.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  const item = await environment.batches.addItem(source.id, {
+    action: 'add',
+    designName: 'copy-terminal-icon',
+    description: 'Source item that will be copied.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(source.id);
+  environment.database.claimNextJob();
+  environment.database.failJob(source.id, 'CATALOG_INTEGRITY_MISMATCH', 'Catalog integrity failure.');
+
+  const cloned = await environment.batches.cloneBatch(source.id);
+  assert.notEqual(cloned.id, source.id);
+  assert.equal(cloned.state, 'DRAFT');
+  assert.equal(cloned.userStatus, 'draft');
+  assert.equal(cloned.validation, null);
+  assert.equal(cloned.error, null);
+  assert.equal(cloned.plan, null);
+  assert.equal(cloned.baseCommit, null);
+  assert.equal(cloned.localDiff, null);
+  assert.equal(cloned.delivery.checkpoint, 'NONE');
+  assert.equal(cloned.job, null);
+  assert.equal(cloned.items.length, 1);
+  assert.notEqual(cloned.items[0]?.id, item.id);
+  assert.notEqual(cloned.items[0]?.sourceFile, item.sourceFile);
+  const cloneRequest = JSON.parse(await readFile(await environment.batches.writeRequest(cloned.id), 'utf8')) as { items: Array<{ sourceFile?: string }> };
+  assert.match(cloneRequest.items[0]?.sourceFile ?? '', /^uploads\/item-/);
 });
 
 test('DRAFT content edits advance a monotonic revision after a same-millisecond final validation failure', async (t) => {
@@ -212,7 +277,7 @@ test('DRAFT content edits advance a monotonic revision after a same-millisecond 
   environment.database.recordFinalValidation(batch.id, {
     valid: false,
     requestSha256: 'a'.repeat(64),
-    errors: [{ code: 'TEST_INVALID', message: 'Simulated final validation failure.' }],
+    errors: [{ code: 'SVG_MULTIPLE_COLORS', message: 'Simulated final validation failure.' }],
     warnings: [],
   }, 'b'.repeat(40));
   environment.database.failJob(batch.id, 'FINAL_VALIDATION_FAILED', 'Simulated final validation failure.');

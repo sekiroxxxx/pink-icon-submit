@@ -6,7 +6,7 @@ import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage } from './storage.js';
-import { canRetryBatch, hasPostPushPullRequestRecoveryEvidence, isFinalValidationFailure, isPostPushCheckpoint, isRetryablePostPushInfrastructureFailure, lifecycleSnapshot } from './batch-lifecycle.js';
+import { canRetryBatch, hasPostPushPullRequestRecoveryEvidence, isActiveBatch, isFinalValidationFailure, isPostPushCheckpoint, isRetryablePostPushInfrastructureFailure, lifecycleSnapshot } from './batch-lifecycle.js';
 import type { BatchDetails, BatchExecutionContext, BatchSummary, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
 
 const maximumBatchItems = 100;
@@ -257,10 +257,7 @@ export class BatchService {
 
   returnToEdit(batchId: string): BatchDetails {
     const batch = this.database.getBatch(batchId);
-    if (batch.state !== 'FAILED'
-      || batch.delivery.checkpoint !== 'NONE'
-      || !isObject(batch.validation)
-      || batch.validation.valid !== false) {
+    if (!isFinalValidationFailure(lifecycleSnapshot(batch))) {
       throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} cannot return to editing from its current delivery state.`, 409);
     }
     this.database.returnToDraftForEditing(batchId);
@@ -301,6 +298,57 @@ export class BatchService {
 
   listBatches(limit: number): BatchSummary[] {
     return this.database.listBatchSummaries(limit);
+  }
+
+  async cloneBatch(batchId: string): Promise<BatchDetails> {
+    const source = this.database.getDetails(batchId);
+    if (isActiveBatch(lifecycleSnapshot(source))) {
+      throw new AppError('BATCH_NOT_CLONEABLE', `Batch ${batchId} is still active and cannot be cloned.`, 409);
+    }
+    if (!source.catalogBaseline || !source.targetRepository) {
+      throw new AppError('BATCH_PROTOCOL_CONTEXT_MISSING', `Batch ${batchId} predates the Stage 1 v2 protocol and must be recreated manually.`, 409);
+    }
+
+    const clonedId = createBatchId();
+    this.database.createBatch(
+      clonedId,
+      {
+        title: source.title,
+        description: source.description,
+        ...(source.designUrl ? { designUrl: source.designUrl } : {}),
+        submitter: source.submitter,
+      },
+      source.catalogBaseline,
+      source.targetRepository,
+      {
+        executionMode: source.executionMode ?? this.executionContext.executionMode,
+        pushRepository: source.pushRepository,
+        pushBranchPrefix: source.pushBranchPrefix,
+      },
+    );
+
+    try {
+      for (const item of source.items) {
+        const itemId = createItemId();
+        const sourceFile = item.sourceFile
+          ? await this.storage.copySvg(source.id, item.sourceFile, clonedId, itemId)
+          : null;
+        this.database.insertItem(clonedId, itemId, {
+          action: item.action,
+          ...(item.designName ? { designName: item.designName } : {}),
+          ...(item.targetName ? { targetName: item.targetName } : {}),
+          ...(item.description ? { description: item.description } : {}),
+          ...(item.reason ? { reason: item.reason } : {}),
+          ...(item.replacementName ? { replacementName: item.replacementName } : {}),
+        }, sourceFile);
+      }
+    } catch (error) {
+      // The database record is an isolated DRAFT and contains no delivery
+      // evidence. Preserve the original copy error for the caller rather than
+      // continuing with a silently incomplete clone.
+      throw error;
+    }
+    return this.database.getDetails(clonedId);
   }
 
   private assertLocallySubmittable(batchId: string): void {

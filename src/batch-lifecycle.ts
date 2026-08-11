@@ -28,10 +28,47 @@ function validationIsInvalid(value: unknown): boolean {
   return isObject(value) && value.valid === false;
 }
 
+function validationErrorCodes(value: unknown): string[] {
+  if (!isObject(value) || !Array.isArray(value.errors)) return [];
+  return value.errors.flatMap((error) => isObject(error) && typeof error.code === 'string' ? [error.code] : []);
+}
+
+// These are request/SVG/selected-target rules a designer can correct in the
+// editor. Repository, catalog, supply-chain and platform diagnostics are not
+// presented as a designer-editable failure.
+const designerCorrectableValidationErrorCodes = new Set([
+  'REQUEST_SCHEMA_INVALID',
+  'DUPLICATE_ITEM_ID',
+  'BATCH_ACTION_CONFLICT',
+  'SOURCE_FILE_MISSING',
+  'SVG_INVALID_XML',
+  'SVG_MISSING_VIEWBOX',
+  'SVG_SCRIPT',
+  'SVG_EXTERNAL_RESOURCE',
+  'SVG_EMBEDDED_BITMAP',
+  'SVG_GRADIENT',
+  'SVG_STYLE_ELEMENT',
+  'SVG_MULTIPLE_COLORS',
+  'SVG_LITERAL_COLOR',
+  'ADD_NAME_COLLISION',
+  'TARGET_NOT_FOUND',
+  'DELETE_TARGET_IS_ALIAS',
+]);
+
+export function hasDesignerCorrectableValidation(batch: Pick<BatchLifecycleSnapshot, 'validation' | 'delivery'>): boolean {
+  if (batch.delivery.checkpoint !== 'NONE' || !validationIsInvalid(batch.validation)) return false;
+  const errorCodes = validationErrorCodes(batch.validation);
+  return errorCodes.length > 0 && errorCodes.every((code) => designerCorrectableValidationErrorCodes.has(code));
+}
+
 export function isFinalValidationFailure(batch: Pick<BatchLifecycleSnapshot, 'state' | 'validation' | 'delivery'>): boolean {
   return batch.state === 'FAILED'
-    && batch.delivery.checkpoint === 'NONE'
-    && validationIsInvalid(batch.validation);
+    && hasDesignerCorrectableValidation(batch);
+}
+
+export function hasRetainedDesignerCorrectableValidation(batch: Pick<BatchLifecycleSnapshot, 'state' | 'validation' | 'delivery'>): boolean {
+  return (batch.state === 'FAILED' || batch.state === 'DRAFT')
+    && hasDesignerCorrectableValidation(batch);
 }
 
 export function hasPostPushPullRequestRecoveryEvidence(batch: Pick<BatchLifecycleSnapshot, 'executionMode' | 'baseCommit' | 'delivery'>): boolean {
@@ -56,7 +93,9 @@ export function canResumeDraftPullRequest(batch: BatchLifecycleSnapshot): boolea
 export function canRetryBatch(batch: BatchLifecycleSnapshot): boolean {
   if (batch.state !== 'FAILED') return false;
   if (isFinalValidationFailure(batch)) return false;
-  if (batch.delivery.checkpoint === 'NONE' || batch.delivery.checkpoint === 'COMMIT_PREPARED') return true;
+  if (batch.delivery.checkpoint === 'NONE' || batch.delivery.checkpoint === 'COMMIT_PREPARED') {
+    return batch.errorCode === 'GIT_COMMAND_FAILED' || batch.errorCode === 'WORKER_INTERRUPTED';
+  }
   return canResumeDraftPullRequest(batch);
 }
 
@@ -69,6 +108,7 @@ export function isActiveBatch(batch: BatchLifecycleSnapshot): boolean {
 export function userStatusForBatch(batch: BatchLifecycleSnapshot): UserBatchStatus {
   if (batch.state === 'PR_CREATED') return 'submitted_review';
   if (batch.state === 'LOCAL_DIFF_READY') return 'local_complete';
+  if (hasRetainedDesignerCorrectableValidation(batch)) return 'needs_changes';
   if (batch.state === 'DRAFT') return 'draft';
   if (batch.state !== 'FAILED') return 'processing';
   if (isFinalValidationFailure(batch)) return 'needs_changes';

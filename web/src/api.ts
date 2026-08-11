@@ -32,6 +32,7 @@ export interface Diagnostic {
   code: string;
   message: string;
   itemId?: string;
+  path?: string;
 }
 
 export interface ValidationResult {
@@ -63,6 +64,7 @@ export interface BatchDetails extends BatchInput {
     handoffAt: string | null;
   };
   error: { code: string; message: string } | null;
+  userStatus: UserBatchStatus;
   createdAt: string;
 }
 
@@ -198,6 +200,7 @@ export const api = {
     } : {}),
   }),
   returnToEdit: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/return-to-edit`, { method: 'POST' }),
+  cloneBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/clone`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
   getBatches: () => request<BatchSummary[]>('/api/batches?limit=20'),
