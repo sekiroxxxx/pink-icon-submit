@@ -174,6 +174,7 @@ function statefulDraftServer(options: { loseCreateResponse?: boolean; loseAddRes
   let addResponseLost = false;
   let addFailedBeforeWrite = false;
   let reconciliationGetFailed = false;
+  const itemMutationIds: Array<string | undefined> = [];
   const handler = vi.fn(async (path: string, request?: RequestInit) => {
     const url = new URL(path, 'http://localhost');
     if (url.pathname === '/api/auth/logout' && request?.method === 'POST') return new Response(null, { status: 204 });
@@ -204,14 +205,15 @@ function statefulDraftServer(options: { loseCreateResponse?: boolean; loseAddRes
     }
     if (current && url.pathname === `/api/batches/${current.id}/items` && request?.method === 'POST') {
       addCount += 1;
+      const body = request.body;
+      const input = body instanceof FormData
+        ? JSON.parse(String(body.get('item'))) as ItemInput & { clientMutationId?: string }
+        : JSON.parse(String(body)) as ItemInput & { clientMutationId?: string };
+      itemMutationIds.push(input.clientMutationId);
       if (options.failAddBeforeWrite && !addFailedBeforeWrite) {
         addFailedBeforeWrite = true;
         return jsonResponse({ error: { code: 'UPLOAD_FAILED', message: 'The upload failed before storage.' } }, 500);
       }
-      const body = request.body;
-      const input = body instanceof FormData
-        ? JSON.parse(String(body.get('item'))) as ItemInput
-        : JSON.parse(String(body)) as ItemInput;
       const item: ApiItem = {
         id: `item-${++itemSequence}`,
         batchId: current.id,
@@ -237,6 +239,7 @@ function statefulDraftServer(options: { loseCreateResponse?: boolean; loseAddRes
     handler,
     current: () => current,
     counts: () => ({ create: createCount, add: addCount, submit: submitCount, metadataSave: metadataSaveCount }),
+    itemMutationIds: () => itemMutationIds,
   };
 }
 
@@ -1485,6 +1488,8 @@ test('a failed first item upload keeps one empty server draft and all editor inp
   expect(await screen.findByText('本次变更 1 项')).toBeTruthy();
   expect(server.current()?.items).toHaveLength(1);
   expect(server.counts()).toMatchObject({ create: 1, add: 2, submit: 0 });
+  expect(server.itemMutationIds()).toHaveLength(2);
+  expect(new Set(server.itemMutationIds()).size).toBe(1);
 });
 
 test('a metadata save failure keeps the designer in the workbench with the server draft unchanged', async () => {

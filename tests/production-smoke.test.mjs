@@ -137,6 +137,43 @@ test('built npm start serves authenticated writes, rejects a second owner, and r
   assert.equal(logout.status, 204, await logout.text());
   assert.doesNotMatch(primary.output(), /production-smoke-password/);
 
+  const itemLogin = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: publicOrigin },
+    body: JSON.stringify({ username, password }),
+  });
+  assert.equal(itemLogin.status, 200, await itemLogin.text());
+  const itemCookie = itemLogin.headers.get('set-cookie')?.split(';', 1)[0];
+  assert.ok(itemCookie);
+  const batchResponse = await fetch(`${base}/api/batches`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: publicOrigin, cookie: itemCookie },
+    body: JSON.stringify({
+      title: 'Production idempotent item',
+      description: 'A repeated browser POST must produce one stored item.',
+    }),
+  });
+  assert.equal(batchResponse.status, 201);
+  const batch = await batchResponse.json();
+  const itemPayload = {
+    action: 'add',
+    designName: 'production-idempotent-icon',
+    description: 'Two production requests use the same mutation identity.',
+    clientMutationId: 'mutation-production-race-0001',
+    svgBase64: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z"/></svg>').toString('base64'),
+  };
+  const [firstItem, secondItem] = await Promise.all([1, 2].map(() => fetch(`${base}/api/batches/${batch.id}/items`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: publicOrigin, cookie: itemCookie },
+    body: JSON.stringify(itemPayload),
+  })));
+  assert.equal(firstItem.status, 201);
+  assert.equal(secondItem.status, 201);
+  assert.equal((await firstItem.json()).id, (await secondItem.json()).id);
+  const persisted = await fetch(`${base}/api/batches/${batch.id}`, { headers: { origin: publicOrigin, cookie: itemCookie } });
+  assert.equal(persisted.status, 200);
+  assert.equal((await persisted.json()).items.length, 1);
+
   const secondPort = await availablePort();
   const duplicate = spawnProductionServer({ ...environment, PINK_ICON_SUBMIT_PORT: String(secondPort) });
   processes.push(duplicate);

@@ -21,7 +21,18 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-async function readItemPayload(request: FastifyRequest): Promise<{ item: CreateItemInput; svg?: Buffer }> {
+function splitItemMutation(item: CreateItemInput, required: boolean): { item: CreateItemInput; clientMutationId?: string } {
+  if (!isObject(item)) return { item };
+  const candidate = item as CreateItemInput & { clientMutationId?: unknown };
+  const { clientMutationId, ...input } = candidate;
+  if (clientMutationId === undefined && !required) return { item: input };
+  if (typeof clientMutationId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$/.test(clientMutationId)) {
+    throw new AppError('REQUEST_INVALID', 'clientMutationId must be a stable 16-128 character identifier.');
+  }
+  return { item: input, clientMutationId };
+}
+
+async function readItemPayload(request: FastifyRequest, requireClientMutationId = false): Promise<{ item: CreateItemInput; svg?: Buffer; clientMutationId?: string }> {
   if (request.isMultipart()) {
     let item: CreateItemInput | undefined;
     let svg: Buffer | undefined;
@@ -45,7 +56,7 @@ async function readItemPayload(request: FastifyRequest): Promise<{ item: CreateI
     if (!item) {
       throw new AppError('REQUEST_INVALID', 'multipart request requires an item field.');
     }
-    return { item, svg };
+    return { ...splitItemMutation(item, requireClientMutationId), svg };
   }
 
   const body = request.body;
@@ -57,7 +68,10 @@ async function readItemPayload(request: FastifyRequest): Promise<{ item: CreateI
   if (svgBase64 !== undefined && typeof svgBase64 !== 'string') {
     throw new AppError('REQUEST_INVALID', 'svgBase64 must be a base64 string.');
   }
-  return { item, ...(typeof svgBase64 === 'string' ? { svg: Buffer.from(svgBase64, 'base64') } : {}) };
+  return {
+    ...splitItemMutation(item, requireClientMutationId),
+    ...(typeof svgBase64 === 'string' ? { svg: Buffer.from(svgBase64, 'base64') } : {}),
+  };
 }
 
 function optionalQueryText(value: unknown, field: string, maximumLength: number): string | undefined {
@@ -330,8 +344,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post('/api/batches/:batchId/items', async (request, reply) => {
     const { batchId } = request.params as { batchId: string };
-    const { item, svg } = await readItemPayload(request);
-    const created = await dependencies.batches.addItem(batchId, item, svg, authenticatedUser(request).id);
+    const { item, svg, clientMutationId } = await readItemPayload(request, true);
+    const created = await dependencies.batches.addItem(batchId, item, svg, authenticatedUser(request).id, clientMutationId);
     return reply.status(201).send(created);
   });
 

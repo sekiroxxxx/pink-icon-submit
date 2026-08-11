@@ -39,7 +39,7 @@ test('batch API stores uploads, validates through icon-batch, and exposes catalo
     `--${boundary}`,
     'Content-Disposition: form-data; name="item"',
     '',
-    JSON.stringify({ action: 'add', designName: 'api-icon', description: 'API icon' }),
+    JSON.stringify({ action: 'add', designName: 'api-icon', description: 'API icon', clientMutationId: 'mutation-api-icon-0001' }),
     `--${boundary}`,
     'Content-Disposition: form-data; name="svg"; filename="api-icon.svg"',
     'Content-Type: image/svg+xml',
@@ -93,6 +93,7 @@ test('DRAFT items can be updated and deleted', async (t) => {
     url: `/api/batches/${batchId}/items`,
     payload: {
       action: 'add',
+      clientMutationId: 'mutation-editable-icon-0001',
       designName: 'editable-icon',
       description: 'Original description',
       svgBase64: Buffer.from(environment.validSvg).toString('base64'),
@@ -117,6 +118,75 @@ test('DRAFT items can be updated and deleted', async (t) => {
   assert.equal(removed.statusCode, 204);
   const batch = await app.inject({ method: 'GET', url: `/api/batches/${batchId}` });
   assert.deepEqual((batch.json() as { items: unknown[] }).items, []);
+});
+
+test('item creation is idempotent for a stable client mutation id and rejects mismatched replays', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const { app } = await buildAuthenticatedApp(environment);
+  t.after(() => app.close());
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Idempotent item creation',
+      description: 'Repeated browser delivery must create one item.',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  const batchId = (created.json() as { id: string }).id;
+  const payload = {
+    action: 'add',
+    designName: 'idempotent-api-icon',
+    description: 'Stable browser mutation identity.',
+    clientMutationId: 'mutation-idempotent-api-0001',
+    svgBase64: Buffer.from(environment.validSvg).toString('base64'),
+  };
+  const [first, second] = await Promise.all([
+    app.inject({ method: 'POST', url: `/api/batches/${batchId}/items`, payload }),
+    app.inject({ method: 'POST', url: `/api/batches/${batchId}/items`, payload }),
+  ]);
+  assert.equal(first.statusCode, 201);
+  assert.equal(second.statusCode, 201);
+  assert.equal((first.json() as { id: string }).id, (second.json() as { id: string }).id);
+  assert.equal(environment.database.countItems(batchId), 1);
+
+  const conflict = await app.inject({
+    method: 'POST',
+    url: `/api/batches/${batchId}/items`,
+    payload: { ...payload, description: 'A different request must not overwrite the original.' },
+  });
+  assert.equal(conflict.statusCode, 409);
+  assert.equal((conflict.json() as { error: { code: string } }).error.code, 'ITEM_MUTATION_CONFLICT');
+  assert.equal(environment.database.countItems(batchId), 1);
+});
+
+test('item creation requires a stable client mutation id', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const { app } = await buildAuthenticatedApp(environment);
+  t.after(() => app.close());
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Mutation identity required',
+      description: 'A client cannot opt out of idempotent item creation.',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  const batchId = (created.json() as { id: string }).id;
+  const response = await app.inject({
+    method: 'POST',
+    url: `/api/batches/${batchId}/items`,
+    payload: {
+      action: 'add',
+      designName: 'missing-mutation-id',
+      description: 'This request has no client mutation id.',
+      svgBase64: Buffer.from(environment.validSvg).toString('base64'),
+    },
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal((response.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
+  assert.equal(environment.database.countItems(batchId), 0);
 });
 
 test('DRAFT batch metadata can be updated and clears obsolete validation, but READY batches remain immutable', async (t) => {
@@ -181,6 +251,7 @@ test('DRAFT batch metadata can be updated and clears obsolete validation, but RE
     url: `/api/batches/${batchId}/items`,
     payload: {
       action: 'add',
+      clientMutationId: 'mutation-ready-metadata-0001',
       designName: 'ready-metadata-icon',
       description: 'Makes the batch valid.',
       svgBase64: Buffer.from(environment.validSvg).toString('base64'),
@@ -222,6 +293,7 @@ test('delete replacement must select a different existing catalog icon', async (
     url: `/api/batches/${batchId}/items`,
     payload: {
       action: 'delete',
+      clientMutationId: 'mutation-delete-replacement-0001',
       targetName: 'existing',
       replacementName: 'existing-alias',
       reason: 'Must use a different icon.',
@@ -279,6 +351,7 @@ test('catalog page returns canonical icons with SVG thumbnails and normalizes al
     url: `/api/batches/${batchId}/items`,
     payload: {
       action: 'replace',
+      clientMutationId: 'mutation-replace-icon-0001',
       targetName: 'existing-alias',
       svgBase64: Buffer.from(environment.validSvg).toString('base64'),
     },
@@ -339,6 +412,7 @@ test('validation warnings are retained for developer review without blocking sub
     url: `/api/batches/${batchId}/items`,
     payload: {
       action: 'add',
+      clientMutationId: 'mutation-warning-icon-0001',
       designName: 'warning-icon',
       description: 'Triggers a test warning.',
       svgBase64: Buffer.from(environment.validSvg).toString('base64'),
@@ -507,6 +581,7 @@ test('DRAFT API delivery accepts an optional design link and queues without the 
     url: `/api/batches/${body.id}/items`,
     payload: {
       action: 'add',
+      clientMutationId: 'mutation-optional-design-0001',
       designName: 'optional-design-link-icon',
       description: 'Can be queued without an interactive validation result.',
       svgBase64: Buffer.from(environment.validSvg).toString('base64'),

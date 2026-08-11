@@ -28,7 +28,7 @@ import type {
 export const legacyBootstrapUserId = 'legacy-bootstrap';
 export const legacyBootstrapPendingPasswordHash = 'bootstrap-pending';
 export const disabledUserPasswordHash = 'disabled';
-export const currentSchemaVersion = 7;
+export const currentSchemaVersion = 8;
 
 const createdCloneMarker: unique symbol = Symbol('created clone ownership');
 
@@ -108,6 +108,7 @@ interface ItemRow {
   reason: string | null;
   replacement_name: string | null;
   source_file: string | null;
+  client_mutation_id: string | null;
   created_at: string;
 }
 
@@ -635,7 +636,7 @@ export class BatchDatabase {
     return update();
   }
 
-  insertItem(batchId: string, id: string, input: CreateItemInput, sourceFile: string | null): StoredItem {
+  insertItem(batchId: string, id: string, input: CreateItemInput, sourceFile: string | null, clientMutationId?: string): StoredItem {
     const insert = this.db.transaction(() => {
       const batch = this.db.prepare('SELECT state FROM batches WHERE id = ?').get(batchId) as Pick<BatchRow, 'state'> | undefined;
       if (!batch) {
@@ -648,8 +649,8 @@ export class BatchDatabase {
       const timestamp = this.nextContentRevision(batchId);
       this.db.prepare(`
         INSERT INTO items (
-          id, batch_id, action, design_name, target_name, description, reason, replacement_name, source_file, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, batch_id, action, design_name, target_name, description, reason, replacement_name, source_file, client_mutation_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         batchId,
@@ -660,6 +661,7 @@ export class BatchDatabase {
         input.reason ?? null,
         input.replacementName ?? null,
         sourceFile,
+        clientMutationId ?? null,
         timestamp,
       );
       this.clearValidationAfterDraftContentChange(batchId, timestamp);
@@ -974,6 +976,13 @@ export class BatchDatabase {
       }
     });
     complete();
+  }
+
+  getItemByClientMutationId(batchId: string, clientMutationId: string): StoredItem | undefined {
+    const row = this.db.prepare(
+      'SELECT * FROM items WHERE batch_id = ? AND client_mutation_id = ?',
+    ).get(batchId, clientMutationId) as ItemRow | undefined;
+    return row ? toItem(row) : undefined;
   }
 
   replaceUserPasswordAndSessions(username: string, passwordHash: string): AuthenticatedUser | undefined {
@@ -1418,6 +1427,19 @@ export class BatchDatabase {
         WHERE id = ? AND password_hash = ?
       `).run(legacyBootstrapPendingPasswordHash, legacyBootstrapUserId, disabledUserPasswordHash);
     });
+    this.applyMigration(8, () => {
+      const itemTable = this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'items'").get();
+      if (!itemTable) return;
+      const columns = this.itemColumnNames();
+      if (!columns.has('client_mutation_id')) {
+        this.db.exec('ALTER TABLE items ADD COLUMN client_mutation_id TEXT');
+      }
+      this.db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS items_batch_client_mutation_id
+        ON items(batch_id, client_mutation_id)
+        WHERE client_mutation_id IS NOT NULL;
+      `);
+    });
   }
 
   private assertSupportedSchemaVersion(): void {
@@ -1445,6 +1467,11 @@ export class BatchDatabase {
 
   private batchColumnNames(): Set<string> {
     const columns = this.db.prepare('PRAGMA table_info(batches)').all() as Array<{ name: string }>;
+    return new Set(columns.map((column) => column.name));
+  }
+
+  private itemColumnNames(): Set<string> {
+    const columns = this.db.prepare('PRAGMA table_info(items)').all() as Array<{ name: string }>;
     return new Set(columns.map((column) => column.name));
   }
 }

@@ -23,6 +23,10 @@ export class BatchStorage {
     return this.saveSvg(targetBatchId, targetItemId, content);
   }
 
+  async readSvg(batchId: string, sourceFile: string): Promise<Buffer> {
+    return readFile(this.resolveBatchPath(batchId, sourceFile));
+  }
+
   /**
    * Prepare every cloned SVG outside of the destination batch directory.  A
    * caller can therefore prove that all source uploads are readable before it

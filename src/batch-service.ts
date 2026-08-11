@@ -161,19 +161,26 @@ export class BatchService {
     });
   }
 
-  async addItem(batchId: string, input: CreateItemInput, svg: Buffer | undefined, ownerId?: string): Promise<StoredItem> {
+  async addItem(batchId: string, input: CreateItemInput, svg: Buffer | undefined, ownerId?: string, clientMutationId?: string): Promise<StoredItem> {
     this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
     return this.withBatchLock(batchId, async () => {
       this.assertOwner(batchId, ownerId);
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+      const normalized = await this.normalizeItemInput(batchId, input, svg);
+      if (clientMutationId) {
+        const existing = this.database.getItemByClientMutationId(batchId, clientMutationId);
+        if (existing) {
+          await this.assertMatchingMutation(existing, normalized, svg);
+          return existing;
+        }
+      }
       if (this.database.countItems(batchId) >= maximumBatchItems) {
         throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
       }
-      const normalized = await this.normalizeItemInput(batchId, input, svg);
       const itemId = createItemId();
       const sourceFile = svg ? await this.saveSvg(batchId, itemId, svg) : null;
-      return this.database.insertItem(batchId, itemId, normalized, sourceFile);
+      return this.database.insertItem(batchId, itemId, normalized, sourceFile, clientMutationId);
     });
   }
 
@@ -275,6 +282,21 @@ export class BatchService {
       }
       throw new AppError('BATCH_NOT_SUBMITTABLE', `Batch ${batchId} is ${batch.state}.`, 409);
     });
+  }
+
+  private async assertMatchingMutation(existing: StoredItem, input: CreateItemInput, svg: Buffer | undefined): Promise<void> {
+    const sameInput = existing.action === input.action
+      && existing.designName === input.designName
+      && existing.targetName === input.targetName
+      && existing.description === input.description
+      && existing.reason === input.reason
+      && existing.replacementName === input.replacementName;
+    const sameSvg = existing.sourceFile
+      ? svg !== undefined && (await this.storage.readSvg(existing.batchId, existing.sourceFile)).equals(svg)
+      : svg === undefined;
+    if (!sameInput || !sameSvg) {
+      throw new AppError('ITEM_MUTATION_CONFLICT', '同一写入标识不能用于不同的图标变更。', 409);
+    }
   }
 
   async returnToEdit(batchId: string, ownerId?: string): Promise<BatchDetails> {

@@ -18,6 +18,7 @@ interface DraftCatalogIcon {
 
 interface DraftChange {
   clientId: string;
+  clientMutationId: string;
   serverId?: string;
   action: ItemAction;
   designName?: string;
@@ -53,6 +54,11 @@ let nextClientId = 1;
 
 function uniqueId(prefix: string): string {
   return `${prefix}-${nextClientId++}`;
+}
+
+function createClientMutationId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return `mutation-${Date.now()}-${Math.random().toString(36).slice(2).padEnd(8, '0')}`;
 }
 
 function routeFromLocation(): AppRoute {
@@ -113,6 +119,7 @@ function draftIcon(primaryName: string | undefined): DraftCatalogIcon | undefine
 function draftChangeFromItem(item: ApiItem): DraftChange {
   return {
     clientId: uniqueId('change'),
+    clientMutationId: createClientMutationId(),
     serverId: item.id,
     action: item.action,
     ...(item.designName ? { designName: item.designName } : {}),
@@ -1295,7 +1302,7 @@ export function App() {
   const persistNewChange = async (currentBatch: BatchDetails, change: DraftChange): Promise<{ item: ApiItem; batch: BatchDetails }> => {
     const existingIds = new Set(currentBatch.items.map((item) => item.id));
     try {
-      const item = await api.addItem(currentBatch.id, toItemInput(change), change.svg?.file);
+      const item = await api.addItem(currentBatch.id, toItemInput(change), change.clientMutationId, change.svg?.file);
       uncertainItemWrite.current = undefined;
       return { item, batch: { ...currentBatch, items: [...currentBatch.items, item] } };
     } catch (error) {
@@ -1307,7 +1314,6 @@ export function App() {
           uncertainItemWrite.current = undefined;
           return reconciled;
         }
-        uncertainItemWrite.current = undefined;
       } catch {
         // Keep the uncertain write so a manual retry reconciles before issuing another POST.
       }
@@ -1348,6 +1354,7 @@ export function App() {
     }
     const change: DraftChange = {
       clientId: uniqueId('change'),
+      clientMutationId: createClientMutationId(),
       action,
       ...(action === 'add' ? { designName: addName.trim(), description: addDescription.trim() } : {}),
       ...(action === 'replace' ? { target, description: replaceDescription.trim() || undefined, svg: activeSvg } : {}),
@@ -1379,10 +1386,13 @@ export function App() {
       let persistedChange = change;
       if (pending) {
         try {
-          const reconciled = await reconcileItemWrite(pending);
-          if (!reconciled) {
-            uncertainItemWrite.current = undefined;
-            persisted = await persistNewChange(currentBatch, change);
+        const reconciled = await reconcileItemWrite(pending);
+        if (!reconciled) {
+            if (!draftChangesMatch(pending.change, change)) {
+              throw pending.originalError instanceof Error ? pending.originalError : new Error('上一次图标写入尚未确认。');
+            }
+            persisted = await persistNewChange(currentBatch, pending.change);
+            persistedChange = pending.change;
           } else {
             uncertainItemWrite.current = undefined;
             persisted = reconciled;

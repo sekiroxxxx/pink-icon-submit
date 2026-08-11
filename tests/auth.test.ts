@@ -181,6 +181,7 @@ test('owner scoping hides other accounts, enforces one active batch, and logout 
     headers: { cookie: aliceCookie },
     payload: {
       action: 'add',
+      clientMutationId: 'mutation-alice-icon-0001',
       designName: 'alice-icon',
       description: 'Alice-owned icon.',
       svgBase64: Buffer.from(environment.validSvg).toString('base64'),
@@ -248,6 +249,7 @@ test('all batch routes use the same owner boundary and never reveal another acco
     headers: { cookie: ownerCookie },
     payload: {
       action: 'add',
+      clientMutationId: 'mutation-private-route-owner-0001',
       designName: 'private-route-matrix-icon',
       description: 'Valid payload so only ownership controls the result.',
       svgBase64: Buffer.from(environment.validSvg).toString('base64'),
@@ -258,7 +260,7 @@ test('all batch routes use the same owner boundary and never reveal another acco
   const attempts: Array<{ name: string; method: 'GET' | 'POST' | 'PUT' | 'DELETE'; url: string; payload?: unknown }> = [
     { name: 'detail', method: 'GET', url: `/api/batches/${batchId}` },
     { name: 'update metadata', method: 'PUT', url: `/api/batches/${batchId}`, payload: { title: 'Other', description: 'Must never reach DRAFT editing.' } },
-    { name: 'add item', method: 'POST', url: `/api/batches/${batchId}/items`, payload: { action: 'delete', targetName: 'existing', reason: 'Must never reach item validation.' } },
+    { name: 'add item', method: 'POST', url: `/api/batches/${batchId}/items`, payload: { action: 'delete', targetName: 'existing', reason: 'Must never reach item validation.', clientMutationId: 'mutation-private-route-other-0001' } },
     { name: 'update item', method: 'PUT', url: `/api/batches/${batchId}/items/${itemId}`, payload: { action: 'add', designName: 'other-icon', description: 'Must never reach item validation.' } },
     { name: 'delete item', method: 'DELETE', url: `/api/batches/${batchId}/items/${itemId}` },
     { name: 'validate', method: 'POST', url: `/api/batches/${batchId}/validate` },

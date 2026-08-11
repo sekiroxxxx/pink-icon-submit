@@ -163,11 +163,43 @@ for (const version of [1, 2, 3, 4] as const) {
     const inspection = new Database(databasePath, { readonly: true });
     assert.deepEqual(
       inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
-      [1, 2, 3, 4, 5, 6, 7].map((migration) => ({ version: migration })),
+      [1, 2, 3, 4, 5, 6, 7, 8].map((migration) => ({ version: migration })),
+    );
+    assert.equal(
+      (inspection.prepare('SELECT client_mutation_id FROM items WHERE id = ?').get(`item-v${version}`) as { client_mutation_id: string | null }).client_mutation_id,
+      null,
+    );
+    assert.equal(
+      (inspection.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'items_batch_client_mutation_id'").get() as { name: string } | undefined)?.name,
+      'items_batch_client_mutation_id',
     );
     inspection.close();
   });
 }
+
+test('migration enforces client mutation uniqueness per batch while retaining legacy null values', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'pink-icon-submit-item-mutation-'));
+  const databasePath = join(root, 'legacy.sqlite');
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  createMinimalLegacyFixture(databasePath, 4);
+  const migrated = new BatchDatabase(databasePath);
+  migrated.close();
+  const inspection = new Database(databasePath);
+  const insert = inspection.prepare(`
+    INSERT INTO items (id, batch_id, action, design_name, source_file, client_mutation_id, created_at)
+    VALUES (?, 'ICON-V4', 'add', ?, NULL, 'mutation-unique-test-0001', ?)
+  `);
+  insert.run('item-mutation-first', 'first-mutation-item', '2026-01-01T00:04:00.000Z');
+  assert.throws(
+    () => insert.run('item-mutation-second', 'second-mutation-item', '2026-01-01T00:05:00.000Z'),
+    /UNIQUE constraint failed: items\.batch_id, items\.client_mutation_id/,
+  );
+  assert.equal(
+    (inspection.prepare('SELECT client_mutation_id FROM items WHERE id = ?').get('item-v4') as { client_mutation_id: string | null }).client_mutation_id,
+    null,
+  );
+  inspection.close();
+});
 
 test('refuses to open a database created by a newer schema version', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'pink-icon-submit-future-schema-'));
@@ -175,20 +207,20 @@ test('refuses to open a database created by a newer schema version', async (t) =
   t.after(async () => rm(root, { recursive: true, force: true }));
   const future = new Database(databasePath);
   future.pragma('journal_mode = DELETE');
-  future.exec('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO schema_migrations (version) VALUES (8);');
+  future.exec('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO schema_migrations (version) VALUES (9);');
   future.close();
   const originalDatabase = await readFile(databasePath);
   const originalFiles = await readdir(root);
 
-  assert.throws(
+    assert.throws(
     () => new BatchDatabase(databasePath),
-    /Database schema version 8 is newer than supported version 7/,
+    /Database schema version 9 is newer than supported version 8/,
   );
   assert.deepEqual(await readFile(databasePath), originalDatabase);
   assert.deepEqual(await readdir(root), originalFiles);
   const inspection = new Database(databasePath, { readonly: true });
   assert.equal(inspection.pragma('journal_mode', { simple: true }), 'delete');
-  assert.deepEqual(inspection.prepare('SELECT version FROM schema_migrations').all(), [{ version: 8 }]);
+  assert.deepEqual(inspection.prepare('SELECT version FROM schema_migrations').all(), [{ version: 9 }]);
   assert.equal(inspection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'batches'").get(), undefined);
   inspection.close();
 });
@@ -233,7 +265,7 @@ test('migrates the v6 legacy placeholder hash without changing disabled users or
   );
   assert.deepEqual(
     inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
-    [1, 2, 3, 4, 5, 6, 7].map((version) => ({ version })),
+    [1, 2, 3, 4, 5, 6, 7, 8].map((version) => ({ version })),
   );
   inspection.close();
 });
@@ -454,7 +486,7 @@ test('migrates a real v1-v4 fixture to ownership without losing batch, item, job
     'push_branch_prefix',
     'push_repository',
   ]);
-  assert.deepEqual(migrations, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }]);
+  assert.deepEqual(migrations, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
   assert.notEqual(jobFailuresTable, undefined);
   assert.notEqual(usersTable, undefined);
   assert.notEqual(sessionsTable, undefined);
