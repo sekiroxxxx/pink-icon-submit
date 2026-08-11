@@ -163,7 +163,7 @@ function draftApiHandler(catalog?: unknown) {
   });
 }
 
-function statefulDraftServer(options: { loseCreateResponse?: boolean; loseAddResponse?: boolean; failAddBeforeWrite?: boolean; failMetadataSave?: boolean } = {}) {
+function statefulDraftServer(options: { loseCreateResponse?: boolean; loseAddResponse?: boolean; failFirstReconciliationGet?: boolean; failAddBeforeWrite?: boolean; failMetadataSave?: boolean } = {}) {
   let current: BatchDetails | undefined;
   let itemSequence = 0;
   let createCount = 0;
@@ -173,6 +173,7 @@ function statefulDraftServer(options: { loseCreateResponse?: boolean; loseAddRes
   let createResponseLost = false;
   let addResponseLost = false;
   let addFailedBeforeWrite = false;
+  let reconciliationGetFailed = false;
   const handler = vi.fn(async (path: string, request?: RequestInit) => {
     const url = new URL(path, 'http://localhost');
     if (url.pathname === '/api/auth/logout' && request?.method === 'POST') return new Response(null, { status: 204 });
@@ -194,7 +195,13 @@ function statefulDraftServer(options: { loseCreateResponse?: boolean; loseAddRes
       current = { ...current, ...metadata };
       return jsonResponse(current);
     }
-    if (current && url.pathname === `/api/batches/${current.id}` && !request?.method) return jsonResponse(current);
+    if (current && url.pathname === `/api/batches/${current.id}` && !request?.method) {
+      if (options.failFirstReconciliationGet && addResponseLost && !reconciliationGetFailed) {
+        reconciliationGetFailed = true;
+        return jsonResponse({ error: { code: 'READ_FAILED', message: 'The first reconciliation read failed.' } }, 503);
+      }
+      return jsonResponse(current);
+    }
     if (current && url.pathname === `/api/batches/${current.id}/items` && request?.method === 'POST') {
       addCount += 1;
       if (options.failAddBeforeWrite && !addFailedBeforeWrite) {
@@ -1412,6 +1419,53 @@ test('lost create and add responses reconcile the unique server draft without du
   expect(server.current()?.items).toHaveLength(1);
   expect(server.counts()).toMatchObject({ create: 1, add: 1, submit: 0 });
   expect(screen.queryByText(/草稿保存失败/)).toBeNull();
+});
+
+test('an uncertain add write reconciles on manual retry before issuing another POST', async () => {
+  const server = statefulDraftServer({ loseAddResponse: true, failFirstReconciliationGet: true });
+  const user = userEvent.setup();
+  render(<App />);
+  await openNewWorkbench(user);
+  await addOneSvgChange(user);
+
+  expect(await screen.findByText('草稿保存失败：The add response was lost.')).toBeTruthy();
+  expect(server.current()?.items).toHaveLength(1);
+  expect(server.counts()).toMatchObject({ create: 1, add: 1, submit: 0 });
+
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+  expect(await screen.findByText('本次变更 1 项')).toBeTruthy();
+  expect(server.current()?.items).toHaveLength(1);
+  expect(server.counts()).toMatchObject({ create: 1, add: 1, submit: 0 });
+});
+
+test('leaving during the first create still exposes the new active draft on home', async () => {
+  const createResponse = deferred<Response>();
+  let active: BatchDetails | undefined;
+  const created = batch({ id: 'ICON-CREATE-ROUTE', title: '首次创建路由恢复', description: '创建期间返回首页。' });
+  stubFetch(vi.fn((path: string, request?: RequestInit) => {
+    if (path === '/api/batches' && request?.method === 'POST') return createResponse.promise;
+    throw new Error(`Unexpected request: ${path}`);
+  }), [], () => active);
+  const user = userEvent.setup();
+  render(<App />);
+  await openNewWorkbench(user);
+  await user.type(screen.getByLabelText(/^本次变更标题/), created.title);
+  await user.type(screen.getByLabelText(/^整体需求说明/), created.description);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('new-icon.svg'));
+  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
+  await user.type(screen.getByLabelText(/^用途说明/), '验证创建期间路由变化。');
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+
+  window.history.replaceState({}, '', '/');
+  window.dispatchEvent(new PopStateEvent('popstate'));
+  active = created;
+  await act(async () => { createResponse.resolve(jsonResponse(created)); });
+
+  expect(await screen.findByRole('heading', { name: created.title })).toBeTruthy();
+  expect(screen.getByText('草稿')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '新建图标变更' })).toBeNull();
+  expect(window.location.pathname).toBe('/');
 });
 
 test('a failed first item upload keeps one empty server draft and all editor input for retry', async () => {

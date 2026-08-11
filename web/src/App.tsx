@@ -143,6 +143,11 @@ function itemMatchesDraft(item: ApiItem, change: DraftChange): boolean {
     && Boolean(item.sourceFile) === Boolean(change.svg);
 }
 
+function draftChangesMatch(left: DraftChange, right: DraftChange): boolean {
+  return JSON.stringify(toItemInput(left)) === JSON.stringify(toItemInput(right))
+    && left.svg?.id === right.svg?.id;
+}
+
 function batchMetadataMatches(batch: BatchDetails, metadata: { title: string; description: string; designUrl?: string }): boolean {
   return batch.title === metadata.title
     && batch.description === metadata.description
@@ -813,6 +818,12 @@ export function App() {
   const lastReconciledWorkbenchPath = useRef<string | undefined>(undefined);
   const skipNextWorkbenchHydrationPath = useRef<string | undefined>(undefined);
   const draftMutationInFlight = useRef(false);
+  const uncertainItemWrite = useRef<{
+    batchId: string;
+    change: DraftChange;
+    existingIds: Set<string>;
+    originalError: unknown;
+  } | undefined>(undefined);
 
   const resetWorkbenchTransientState = useCallback(() => {
     liveSvgDrafts.current.forEach(revokePreview);
@@ -841,6 +852,7 @@ export function App() {
     setReviewErrors({});
     setConfirmed(false);
     setRepeatedSubmissionConfirmation(false);
+    uncertainItemWrite.current = undefined;
   }, []);
 
   const setBrowserActiveBatch = useCallback((batchId: string | undefined) => {
@@ -1270,18 +1282,34 @@ export function App() {
     return created;
   };
 
+  const reconcileItemWrite = async (
+    pending: NonNullable<typeof uncertainItemWrite.current>,
+  ): Promise<{ item: ApiItem; batch: BatchDetails } | undefined> => {
+    const restored = await api.getBatch(pending.batchId);
+    const candidates = restored.items.filter((item) => !pending.existingIds.has(item.id) && itemMatchesDraft(item, pending.change));
+    if (candidates.length === 1) return { item: candidates[0]!, batch: restored };
+    if (candidates.length > 1) throw new Error('服务端存在多项无法区分的相同变更，请交由开发处理。');
+    return undefined;
+  };
+
   const persistNewChange = async (currentBatch: BatchDetails, change: DraftChange): Promise<{ item: ApiItem; batch: BatchDetails }> => {
     const existingIds = new Set(currentBatch.items.map((item) => item.id));
     try {
       const item = await api.addItem(currentBatch.id, toItemInput(change), change.svg?.file);
+      uncertainItemWrite.current = undefined;
       return { item, batch: { ...currentBatch, items: [...currentBatch.items, item] } };
     } catch (error) {
+      const pending = { batchId: currentBatch.id, change, existingIds, originalError: error };
+      uncertainItemWrite.current = pending;
       try {
-        const restored = await api.getBatch(currentBatch.id);
-        const candidates = restored.items.filter((item) => !existingIds.has(item.id) && itemMatchesDraft(item, change));
-        if (candidates.length === 1) return { item: candidates[0]!, batch: restored };
+        const reconciled = await reconcileItemWrite(pending);
+        if (reconciled) {
+          uncertainItemWrite.current = undefined;
+          return reconciled;
+        }
+        uncertainItemWrite.current = undefined;
       } catch {
-        // Preserve the item failure when reconciliation cannot prove that the write succeeded.
+        // Keep the uncertain write so a manual retry reconciles before issuing another POST.
       }
       throw error;
     }
@@ -1332,22 +1360,58 @@ export function App() {
     let operationHydrationVersion = workbenchHydrationVersion.current;
     try {
       const currentBatch = await ensureDraftBatch(batchMetadata());
-      if (authGeneration.current !== operationAuthGeneration || workbenchHydrationVersion.current !== operationHydrationVersion) return;
+      if (authGeneration.current !== operationAuthGeneration) return;
+      if (workbenchHydrationVersion.current !== operationHydrationVersion) {
+        if (!batch) {
+          setBrowserActiveBatch(currentBatch.id);
+          setBatch(currentBatch);
+          void refreshBatchSummaries();
+        }
+        return;
+      }
       if (!batch) {
         setBrowserActiveBatch(currentBatch.id);
         operationHydrationVersion = workbenchHydrationVersion.current;
         setBatch(currentBatch);
       }
-      const persisted = await persistNewChange(currentBatch, change);
-      if (authGeneration.current !== operationAuthGeneration || workbenchHydrationVersion.current !== operationHydrationVersion) return;
-      const saved = savedDraftChange(change, persisted.item);
+      const pending = uncertainItemWrite.current;
+      let persisted: { item: ApiItem; batch: BatchDetails };
+      let persistedChange = change;
+      if (pending) {
+        try {
+          const reconciled = await reconcileItemWrite(pending);
+          if (!reconciled) {
+            uncertainItemWrite.current = undefined;
+            persisted = await persistNewChange(currentBatch, change);
+          } else {
+            uncertainItemWrite.current = undefined;
+            persisted = reconciled;
+            persistedChange = pending.change;
+          }
+        } catch (error) {
+          throw pending.originalError instanceof Error ? pending.originalError : error;
+        }
+      } else {
+        persisted = await persistNewChange(currentBatch, change);
+      }
+      if (authGeneration.current !== operationAuthGeneration) return;
+      if (workbenchHydrationVersion.current !== operationHydrationVersion) {
+        setBatch(persisted.batch);
+        void refreshBatchSummaries();
+        return;
+      }
+      const saved = savedDraftChange(persistedChange, persisted.item);
       setBatch(persisted.batch);
       setChanges((current) => [...current, saved]);
-      if (activeSvg) removePendingSvg(activeSvg.id, true);
-      setTarget(undefined);
-      setAddName(''); setAddDescription(''); setReplaceDescription(''); setDeleteReason(''); setReplacement(undefined);
+      if (draftChangesMatch(persistedChange, change)) {
+        if (activeSvg) removePendingSvg(activeSvg.id, true);
+        setTarget(undefined);
+        setAddName(''); setAddDescription(''); setReplaceDescription(''); setDeleteReason(''); setReplacement(undefined);
+      }
       setChangeErrors({});
-      setNotice('已保存到当前草稿。其余 SVG 会继续保留在待处理队列。');
+      setNotice(draftChangesMatch(persistedChange, change)
+        ? '已保存到当前草稿。其余 SVG 会继续保留在待处理队列。'
+        : '上一项变更已确认保存；当前编辑内容仍保留，可再次加入队列。');
       void refreshBatchSummaries();
     } catch (error) {
       if (authGeneration.current === operationAuthGeneration && workbenchHydrationVersion.current === operationHydrationVersion) {
