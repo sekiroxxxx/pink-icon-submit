@@ -358,6 +358,7 @@ export class BatchService {
     let created: CreatedClone | undefined;
     let published: PublishedClone | undefined;
     try {
+      const cloneCreationNonce = randomUUID();
       created = this.database.createClonedBatch(
         clonedId,
         {
@@ -375,9 +376,11 @@ export class BatchService {
         },
         cloneOwnerId,
         clonedItems.map(({ id, input, sourceFile }) => ({ id, input, sourceFile })),
+        cloneCreationNonce,
         ownerId !== undefined,
       );
       published = await this.storage.publishStagedClone(staged, clonedId);
+      this.database.completeClonePublication(created);
     } catch (error) {
       await this.discardFailedClone(created, staged, published, error);
       throw error;

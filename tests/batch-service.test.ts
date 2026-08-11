@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import Database from 'better-sqlite3';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -10,7 +11,7 @@ import { IconBatchCli } from '../src/icon-batch-cli.js';
 import { BatchStorage, type PublishedClone, type StagedClone } from '../src/storage.js';
 import { LocalDiffWorker } from '../src/worker.js';
 import type { IconBatchResult } from '../src/types.js';
-import { createTestEnvironment } from './helpers.js';
+import { createTestEnvironment, type TestEnvironment } from './helpers.js';
 
 class BlockingIconBatchCli extends IconBatchCli {
   private resolveStarted!: () => void;
@@ -49,16 +50,35 @@ class BlockingIconBatchCli extends IconBatchCli {
 
 class CollidingCloneStorage extends BatchStorage {
   collisionDirectory: string | undefined;
+  targetBatchId: string | undefined;
 
   constructor(private readonly rootPath: string) {
     super(rootPath);
   }
 
   override async publishStagedClone(staging: StagedClone, targetBatchId: string): Promise<PublishedClone> {
+    this.targetBatchId = targetBatchId;
     this.collisionDirectory = join(this.rootPath, targetBatchId);
     await mkdir(this.collisionDirectory, { recursive: true });
     await writeFile(join(this.collisionDirectory, 'pre-existing.txt'), 'do not remove\n');
     return super.publishStagedClone(staging, targetBatchId);
+  }
+}
+
+class FailingClonePublishStorage extends BatchStorage {
+  targetBatchId: string | undefined;
+
+  constructor(
+    rootPath: string,
+    private readonly beforeFailure: (targetBatchId: string) => void,
+  ) {
+    super(rootPath);
+  }
+
+  override async publishStagedClone(_staging: StagedClone, targetBatchId: string): Promise<PublishedClone> {
+    this.targetBatchId = targetBatchId;
+    this.beforeFailure(targetBatchId);
+    throw new Error('Simulated clone publish failure.');
   }
 }
 
@@ -93,6 +113,23 @@ async function createBatch(batches: BatchService): Promise<string> {
     designUrl: 'https://design.example.invalid/state-test',
     submitter: { name: 'Designer', email: 'designer@example.invalid' },
   })).id;
+}
+
+async function createTerminalCloneSource(environment: TestEnvironment, batches = environment.batches) {
+  const source = await batches.createBatch({
+    title: 'Clone mutation source',
+    description: 'A terminal source for clone compensation tests.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  await batches.addItem(source.id, {
+    action: 'add',
+    designName: 'clone-mutation-source-icon',
+    description: 'Source SVG for clone compensation tests.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(source.id);
+  environment.database.claimNextJob();
+  environment.database.failJob(source.id, 'CATALOG_INTEGRITY_MISMATCH', 'Terminal source fixture.');
+  return source;
 }
 
 test('validation makes the batch immutable until it completes and rejects queued revalidation', async (t) => {
@@ -269,6 +306,8 @@ test('cloning an immutable batch copies designer content without delivery or val
   assert.equal(cloned.localDiff, null);
   assert.equal(cloned.delivery.checkpoint, 'NONE');
   assert.equal(cloned.job, null);
+  assert.equal(Object.hasOwn(cloned, 'nonce'), false);
+  assert.equal(Object.hasOwn(cloned, 'cloneCreationNonce'), false);
   assert.equal(cloned.items.length, 1);
   assert.notEqual(cloned.items[0]?.id, item.id);
   assert.notEqual(cloned.items[0]?.sourceFile, item.sourceFile);
@@ -363,9 +402,12 @@ test('a target directory that appears before clone publish is never deleted afte
   });
 
   assert.ok(storage.collisionDirectory);
+  assert.ok(storage.targetBatchId);
   assert.equal(await readFile(join(storage.collisionDirectory, 'pre-existing.txt'), 'utf8'), 'do not remove\n');
   assert.equal(batches.getActiveBatch('legacy-bootstrap'), null);
   assert.deepEqual(batches.listBatches(20).map((batch) => batch.id), [source.id]);
+  assert.throws(() => environment.database.getBatch(storage.targetBatchId), { code: 'BATCH_NOT_FOUND' });
+  assert.equal(environment.database.getItems(storage.targetBatchId).length, 0);
   assert.equal((await readdir(environment.config.storageRoot)).some((entry) => entry.startsWith('.clone-')), false);
 });
 
@@ -390,7 +432,7 @@ test('a same-owner database ID collision never compensates away the existing bat
   const originalDiscard = database.discardCreatedClone.bind(database);
   let collisionId: string | undefined;
   let discardCalls = 0;
-  database.createClonedBatch = ((id, input, catalogBaseline, targetRepository, executionContext, ownerId, items, enforceSingleActiveOwner) => {
+  database.createClonedBatch = ((id, input, catalogBaseline, targetRepository, executionContext, ownerId, items, cloneCreationNonce, enforceSingleActiveOwner) => {
     collisionId = id;
     database.createBatch(id, {
       title: 'Existing same-owner draft',
@@ -404,7 +446,7 @@ test('a same-owner database ID collision never compensates away the existing bat
     }, 'uploads/item-existing-collision.svg');
     mkdirSync(join(environment.config.storageRoot, id, 'uploads'), { recursive: true });
     writeFileSync(join(environment.config.storageRoot, id, 'uploads/item-existing-collision.svg'), 'existing clone collision file\n');
-    return originalCreate(id, input, catalogBaseline, targetRepository, executionContext, ownerId, items, enforceSingleActiveOwner);
+    return originalCreate(id, input, catalogBaseline, targetRepository, executionContext, ownerId, items, cloneCreationNonce, enforceSingleActiveOwner);
   }) as typeof database.createClonedBatch;
   database.discardCreatedClone = ((created) => {
     discardCalls += 1;
@@ -425,7 +467,7 @@ test('a same-owner database ID collision never compensates away the existing bat
   assert.equal(await readFile(join(environment.config.storageRoot, collisionId, 'uploads/item-existing-collision.svg'), 'utf8'), 'existing clone collision file\n');
 });
 
-test('a stale clone ownership handle cannot delete a later same-owner row with the reused batch ID', async (t) => {
+test('a clone ownership nonce survives SQLite rowid reuse and cannot delete a later same-owner row', async (t) => {
   const environment = await createTestEnvironment(t);
   const input = {
     title: 'Clone handle fixture',
@@ -440,21 +482,130 @@ test('a stale clone ownership handle cannot delete a later same-owner row with t
   const executionContext = { executionMode: 'local' as const, pushRepository: null, pushBranchPrefix: null };
   const batchId = 'ICON-20260811-C0FFEE00';
   const created = environment.database.createClonedBatch(
-    batchId, input, catalogBaseline, targetRepository, executionContext, 'legacy-bootstrap', [], false,
+    batchId, input, catalogBaseline, targetRepository, executionContext, 'legacy-bootstrap', [], 'clone-nonce-old', false,
   );
+  const before = new Database(environment.config.databasePath, { readonly: true });
+  const oldRow = before.prepare('SELECT rowid FROM batches WHERE id = ?').get(batchId) as { rowid: number };
+  before.close();
   environment.database.discardCreatedClone(created);
 
-  // Ensure the next same-ID row receives a different SQLite row identity even
-  // on SQLite builds that otherwise reuse the highest deleted rowid.
-  environment.database.createBatch('ICON-20260811-F11E0000', input, catalogBaseline, targetRepository, executionContext);
   environment.database.createBatch(batchId, {
     ...input,
     title: 'Later same-owner row',
   }, catalogBaseline, targetRepository, executionContext);
+  const after = new Database(environment.config.databasePath, { readonly: true });
+  const laterRow = after.prepare('SELECT rowid, clone_creation_nonce FROM batches WHERE id = ?').get(batchId) as { rowid: number; clone_creation_nonce: string | null };
+  after.close();
 
+  assert.equal(laterRow.rowid, oldRow.rowid, 'the SQLite rowid was reused');
+  assert.equal(laterRow.clone_creation_nonce, null);
   assert.throws(() => environment.database.discardCreatedClone(created), { code: 'CLONE_CLEANUP_CONFLICT' });
   assert.equal(environment.database.getBatch(batchId).title, 'Later same-owner row');
 });
+
+test('a completed clone publication retires its compensation handle', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const input = {
+    title: 'Clone completion fixture',
+    description: 'A completed clone cannot be discarded by its old handle.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  };
+  const catalogBaseline = {
+    packageName: '@pink/codicons', requestedTag: 'beta', version: '0.0.46-test.1', integrity: 'sha512-test',
+    sourceRepository: 'sud-global/pink-codicons', sourceCommit: 'a'.repeat(40),
+  };
+  const targetRepository = { repository: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test', branch: 'main' as const };
+  const executionContext = { executionMode: 'local' as const, pushRepository: null, pushBranchPrefix: null };
+  const created = environment.database.createClonedBatch(
+    'ICON-20260811-C0FFEE01', input, catalogBaseline, targetRepository, executionContext, 'legacy-bootstrap', [], 'clone-nonce-complete', false,
+  );
+
+  environment.database.completeClonePublication(created);
+
+  assert.throws(() => environment.database.discardCreatedClone(created), { code: 'CLONE_CLEANUP_CONFLICT' });
+  assert.equal(environment.database.getBatch(created.id).state, 'DRAFT');
+});
+
+for (const scenario of [
+  {
+    name: 'metadata edit',
+    mutate: (environment: TestEnvironment, _batches: BatchService, batchId: string) => {
+      environment.database.updateBatchMetadata(batchId, {
+        title: 'Edited while clone publish is failing',
+        description: 'The compensation handle must no longer own this batch.',
+      });
+    },
+    expectedState: 'DRAFT',
+  },
+  {
+    name: 'item edit',
+    mutate: (environment: TestEnvironment, _batches: BatchService, batchId: string) => {
+      const item = environment.database.getDetails(batchId).items[0]!;
+      environment.database.updateItem(batchId, item.id, {
+        action: 'add',
+        designName: 'edited-clone-item',
+        description: 'An item edit invalidates clone compensation ownership.',
+      }, item.sourceFile);
+    },
+    expectedState: 'DRAFT',
+  },
+  {
+    name: 'item add',
+    mutate: (environment: TestEnvironment, _batches: BatchService, batchId: string) => {
+      environment.database.insertItem(batchId, 'item-added-during-clone-failure', {
+        action: 'add',
+        designName: 'added-clone-item',
+        description: 'An added item invalidates clone compensation ownership.',
+      }, null);
+    },
+    expectedState: 'DRAFT',
+  },
+  {
+    name: 'item delete',
+    mutate: (environment: TestEnvironment, _batches: BatchService, batchId: string) => {
+      const item = environment.database.getDetails(batchId).items[0]!;
+      environment.database.deleteItem(batchId, item.id);
+    },
+    expectedState: 'DRAFT',
+  },
+  {
+    name: 'submit',
+    mutate: (_environment: TestEnvironment, batches: BatchService, batchId: string) => {
+      batches.submit(batchId);
+    },
+    expectedState: 'QUEUED',
+  },
+] as const) {
+  test(`a clone publish failure never compensates away a batch changed by ${scenario.name}`, async (t) => {
+    const environment = await createTestEnvironment(t);
+    let batches!: BatchService;
+    const storage = new FailingClonePublishStorage(environment.config.storageRoot, (batchId) => {
+      scenario.mutate(environment, batches, batchId);
+    });
+    batches = new BatchService(
+      environment.database,
+      storage,
+      environment.batches.repository,
+      new IconBatchCli(),
+      environment.config.maxUploadBytes,
+      catalogOptionsFromConfig(environment.config),
+      environment.config.targetRepository,
+    );
+    const source = await createTerminalCloneSource(environment, batches);
+
+    await assert.rejects(() => batches.cloneBatch(source.id));
+
+    assert.ok(storage.targetBatchId);
+    const retained = environment.database.getDetails(storage.targetBatchId);
+    assert.equal(retained.state, scenario.expectedState);
+    if (scenario.name === 'submit') {
+      assert.equal(retained.job?.state, 'QUEUED');
+    } else {
+      assert.equal(retained.job, null);
+    }
+    assert.equal((await readdir(environment.config.storageRoot)).some((entry) => entry.startsWith('.clone-')), false);
+  });
+}
 
 test('DRAFT content edits advance a monotonic revision after a same-millisecond final validation failure', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-08-10T08:00:00.000Z') });

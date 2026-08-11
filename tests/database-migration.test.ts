@@ -186,6 +186,7 @@ test('migrates a real v1-v4 fixture to ownership without losing batch, item, job
   const usersTable = inspection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
   const sessionsTable = inspection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").get();
   const legacyOwner = inspection.prepare('SELECT owner_id FROM batches WHERE id = ?').get('ICON-20260801-ABCDEF12') as { owner_id: string };
+  const legacyCloneNonce = inspection.prepare('SELECT clone_creation_nonce FROM batches WHERE id = ?').get('ICON-20260801-ABCDEF12') as { clone_creation_nonce: string | null };
   const legacyUserCount = inspection.prepare('SELECT COUNT(*) AS count FROM users WHERE id = ?').get('legacy-bootstrap') as { count: number };
   inspection.close();
   assert.deepEqual(columns.map((column) => column.name).filter((name) => name.endsWith('_json')).sort(), [
@@ -222,12 +223,14 @@ test('migrates a real v1-v4 fixture to ownership without losing batch, item, job
     'push_branch_prefix',
     'push_repository',
   ]);
-  assert.deepEqual(migrations, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
+  assert.deepEqual(migrations, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
   assert.notEqual(jobFailuresTable, undefined);
   assert.notEqual(usersTable, undefined);
   assert.notEqual(sessionsTable, undefined);
   assert.equal(columns.some((column) => column.name === 'owner_id'), true);
+  assert.equal(columns.some((column) => column.name === 'clone_creation_nonce'), true);
   assert.equal(legacyOwner.owner_id, 'legacy-bootstrap');
+  assert.equal(legacyCloneNonce.clone_creation_nonce, null);
   assert.equal(legacyUserCount.count, 1);
 });
 

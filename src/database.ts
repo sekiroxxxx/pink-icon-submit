@@ -49,7 +49,8 @@ interface ClonedBatchItem {
 export interface CreatedClone {
   readonly id: string;
   readonly ownerId: string;
-  readonly rowId: number;
+  readonly nonce: string;
+  readonly revision: string;
   readonly [createdCloneMarker]: true;
 }
 
@@ -82,6 +83,7 @@ interface BatchRow {
   local_diff_json: string | null;
   error_code: string | null;
   error_message: string | null;
+  clone_creation_nonce: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -496,6 +498,7 @@ export class BatchDatabase {
     executionContext: BatchExecutionContext,
     ownerId: string,
     items: ReadonlyArray<ClonedBatchItem>,
+    cloneCreationNonce: string,
     enforceSingleActiveOwner = false,
   ): CreatedClone {
     const create = this.db.transaction(() => {
@@ -505,8 +508,8 @@ export class BatchDatabase {
         INSERT INTO batches (
           id, owner_id, title, description, design_url, submitter_name, submitter_email,
           catalog_baseline_json, target_repository_json, execution_mode, push_repository, push_branch_prefix,
-          state, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?)
+          state, clone_creation_nonce, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?)
       `).run(
         id,
         ownerId,
@@ -520,6 +523,7 @@ export class BatchDatabase {
         executionContext.executionMode,
         executionContext.pushRepository,
         executionContext.pushBranchPrefix,
+        cloneCreationNonce,
         timestamp,
         timestamp,
       );
@@ -542,13 +546,34 @@ export class BatchDatabase {
           timestamp,
         );
       }
-      const row = this.db.prepare('SELECT rowid AS row_id FROM batches WHERE id = ? AND owner_id = ?').get(id, ownerId) as { row_id: number } | undefined;
-      if (!row) {
+      const row = this.db.prepare(`
+        SELECT clone_creation_nonce, updated_at FROM batches
+        WHERE id = ? AND owner_id = ? AND clone_creation_nonce = ?
+      `).get(id, ownerId, cloneCreationNonce) as Pick<BatchRow, 'clone_creation_nonce' | 'updated_at'> | undefined;
+      if (!row || row.clone_creation_nonce !== cloneCreationNonce) {
         throw new AppError('CLONE_CREATION_CONFLICT', `Batch ${id} was not created for this clone.`, 409);
       }
-      return { id, ownerId, rowId: row.row_id, [createdCloneMarker]: true as const };
+      return { id, ownerId, nonce: cloneCreationNonce, revision: row.updated_at, [createdCloneMarker]: true as const };
     });
     return create();
+  }
+
+  /**
+   * A successful storage publication retires the one-time compensation handle
+   * without changing the batch's content revision.
+   */
+  completeClonePublication(created: CreatedClone): void {
+    if (created[createdCloneMarker] !== true) {
+      throw new AppError('CLONE_CLEANUP_CONFLICT', 'Clone publication requires a creation ownership handle.', 409);
+    }
+    const result = this.db.prepare(`
+      UPDATE batches
+      SET clone_creation_nonce = NULL
+      WHERE id = ? AND owner_id = ? AND clone_creation_nonce = ?
+    `).run(created.id, created.ownerId, created.nonce);
+    if (result.changes !== 1) {
+      throw new AppError('CLONE_CLEANUP_CONFLICT', `Batch ${created.id} could not complete clone publication.`, 409);
+    }
   }
 
   discardCreatedClone(created: CreatedClone): void {
@@ -558,7 +583,7 @@ export class BatchDatabase {
     const discard = this.db.transaction(() => {
       const result = this.db.prepare(`
         DELETE FROM batches
-        WHERE id = ? AND owner_id = ? AND rowid = ?
+        WHERE id = ? AND owner_id = ? AND clone_creation_nonce = ? AND updated_at = ?
           AND state = 'DRAFT'
           AND validation_json IS NULL AND warning_ack_request_sha256 IS NULL
           AND plan_json IS NULL AND base_commit IS NULL AND local_diff_json IS NULL
@@ -567,7 +592,8 @@ export class BatchDatabase {
           AND delivery_branch IS NULL AND delivery_commit_sha IS NULL
           AND pr_number IS NULL AND pr_url IS NULL AND pr_state IS NULL
           AND pr_is_draft IS NULL AND pr_created_at IS NULL AND handoff_at IS NULL
-      `).run(created.id, created.ownerId, created.rowId);
+          AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = batches.id)
+      `).run(created.id, created.ownerId, created.nonce, created.revision);
       if (result.changes !== 1) {
         throw new AppError('CLONE_CLEANUP_CONFLICT', `Batch ${created.id} could not be discarded.`, 409);
       }
@@ -1314,6 +1340,12 @@ export class BatchDatabase {
       }
       this.db.prepare('UPDATE batches SET owner_id = ? WHERE owner_id IS NULL OR owner_id = ?').run(legacyBootstrapUserId, '');
       this.db.exec('CREATE INDEX IF NOT EXISTS batches_owner_created_at ON batches(owner_id, created_at DESC, id DESC)');
+    });
+    this.applyMigration(6, () => {
+      const columns = this.batchColumnNames();
+      if (!columns.has('clone_creation_nonce')) {
+        this.db.exec('ALTER TABLE batches ADD COLUMN clone_creation_nonce TEXT');
+      }
     });
   }
 
