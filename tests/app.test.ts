@@ -303,7 +303,7 @@ test('delete replacement must select a different existing catalog icon', async (
   assert.equal((response.json() as { error: { code: string } }).error.code, 'ITEM_INVALID');
 });
 
-test('catalog page returns canonical icons with SVG thumbnails and normalizes aliases', async (t) => {
+test('catalog page returns canonical icons with SVG thumbnails and editing normalizes aliases without target Git access', async (t) => {
   const environment = await createTestEnvironment(t);
   const { app } = await buildAuthenticatedApp(environment);
   t.after(() => app.close());
@@ -346,6 +346,9 @@ test('catalog page returns canonical icons with SVG thumbnails and normalizes al
     },
   });
   const batchId = (created.json() as { id: string }).id;
+  environment.batches.repository.resolveBaseCommit = async () => {
+    throw new Error('target Git must not be accessed while editing a draft');
+  };
   const item = await app.inject({
     method: 'POST',
     url: `/api/batches/${batchId}/items`,
@@ -358,38 +361,19 @@ test('catalog page returns canonical icons with SVG thumbnails and normalizes al
   });
   assert.equal(item.statusCode, 201);
   assert.equal((item.json() as { targetName: string }).targetName, 'existing');
-});
 
-test('name preview delegates normalization and catalog collision checks to icon-batch', async (t) => {
-  const environment = await createTestEnvironment(t);
-  const { app } = await buildAuthenticatedApp(environment);
-  t.after(() => app.close());
-
-  const preview = await app.inject({ method: 'GET', url: '/api/names/preview?name=ExistingAlias' });
-  assert.equal(preview.statusCode, 200);
-  assert.deepEqual(preview.json(), {
-    schemaVersion: 1,
-    baseCommit: preview.json().baseCommit,
-    input: 'ExistingAlias',
-    normalizedName: 'existing-alias',
-    valid: true,
-    collision: { primaryName: 'existing', aliases: ['existing-alias'] },
+  const deleted = await app.inject({
+    method: 'POST',
+    url: `/api/batches/${batchId}/items`,
+    payload: {
+      action: 'delete',
+      clientMutationId: 'mutation-delete-icon-0001',
+      targetName: 'existing-alias',
+      reason: 'The alias test covers deletion normalization too.',
+    },
   });
-
-  const missing = await app.inject({ method: 'GET', url: '/api/names/preview' });
-  assert.equal(missing.statusCode, 400);
-  assert.equal((missing.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
-
-  const invalid = await app.inject({ method: 'GET', url: '/api/names/preview?name=---' });
-  assert.equal(invalid.statusCode, 200);
-  assert.deepEqual(invalid.json(), {
-    schemaVersion: 1,
-    baseCommit: invalid.json().baseCommit,
-    input: '---',
-    normalizedName: '',
-    valid: false,
-    collision: null,
-  });
+  assert.equal(deleted.statusCode, 201);
+  assert.equal((deleted.json() as { targetName: string }).targetName, 'existing');
 });
 
 test('validation warnings are retained for developer review without blocking submission', async (t) => {

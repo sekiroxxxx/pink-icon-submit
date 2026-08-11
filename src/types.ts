@@ -266,15 +266,3 @@ export interface CatalogPage {
   total: number;
   icons: CatalogPageIcon[];
 }
-
-export interface IconNamePreview {
-  schemaVersion: 1;
-  baseCommit: string;
-  input: string;
-  normalizedName: string;
-  valid: boolean;
-  collision: {
-    primaryName: string;
-    aliases: string[];
-  } | null;
-}

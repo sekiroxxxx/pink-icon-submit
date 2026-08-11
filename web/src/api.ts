@@ -97,18 +97,6 @@ export type UserBatchStatus =
   | 'submitted_review'
   | 'local_complete';
 
-export interface NamePreview {
-  schemaVersion: 1;
-  baseCommit: string;
-  input: string;
-  normalizedName: string;
-  valid: boolean;
-  collision: {
-    primaryName: string;
-    aliases: string[];
-  } | null;
-}
-
 export interface CatalogPageIcon {
   primaryName: string;
   aliases: string[];
@@ -192,7 +180,6 @@ export const api = {
     if (query.pageSize) parameters.set('pageSize', String(query.pageSize));
     return request<CatalogPage>(`/api/catalog/page?${parameters.toString()}`);
   },
-  previewName: (name: string) => request<NamePreview>(`/api/names/preview?${new URLSearchParams({ name }).toString()}`),
   createBatch: (input: CreateBatchInput) => request<BatchDetails>('/api/batches', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

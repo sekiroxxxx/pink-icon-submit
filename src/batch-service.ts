@@ -7,7 +7,7 @@ import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage, type PublishedClone } from './storage.js';
 import { canRetryBatch, hasPostPushPullRequestRecoveryEvidence, isActiveBatch, isFinalValidationFailure, isPostPushCheckpoint, isRetryablePostPushInfrastructureFailure, lifecycleSnapshot } from './batch-lifecycle.js';
-import type { BatchDetails, BatchExecutionContext, BatchSummary, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
+import type { BatchDetails, BatchExecutionContext, BatchSummary, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
 
 const maximumBatchItems = 100;
 
@@ -109,7 +109,7 @@ export class BatchService {
       pushBranchPrefix: null,
     },
   ) {
-    this.catalog = new CatalogSnapshotCache(repository, iconBatch, catalogOptions);
+    this.catalog = new CatalogSnapshotCache(catalogOptions);
   }
 
   get uploadLimit(): number {
@@ -247,10 +247,6 @@ export class BatchService {
 
   getCatalogPage(input: CatalogPageInput): Promise<CatalogPage> {
     return this.catalog.page(input);
-  }
-
-  previewName(input: string): Promise<IconNamePreview> {
-    return this.catalog.previewName(requiredIconName(input, 'name'));
   }
 
   async getCatalogIconSvg(name: string): Promise<Buffer> {

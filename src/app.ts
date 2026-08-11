@@ -88,14 +88,6 @@ function optionalQueryText(value: unknown, field: string, maximumLength: number)
   return normalized || undefined;
 }
 
-function requiredQueryText(value: unknown, field: string, maximumLength: number): string {
-  const normalized = optionalQueryText(value, field, maximumLength);
-  if (!normalized) {
-    throw new AppError('REQUEST_INVALID', `${field} is required.`);
-  }
-  return normalized;
-}
-
 function positiveQueryInteger(value: unknown, field: string, fallback: number, maximum: number): number {
   if (value === undefined) {
     return fallback;
@@ -309,11 +301,6 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.get('/api/catalog', async () => dependencies.batches.getCatalog());
 
   app.get('/api/catalog/page', async (request) => dependencies.batches.getCatalogPage(catalogPageInput(request.query)));
-
-  app.get('/api/names/preview', async (request) => {
-    const parameters = isObject(request.query) ? request.query : {};
-    return dependencies.batches.previewName(requiredQueryText(parameters.name, 'name', 100));
-  });
 
   app.get('/api/catalog/icons/:name/svg', async (request, reply) => {
     const { name } = request.params as { name: string };
