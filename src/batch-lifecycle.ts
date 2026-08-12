@@ -63,6 +63,7 @@ const designerCorrectableValidationErrorCodes = new Set([
   'ADD_NAME_COLLISION',
   'TARGET_NOT_FOUND',
   'DELETE_TARGET_IS_ALIAS',
+  'REPLACE_CONTENT_UNCHANGED',
 ]);
 
 export function hasDesignerCorrectableValidation(batch: Pick<BatchLifecycleSnapshot, 'validation' | 'delivery'>): boolean {
