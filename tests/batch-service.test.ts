@@ -315,6 +315,36 @@ test('a system final validation diagnostic requires developer handling instead o
   await assert.rejects(() => environment.batches.retry(batch.id), { code: 'BATCH_NOT_RETRYABLE' });
 });
 
+test('an unchanged replace final validation returns the batch to a designer-editable state', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const batch = await environment.batches.createBatch({
+    title: 'Unchanged replace final validation',
+    description: 'A designer can upload a different SVG after this validation result.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  });
+  await environment.batches.addItem(batch.id, {
+    action: 'replace',
+    targetName: 'existing',
+    description: 'Will be corrected with a different SVG.',
+  }, Buffer.from(environment.validSvg));
+  environment.database.queueJob(batch.id);
+  environment.database.claimNextJob();
+  environment.database.recordFinalValidation(batch.id, {
+    valid: false,
+    requestSha256: 'a'.repeat(64),
+    errors: [{ code: 'REPLACE_CONTENT_UNCHANGED', message: 'Replace source is identical to the current target SVG.' }],
+    warnings: [],
+  }, 'b'.repeat(40));
+  environment.database.failJob(batch.id, 'FINAL_VALIDATION_FAILED', 'Replace source is identical to the current target SVG.');
+
+  const failed = environment.batches.getBatch(batch.id);
+  assert.equal(failed.userStatus, 'needs_changes');
+  const draft = await environment.batches.returnToEdit(batch.id);
+  assert.equal(draft.state, 'DRAFT');
+  assert.equal(draft.userStatus, 'needs_changes');
+  assert.equal(draft.items.length, 1);
+});
+
 test('cloning an immutable batch copies designer content without delivery or validation evidence', async (t) => {
   const environment = await createTestEnvironment(t);
   const source = await environment.batches.createBatch({
