@@ -1,5 +1,10 @@
 import multipart from '@fastify/multipart';
-import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
+import { randomUUID } from 'node:crypto';
+import { access } from 'node:fs/promises';
+import { join } from 'node:path';
+
+import fastifyStatic from '@fastify/static';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 
 import { AuthService, sessionCookieName, sessionMaxAgeSeconds } from './auth.js';
 import { BatchService } from './batch-service.js';
@@ -16,7 +21,18 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-async function readItemPayload(request: FastifyRequest): Promise<{ item: CreateItemInput; svg?: Buffer }> {
+function splitItemMutation(item: CreateItemInput, required: boolean): { item: CreateItemInput; clientMutationId?: string } {
+  if (!isObject(item)) return { item };
+  const candidate = item as CreateItemInput & { clientMutationId?: unknown };
+  const { clientMutationId, ...input } = candidate;
+  if (clientMutationId === undefined && !required) return { item: input };
+  if (typeof clientMutationId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$/.test(clientMutationId)) {
+    throw new AppError('REQUEST_INVALID', 'clientMutationId must be a stable 16-128 character identifier.');
+  }
+  return { item: input, clientMutationId };
+}
+
+async function readItemPayload(request: FastifyRequest, requireClientMutationId = false): Promise<{ item: CreateItemInput; svg?: Buffer; clientMutationId?: string }> {
   if (request.isMultipart()) {
     let item: CreateItemInput | undefined;
     let svg: Buffer | undefined;
@@ -40,7 +56,7 @@ async function readItemPayload(request: FastifyRequest): Promise<{ item: CreateI
     if (!item) {
       throw new AppError('REQUEST_INVALID', 'multipart request requires an item field.');
     }
-    return { item, svg };
+    return { ...splitItemMutation(item, requireClientMutationId), svg };
   }
 
   const body = request.body;
@@ -52,7 +68,10 @@ async function readItemPayload(request: FastifyRequest): Promise<{ item: CreateI
   if (svgBase64 !== undefined && typeof svgBase64 !== 'string') {
     throw new AppError('REQUEST_INVALID', 'svgBase64 must be a base64 string.');
   }
-  return { item, ...(typeof svgBase64 === 'string' ? { svg: Buffer.from(svgBase64, 'base64') } : {}) };
+  return {
+    ...splitItemMutation(item, requireClientMutationId),
+    ...(typeof svgBase64 === 'string' ? { svg: Buffer.from(svgBase64, 'base64') } : {}),
+  };
 }
 
 function optionalQueryText(value: unknown, field: string, maximumLength: number): string | undefined {
@@ -67,14 +86,6 @@ function optionalQueryText(value: unknown, field: string, maximumLength: number)
     throw new AppError('REQUEST_INVALID', `${field} must be at most ${maximumLength} characters.`);
   }
   return normalized || undefined;
-}
-
-function requiredQueryText(value: unknown, field: string, maximumLength: number): string {
-  const normalized = optionalQueryText(value, field, maximumLength);
-  if (!normalized) {
-    throw new AppError('REQUEST_INVALID', `${field} is required.`);
-  }
-  return normalized;
 }
 
 function positiveQueryInteger(value: unknown, field: string, fallback: number, maximum: number): number {
@@ -155,7 +166,7 @@ function isMutation(request: FastifyRequest): boolean {
   return ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method);
 }
 
-function assertSameOriginWhenPresent(request: FastifyRequest): void {
+function assertSameOriginWhenPresent(request: FastifyRequest, publicOrigin?: string): void {
   const header = request.headers.origin;
   if (header === undefined) return;
   const origin = Array.isArray(header) ? header[0] : header;
@@ -164,8 +175,8 @@ function assertSameOriginWhenPresent(request: FastifyRequest): void {
     throw new AppError('CSRF_ORIGIN_INVALID', '请求来源无效，请从当前服务页面重新提交。', 403);
   }
   try {
-    const expected = new URL(`${request.protocol}://${host}`).origin;
-    if (new URL(origin).origin !== expected) {
+    const expected = publicOrigin ?? new URL(`${request.protocol}://${host}`).origin;
+    if (new URL(origin).origin !== expected || new URL(origin).origin !== origin) {
       throw new AppError('CSRF_ORIGIN_INVALID', '请求来源无效，请从当前服务页面重新提交。', 403);
     }
   } catch (error) {
@@ -190,13 +201,41 @@ export interface AppDependencies {
   batches: BatchService;
   auth: AuthService;
   sessionCookieSecure?: boolean;
+  publicOrigin?: string;
+  readiness?: () => void | Promise<void>;
+  logger?: boolean;
+  webRoot?: string;
+  requireWebRoot?: boolean;
 }
 
 export async function buildApp(dependencies: AppDependencies): Promise<FastifyInstance> {
-  const app = Fastify({ logger: false });
+  const app = Fastify({ logger: dependencies.logger ?? false });
   await app.register(multipart, { limits: { files: 1, fileSize: dependencies.batches.uploadLimit } });
 
-  app.setErrorHandler((error, _request, reply) => {
+  if (dependencies.webRoot) {
+    let webBuildAvailable = false;
+    try {
+      await access(join(dependencies.webRoot, 'index.html'));
+      webBuildAvailable = true;
+    } catch (error) {
+      if (dependencies.requireWebRoot) {
+        throw new Error(`Production web build is missing at ${dependencies.webRoot}. Run npm run build before npm start.`, { cause: error });
+      }
+    }
+    if (webBuildAvailable) {
+      await app.register(fastifyStatic, {
+        root: dependencies.webRoot,
+        index: false,
+      });
+      const sendSpa = async (_request: FastifyRequest, reply: FastifyReply) => reply.sendFile('index.html');
+      app.get('/', sendSpa);
+      app.get('/workbench', sendSpa);
+    }
+  } else if (dependencies.requireWebRoot) {
+    throw new Error('Production web build path is required.');
+  }
+
+  app.setErrorHandler((error, request, reply) => {
     if (isAppError(error)) {
       return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message, details: error.details } });
     }
@@ -208,21 +247,24 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         },
       });
     }
+    const errorId = randomUUID();
+    request.log.error({ err: error, errorId }, 'Unhandled request error');
     return reply.status(500).send({
       error: {
         code: 'INTERNAL_ERROR',
-        message: error instanceof Error ? error.message : 'Unexpected server error.',
+        message: '服务暂时无法完成请求，请稍后重试。',
+        errorId,
       },
     });
   });
 
   app.addHook('preHandler', async (request) => {
     const path = requestPath(request);
-    const isPublic = (request.method === 'GET' && path === '/api/health')
+    const isPublic = (request.method === 'GET' && (path === '/api/health' || path === '/api/ready'))
       || (request.method === 'POST' && path === '/api/auth/login');
     if (!path.startsWith('/api/')) return;
     if (isMutation(request)) {
-      assertSameOriginWhenPresent(request);
+      assertSameOriginWhenPresent(request, dependencies.publicOrigin);
     }
     if (isPublic) return;
     const user = dependencies.auth.authenticate(cookieValue(request, sessionCookieName));
@@ -233,6 +275,16 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   });
 
   app.get('/api/health', async () => ({ status: 'ok' }));
+
+  app.get('/api/ready', async (_request, reply) => {
+    try {
+      await dependencies.readiness?.();
+      return { status: 'ready' };
+    } catch (error) {
+      app.log.warn({ err: error }, 'Readiness check failed');
+      return reply.status(503).send({ status: 'not_ready' });
+    }
+  });
 
   app.post('/api/auth/login', async (request, reply) => {
     const session = await dependencies.auth.login(request.body);
@@ -249,11 +301,6 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.get('/api/catalog', async () => dependencies.batches.getCatalog());
 
   app.get('/api/catalog/page', async (request) => dependencies.batches.getCatalogPage(catalogPageInput(request.query)));
-
-  app.get('/api/names/preview', async (request) => {
-    const parameters = isObject(request.query) ? request.query : {};
-    return dependencies.batches.previewName(requiredQueryText(parameters.name, 'name', 100));
-  });
 
   app.get('/api/catalog/icons/:name/svg', async (request, reply) => {
     const { name } = request.params as { name: string };
@@ -284,8 +331,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post('/api/batches/:batchId/items', async (request, reply) => {
     const { batchId } = request.params as { batchId: string };
-    const { item, svg } = await readItemPayload(request);
-    const created = await dependencies.batches.addItem(batchId, item, svg, authenticatedUser(request).id);
+    const { item, svg, clientMutationId } = await readItemPayload(request, true);
+    const created = await dependencies.batches.addItem(batchId, item, svg, authenticatedUser(request).id, clientMutationId);
     return reply.status(201).send(created);
   });
 
@@ -308,12 +355,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post('/api/batches/:batchId/submit', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.submit(batchId, submitConfirmation(request.body), authenticatedUser(request).id);
+    return await dependencies.batches.submit(batchId, submitConfirmation(request.body), authenticatedUser(request).id);
   });
 
   app.post('/api/batches/:batchId/return-to-edit', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.returnToEdit(batchId, authenticatedUser(request).id);
+    return await dependencies.batches.returnToEdit(batchId, authenticatedUser(request).id);
   });
 
   app.post('/api/batches/:batchId/clone', async (request, reply) => {
@@ -329,7 +376,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post('/api/batches/:batchId/retry', async (request) => {
     const { batchId } = request.params as { batchId: string };
-    return dependencies.batches.retry(batchId, authenticatedUser(request).id);
+    return await dependencies.batches.retry(batchId, authenticatedUser(request).id);
   });
 
   return app;

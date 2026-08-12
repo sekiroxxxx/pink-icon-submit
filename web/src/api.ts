@@ -97,18 +97,6 @@ export type UserBatchStatus =
   | 'submitted_review'
   | 'local_complete';
 
-export interface NamePreview {
-  schemaVersion: 1;
-  baseCommit: string;
-  input: string;
-  normalizedName: string;
-  valid: boolean;
-  collision: {
-    primaryName: string;
-    aliases: string[];
-  } | null;
-}
-
 export interface CatalogPageIcon {
   primaryName: string;
   aliases: string[];
@@ -161,17 +149,18 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function itemRequest(item: ItemInput, svg?: File): RequestInit {
+function itemRequest(item: ItemInput, clientMutationId?: string, svg?: File): RequestInit {
+  const payload = clientMutationId ? { ...item, clientMutationId } : item;
   if (svg) {
     const body = new FormData();
-    body.set('item', JSON.stringify(item));
+    body.set('item', JSON.stringify(payload));
     body.set('svg', svg);
     return { method: 'POST', body };
   }
   return {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(item),
+    body: JSON.stringify(payload),
   };
 }
 
@@ -191,7 +180,6 @@ export const api = {
     if (query.pageSize) parameters.set('pageSize', String(query.pageSize));
     return request<CatalogPage>(`/api/catalog/page?${parameters.toString()}`);
   },
-  previewName: (name: string) => request<NamePreview>(`/api/names/preview?${new URLSearchParams({ name }).toString()}`),
   createBatch: (input: CreateBatchInput) => request<BatchDetails>('/api/batches', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -202,9 +190,9 @@ export const api = {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(input),
   }),
-  addItem: (batchId: string, item: ItemInput, svg?: File) => request<ApiItem>(`/api/batches/${encodeURIComponent(batchId)}/items`, itemRequest(item, svg)),
+  addItem: (batchId: string, item: ItemInput, clientMutationId: string, svg?: File) => request<ApiItem>(`/api/batches/${encodeURIComponent(batchId)}/items`, itemRequest(item, clientMutationId, svg)),
   updateItem: (batchId: string, itemId: string, item: ItemInput, svg?: File) => {
-    const options = itemRequest(item, svg);
+    const options = itemRequest(item, undefined, svg);
     return request<ApiItem>(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}`, { ...options, method: 'PUT' });
   },
   deleteItem: (batchId: string, itemId: string) => request<void>(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}`, { method: 'DELETE' }),

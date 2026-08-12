@@ -4,7 +4,7 @@ import type { ReactElement } from 'react';
 import { afterEach, expect, test, vi } from 'vitest';
 
 import { App } from './App';
-import type { BatchDetails, BatchSummary } from './api';
+import type { ApiItem, BatchDetails, BatchSummary, ItemInput } from './api';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -64,13 +64,14 @@ function batch(overrides: Partial<BatchDetails> = {}): BatchDetails {
   return { ...result, userStatus: 'developer_attention' };
 }
 
-function stubFetch(handler: (path: string, options?: RequestInit) => unknown, summaries: BatchSummary[] = [], activeBatch?: BatchDetails): void {
+function stubFetch(handler: (path: string, options?: RequestInit) => unknown, summaries: BatchSummary[] = [], activeBatch?: BatchDetails | (() => BatchDetails | undefined)): void {
   vi.stubGlobal('fetch', vi.fn((path: string, options?: RequestInit) => {
     if (path === '/api/auth/me') {
       return Promise.resolve(jsonResponse({ user: { id: 'user-designer', username: 'designer@example.invalid' } }));
     }
     if (path === '/api/batches/active') {
-      if (activeBatch) return Promise.resolve(jsonResponse(activeBatch));
+      const active = typeof activeBatch === 'function' ? activeBatch() : activeBatch;
+      if (active) return Promise.resolve(jsonResponse(active));
       return Promise.resolve(new Response(null, { status: 204 }));
     }
     if (path === '/api/batches?limit=20') {
@@ -100,6 +101,7 @@ function summary(overrides: Partial<BatchSummary> = {}): BatchSummary {
 }
 
 async function addOneSvgChange(user: ReturnType<typeof userEvent.setup>): Promise<void> {
+  await fillBatchMetadata(user);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('new-icon.svg'));
   await screen.findByRole('button', { name: '选择 new-icon.svg' });
@@ -108,12 +110,137 @@ async function addOneSvgChange(user: ReturnType<typeof userEvent.setup>): Promis
   await user.click(screen.getByRole('button', { name: '加入新增队列' }));
 }
 
-async function openReview(user: ReturnType<typeof userEvent.setup>, designUrl?: string): Promise<void> {
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.type(screen.getByLabelText(/^本次变更标题/), '模型入口图标');
-  await user.type(screen.getByLabelText(/^整体需求说明/), '新增模型入口图标。');
+async function fillBatchMetadata(user: ReturnType<typeof userEvent.setup>, designUrl?: string): Promise<void> {
+  const title = screen.getByLabelText(/^本次变更标题/) as HTMLInputElement;
+  const description = screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement;
+  if (!title.value) await user.type(title, '模型入口图标');
+  if (!description.value) await user.type(description, '新增模型入口图标。');
   if (designUrl) await user.type(screen.getByLabelText(/^设计稿链接/), designUrl);
+}
+
+async function openReview(user: ReturnType<typeof userEvent.setup>, designUrl?: string): Promise<void> {
+  if (designUrl) await user.type(screen.getByLabelText(/^设计稿链接/), designUrl);
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
   await user.click(screen.getByRole('checkbox'));
+}
+
+function draftApiHandler(catalog?: unknown) {
+  let current: BatchDetails | undefined;
+  let itemSequence = 0;
+  return vi.fn(async (path: string, options?: RequestInit) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/catalog/page' && catalog) return jsonResponse(catalog);
+    if (url.pathname === '/api/batches' && options?.method === 'POST') {
+      const metadata = JSON.parse(String(options.body)) as Pick<BatchDetails, 'title' | 'description' | 'designUrl'>;
+      current = batch({ id: 'ICON-DRAFT', ...metadata, items: [] });
+      return jsonResponse(current);
+    }
+    if (current && url.pathname === `/api/batches/${current.id}` && options?.method === 'PUT') {
+      const metadata = JSON.parse(String(options.body)) as Pick<BatchDetails, 'title' | 'description' | 'designUrl'>;
+      current = { ...current, ...metadata };
+      return jsonResponse(current);
+    }
+    if (current && url.pathname === `/api/batches/${current.id}` && !options?.method) return jsonResponse(current);
+    if (current && url.pathname === `/api/batches/${current.id}/items` && options?.method === 'POST') {
+      const body = options.body;
+      const input = body instanceof FormData
+        ? JSON.parse(String(body.get('item'))) as ItemInput
+        : JSON.parse(String(body)) as ItemInput;
+      const item: ApiItem = {
+        id: `item-${++itemSequence}`,
+        batchId: current.id,
+        ...input,
+        sourceFile: body instanceof FormData ? `items/item-${itemSequence}.svg` : null,
+      };
+      current = { ...current, items: [...current.items, item] };
+      return jsonResponse(item);
+    }
+    if (current && url.pathname === `/api/batches/${current.id}/submit` && options?.method === 'POST') {
+      current = batch({ ...current, state: 'QUEUED' });
+      return jsonResponse(current);
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+}
+
+function statefulDraftServer(options: { loseCreateResponse?: boolean; loseAddResponse?: boolean; failFirstReconciliationGet?: boolean; failAddBeforeWrite?: boolean; failMetadataSave?: boolean } = {}) {
+  let current: BatchDetails | undefined;
+  let itemSequence = 0;
+  let createCount = 0;
+  let addCount = 0;
+  let submitCount = 0;
+  let metadataSaveCount = 0;
+  let createResponseLost = false;
+  let addResponseLost = false;
+  let addFailedBeforeWrite = false;
+  let reconciliationGetFailed = false;
+  const itemMutationIds: Array<string | undefined> = [];
+  const handler = vi.fn(async (path: string, request?: RequestInit) => {
+    const url = new URL(path, 'http://localhost');
+    if (url.pathname === '/api/auth/logout' && request?.method === 'POST') return new Response(null, { status: 204 });
+    if (url.pathname === '/api/auth/login' && request?.method === 'POST') return jsonResponse({ user: { id: 'user-designer', username: 'designer@example.invalid' } });
+    if (url.pathname === '/api/batches' && request?.method === 'POST') {
+      createCount += 1;
+      const metadata = JSON.parse(String(request.body)) as Pick<BatchDetails, 'title' | 'description' | 'designUrl'>;
+      current = batch({ id: 'ICON-PERSISTED', ...metadata, items: [] });
+      if (options.loseCreateResponse && !createResponseLost) {
+        createResponseLost = true;
+        throw new TypeError('The create response was lost.');
+      }
+      return jsonResponse(current);
+    }
+    if (current && url.pathname === `/api/batches/${current.id}` && request?.method === 'PUT') {
+      metadataSaveCount += 1;
+      if (options.failMetadataSave) return jsonResponse({ error: { code: 'SAVE_FAILED', message: 'Metadata save failed.' } }, 500);
+      const metadata = JSON.parse(String(request.body)) as Pick<BatchDetails, 'title' | 'description' | 'designUrl'>;
+      current = { ...current, ...metadata };
+      return jsonResponse(current);
+    }
+    if (current && url.pathname === `/api/batches/${current.id}` && !request?.method) {
+      if (options.failFirstReconciliationGet && addResponseLost && !reconciliationGetFailed) {
+        reconciliationGetFailed = true;
+        return jsonResponse({ error: { code: 'READ_FAILED', message: 'The first reconciliation read failed.' } }, 503);
+      }
+      return jsonResponse(current);
+    }
+    if (current && url.pathname === `/api/batches/${current.id}/items` && request?.method === 'POST') {
+      addCount += 1;
+      const body = request.body;
+      const input = body instanceof FormData
+        ? JSON.parse(String(body.get('item'))) as ItemInput & { clientMutationId?: string }
+        : JSON.parse(String(body)) as ItemInput & { clientMutationId?: string };
+      itemMutationIds.push(input.clientMutationId);
+      if (options.failAddBeforeWrite && !addFailedBeforeWrite) {
+        addFailedBeforeWrite = true;
+        return jsonResponse({ error: { code: 'UPLOAD_FAILED', message: 'The upload failed before storage.' } }, 500);
+      }
+      const item: ApiItem = {
+        id: `item-${++itemSequence}`,
+        batchId: current.id,
+        ...input,
+        sourceFile: body instanceof FormData ? `items/item-${itemSequence}.svg` : null,
+      };
+      current = { ...current, items: [...current.items, item] };
+      if (options.loseAddResponse && !addResponseLost) {
+        addResponseLost = true;
+        throw new TypeError('The add response was lost.');
+      }
+      return jsonResponse(item);
+    }
+    if (current && url.pathname === `/api/batches/${current.id}/submit` && request?.method === 'POST') {
+      submitCount += 1;
+      current = batch({ ...current, state: 'QUEUED' });
+      return jsonResponse(current);
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(handler, [], () => current?.state === 'DRAFT' ? current : undefined);
+  return {
+    handler,
+    current: () => current,
+    counts: () => ({ create: createCount, add: addCount, submit: submitCount, metadataSave: metadataSaveCount }),
+    itemMutationIds: () => itemMutationIds,
+  };
 }
 
 async function openActiveWorkbench(user: ReturnType<typeof userEvent.setup>, label: string): Promise<void> {
@@ -199,7 +326,7 @@ test('the expected icon name uses only local checks and never performs a name pr
   expect(screen.getByLabelText(/^期望图标名称/)).toBeTruthy();
   expect(screen.getByText('最终名称会在开发审核时确认。')).toBeTruthy();
   expect(screen.queryByText(/仓库最终名称预览/)).toBeNull();
-  expect(fetchMock).not.toHaveBeenCalled();
+  expect(fetchMock.mock.calls.some(([path]) => String(path).includes('/names/preview'))).toBe(false);
 });
 
 test('an expected icon name with path characters is rejected locally without a network check', async () => {
@@ -252,14 +379,15 @@ test('replace opens the frozen catalog only when the designer asks for it', asyn
 
 test('a replace target becomes unavailable after it is added to the same batch', async () => {
   saveProfile();
-  stubFetch(vi.fn().mockResolvedValue(jsonResponse({
+  stubFetch(draftApiHandler({
     baseCommit: 'a'.repeat(40), page: 1, pageSize: 24, total: 1,
     icons: [{ primaryName: 'existing', aliases: ['existing-alias'], group: 'common', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>' }],
-  })));
+  }));
   const user = userEvent.setup();
 
   render(<App />);
   await openNewWorkbench(user);
+  await fillBatchMetadata(user);
   await user.click(screen.getByRole('tab', { name: '替换图标' }));
   await user.click(screen.getByRole('button', { name: '选择图标' }));
   await screen.findByText('existing');
@@ -276,11 +404,12 @@ test('a replace target becomes unavailable after it is added to the same batch',
 
 test('multiple SVG files stay in the local queue until each is paired with a change', async () => {
   saveProfile();
-  stubFetch(vi.fn());
+  stubFetch(draftApiHandler());
   const user = userEvent.setup();
 
   render(<App />);
   await openNewWorkbench(user);
+  await fillBatchMetadata(user);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, [svgFile('one.svg'), svgFile('two.svg')]);
   await screen.findByRole('button', { name: '选择 one.svg' });
@@ -295,14 +424,15 @@ test('multiple SVG files stay in the local queue until each is paired with a cha
 
 test('delete only needs a catalog target and a design reason before it enters the queue', async () => {
   saveProfile();
-  stubFetch(vi.fn().mockResolvedValue(jsonResponse({
+  stubFetch(draftApiHandler({
     baseCommit: 'a'.repeat(40), page: 1, pageSize: 24, total: 1,
     icons: [{ primaryName: 'existing', aliases: ['existing-alias'], group: 'common', svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h1v1H0z" /></svg>' }],
-  })));
+  }));
   const user = userEvent.setup();
 
   render(<App />);
   await openNewWorkbench(user);
+  await fillBatchMetadata(user);
   await user.click(screen.getByRole('tab', { name: '删除图标' }));
   await user.click(screen.getByRole('button', { name: '选择图标' }));
   await screen.findByText('existing');
@@ -313,7 +443,7 @@ test('delete only needs a catalog target and a design reason before it enters th
   expect(screen.getByText('本次变更 1 项')).toBeTruthy();
 });
 
-test('review requires local batch fields but design link is optional', async () => {
+test('the first queued item requires batch fields but design link is optional', async () => {
   saveProfile();
   const fetchMock = vi.fn();
   stubFetch(fetchMock);
@@ -321,18 +451,19 @@ test('review requires local batch fields but design link is optional', async () 
 
   render(<App />);
   await openNewWorkbench(user);
-  await addOneSvgChange(user);
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
-  await user.click(screen.getByRole('button', { name: '确认提交' }));
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('new-icon.svg'));
+  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
+  await user.type(screen.getByLabelText(/^用途说明/), '用于测试新增图标的设计稿。');
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
 
   expect(screen.getByText('请填写本次变更标题。')).toBeTruthy();
   expect(screen.getByText('请填写整体需求说明。')).toBeTruthy();
-  expect(screen.getByText('请确认本次变更内容。')).toBeTruthy();
   expect(screen.queryByText('请填写有效的 HTTP(S) 设计稿链接。')).toBeNull();
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
-test('review rejects a malformed optional design link before it creates a batch', async () => {
+test('the first queued item rejects a malformed optional design link before it creates a batch', async () => {
   saveProfile();
   const fetchMock = vi.fn();
   stubFetch(fetchMock);
@@ -340,9 +471,12 @@ test('review rejects a malformed optional design link before it creates a batch'
 
   render(<App />);
   await openNewWorkbench(user);
-  await addOneSvgChange(user);
-  await openReview(user, 'https:www.123.com');
-  await user.click(screen.getByRole('button', { name: '确认提交' }));
+  await fillBatchMetadata(user, 'https:www.123.com');
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('new-icon.svg'));
+  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
+  await user.type(screen.getByLabelText(/^用途说明/), '用于测试新增图标的设计稿。');
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
 
   expect(screen.getByText('请填写有效的 HTTP(S) 设计稿链接。')).toBeTruthy();
   expect(fetchMock).not.toHaveBeenCalled();
@@ -357,6 +491,7 @@ test('confirmation closes review, queues a DRAFT batch, and makes no preview or 
     const url = new URL(path, 'http://localhost');
     if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse(draft));
     if (url.pathname === `/api/batches/${draft.id}/items`) return Promise.resolve(jsonResponse(item));
+    if (url.pathname === `/api/batches/${draft.id}` && _options?.method === 'PUT') return Promise.resolve(jsonResponse({ ...draft, items: [item] }));
     if (url.pathname === `/api/batches/${draft.id}/submit`) return Promise.resolve(jsonResponse(queued));
     throw new Error(`Unexpected request: ${path}`);
   });
@@ -374,6 +509,7 @@ test('confirmation closes review, queues a DRAFT batch, and makes no preview or 
   expect(fetchMock.mock.calls.map(([path]) => String(path))).toEqual([
     '/api/batches',
     `/api/batches/${draft.id}/items`,
+    `/api/batches/${draft.id}`,
     `/api/batches/${draft.id}/submit`,
   ]);
   const createOptions = fetchMock.mock.calls[0]?.[1] as RequestInit;
@@ -560,6 +696,7 @@ test('unchanged final-validation failures need an explicit confirmation before r
     const url = new URL(path, 'http://localhost');
     if (url.pathname === '/api/batches') return Promise.resolve(jsonResponse(draft));
     if (url.pathname === `/api/batches/${draft.id}/items`) return Promise.resolve(jsonResponse(item));
+    if (url.pathname === `/api/batches/${draft.id}` && _options?.method === 'PUT') return Promise.resolve(jsonResponse({ ...draft, items: [item] }));
     if (url.pathname === `/api/batches/${draft.id}/submit`) {
       submitCount += 1;
       return submitCount === 1
@@ -585,7 +722,7 @@ test('unchanged final-validation failures need an explicit confirmation before r
   expect(JSON.parse((submitCalls[1]?.[1] as RequestInit).body as string)).toEqual({ confirmRepeatedSubmission: true });
 });
 
-test('partial item sync reconciles server items before retrying without duplicate creation', async () => {
+test('a failed second item save preserves the first item and retries only the unsaved item', async () => {
   saveProfile();
   const batchId = 'ICON-PARTIAL';
   const serverItems: Array<{
@@ -643,15 +780,16 @@ test('partial item sync reconciles server items before retrying without duplicat
   await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-second-icon');
   await user.type(screen.getByLabelText(/^用途说明/), '第二项用于验证部分上传失败后的服务端对账。');
   await user.click(screen.getByRole('button', { name: '加入新增队列' }));
-  await openReview(user);
-  await user.click(screen.getByRole('button', { name: '确认提交' }));
 
-  await screen.findByText('提交未完成：The second upload failed.');
+  await screen.findByText('草稿保存失败：The second upload failed.');
   expect(serverItems).toHaveLength(1);
   expect(serverItems[0]?.designName).toBe('pink-new-icon');
-  expect(screen.getByText('本次变更 2 项')).toBeTruthy();
+  expect(screen.getByText('本次变更 1 项')).toBeTruthy();
+  expect((screen.getByLabelText(/^期望图标名称/) as HTMLInputElement).value).toBe('pink-second-icon');
 
-  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+  await screen.findByText('本次变更 2 项');
+  await openReview(user);
   await user.click(screen.getByRole('button', { name: '确认提交' }));
 
   await screen.findByRole('heading', { name: '已提交' });
@@ -1234,4 +1372,189 @@ test('a completed Draft PR returns the current workbench to home and keeps its r
   fireEvent.click(screen.getByRole('button', { name: '查看' }));
   const link = await screen.findByRole('link', { name: '打开开发审核记录' });
   expect(link.getAttribute('href')).toBe('https://github.example.invalid/pull/8');
+});
+
+test('the first queued item is a server draft and survives home navigation, remount, and account login', async () => {
+  const server = statefulDraftServer();
+  const user = userEvent.setup();
+  const firstRender = render(<App />);
+  await openNewWorkbench(user);
+  await addOneSvgChange(user);
+
+  await screen.findByText('本次变更 1 项');
+  expect(server.current()?.items).toHaveLength(1);
+  expect(server.current()?.state).toBe('DRAFT');
+  expect(server.counts()).toMatchObject({ create: 1, add: 1, submit: 0 });
+
+  const title = screen.getByLabelText(/^本次变更标题/);
+  await user.clear(title);
+  await user.type(title, '返回首页前保存的新标题');
+  const pendingInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(pendingInput, svgFile('not-added.svg'));
+  await screen.findByRole('button', { name: '选择 not-added.svg' });
+  await user.click(screen.getByRole('button', { name: '返回首页' }));
+  expect(server.current()?.title).toBe('返回首页前保存的新标题');
+  await openActiveWorkbench(user, '继续编辑');
+  expect(await screen.findByText('本次变更 1 项')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '选择 not-added.svg' })).toBeNull();
+
+  await user.click(screen.getByRole('button', { name: '退出登录' }));
+  await screen.findByRole('heading', { name: '登录 PinK 图标工作台' });
+  await user.type(screen.getByLabelText(/^账号/), 'designer@example.invalid');
+  await user.type(screen.getByLabelText(/^密码/), 'secret');
+  await user.click(screen.getByRole('button', { name: '登录' }));
+  expect((await screen.findAllByRole('button', { name: '继续编辑' })).length).toBeGreaterThan(0);
+
+  firstRender.unmount();
+  render(<App />);
+  expect((await screen.findAllByRole('button', { name: '继续编辑' })).length).toBeGreaterThan(0);
+  expect(server.counts()).toMatchObject({ create: 1, add: 1, submit: 0 });
+});
+
+test('lost create and add responses reconcile the unique server draft without duplicate writes', async () => {
+  const server = statefulDraftServer({ loseCreateResponse: true, loseAddResponse: true });
+  const user = userEvent.setup();
+  render(<App />);
+  await openNewWorkbench(user);
+  await addOneSvgChange(user);
+
+  expect(await screen.findByText('本次变更 1 项')).toBeTruthy();
+  expect(server.current()?.items).toHaveLength(1);
+  expect(server.counts()).toMatchObject({ create: 1, add: 1, submit: 0 });
+  expect(screen.queryByText(/草稿保存失败/)).toBeNull();
+});
+
+test('an uncertain add write reconciles on manual retry before issuing another POST', async () => {
+  const server = statefulDraftServer({ loseAddResponse: true, failFirstReconciliationGet: true });
+  const user = userEvent.setup();
+  render(<App />);
+  await openNewWorkbench(user);
+  await addOneSvgChange(user);
+
+  expect(await screen.findByText('草稿保存失败：The add response was lost.')).toBeTruthy();
+  expect(server.current()?.items).toHaveLength(1);
+  expect(server.counts()).toMatchObject({ create: 1, add: 1, submit: 0 });
+
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+  expect(await screen.findByText('本次变更 1 项')).toBeTruthy();
+  expect(server.current()?.items).toHaveLength(1);
+  expect(server.counts()).toMatchObject({ create: 1, add: 1, submit: 0 });
+});
+
+test('leaving during the first create still exposes the new active draft on home', async () => {
+  const createResponse = deferred<Response>();
+  let active: BatchDetails | undefined;
+  const created = batch({ id: 'ICON-CREATE-ROUTE', title: '首次创建路由恢复', description: '创建期间返回首页。' });
+  stubFetch(vi.fn((path: string, request?: RequestInit) => {
+    if (path === '/api/batches' && request?.method === 'POST') return createResponse.promise;
+    throw new Error(`Unexpected request: ${path}`);
+  }), [], () => active);
+  const user = userEvent.setup();
+  render(<App />);
+  await openNewWorkbench(user);
+  await user.type(screen.getByLabelText(/^本次变更标题/), created.title);
+  await user.type(screen.getByLabelText(/^整体需求说明/), created.description);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('new-icon.svg'));
+  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
+  await user.type(screen.getByLabelText(/^用途说明/), '验证创建期间路由变化。');
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+
+  window.history.replaceState({}, '', '/');
+  window.dispatchEvent(new PopStateEvent('popstate'));
+  active = created;
+  await act(async () => { createResponse.resolve(jsonResponse(created)); });
+
+  expect(await screen.findByRole('heading', { name: created.title })).toBeTruthy();
+  expect(screen.getByText('草稿')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '新建图标变更' })).toBeNull();
+  expect(window.location.pathname).toBe('/');
+});
+
+test('a failed first item upload keeps one empty server draft and all editor input for retry', async () => {
+  const server = statefulDraftServer({ failAddBeforeWrite: true });
+  const user = userEvent.setup();
+  render(<App />);
+  await openNewWorkbench(user);
+  await addOneSvgChange(user);
+
+  expect(await screen.findByText('草稿保存失败：The upload failed before storage.')).toBeTruthy();
+  expect(server.current()?.items).toHaveLength(0);
+  expect(server.counts()).toMatchObject({ create: 1, add: 1, submit: 0 });
+  expect((screen.getByLabelText(/^期望图标名称/) as HTMLInputElement).value).toBe('pink-new-icon');
+  expect(screen.getByRole('button', { name: '选择 new-icon.svg' })).toBeTruthy();
+
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+  expect(await screen.findByText('本次变更 1 项')).toBeTruthy();
+  expect(server.current()?.items).toHaveLength(1);
+  expect(server.counts()).toMatchObject({ create: 1, add: 2, submit: 0 });
+  expect(server.itemMutationIds()).toHaveLength(2);
+  expect(new Set(server.itemMutationIds()).size).toBe(1);
+});
+
+test('a metadata save failure keeps the designer in the workbench with the server draft unchanged', async () => {
+  const server = statefulDraftServer({ failMetadataSave: true });
+  const user = userEvent.setup();
+  render(<App />);
+  await openNewWorkbench(user);
+  await addOneSvgChange(user);
+  await screen.findByText('本次变更 1 项');
+
+  const title = screen.getByLabelText(/^本次变更标题/);
+  await user.clear(title);
+  await user.type(title, '修改后的批次标题');
+  await user.click(screen.getByRole('button', { name: '返回首页' }));
+
+  expect(await screen.findByText('草稿保存失败：Metadata save failed.')).toBeTruthy();
+  expect(screen.getByRole('heading', { name: '完成设计，交给开发' })).toBeTruthy();
+  expect(window.location.pathname).toBe('/workbench');
+  expect(server.current()?.title).toBe('模型入口图标');
+});
+
+test('double-clicking add and confirming review create one batch, one item, and one submission', async () => {
+  const server = statefulDraftServer();
+  const user = userEvent.setup();
+  render(<App />);
+  await openNewWorkbench(user);
+  await fillBatchMetadata(user);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('new-icon.svg'));
+  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
+  await user.type(screen.getByLabelText(/^用途说明/), '用于验证双击不会产生重复写入。');
+  await user.dblClick(screen.getByRole('button', { name: '加入新增队列' }));
+  await screen.findByText('本次变更 1 项');
+
+  await openReview(user);
+  await user.click(screen.getByRole('button', { name: '确认提交' }));
+  await screen.findByRole('heading', { name: '已提交' });
+
+  expect(server.current()?.items).toHaveLength(1);
+  expect(server.counts()).toEqual({ create: 1, add: 1, metadataSave: 1, submit: 1 });
+});
+
+test('an in-flight draft response cannot restore the previous account after authentication expires', async () => {
+  const createResponse = deferred<Response>();
+  const created = batch({ id: 'ICON-STALE-AUTH', title: '模型入口图标', description: '新增模型入口图标。' });
+  stubFetch(vi.fn((path: string, request?: RequestInit) => {
+    if (path === '/api/batches' && request?.method === 'POST') return createResponse.promise;
+    throw new Error(`Unexpected request: ${path}`);
+  }));
+  const user = userEvent.setup();
+  render(<App />);
+  await openNewWorkbench(user);
+  await fillBatchMetadata(user);
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+  await user.upload(fileInput, svgFile('new-icon.svg'));
+  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
+  await user.type(screen.getByLabelText(/^用途说明/), '用于验证失效会话不会回写。');
+  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+  expect((screen.getByRole('button', { name: '退出登录' }) as HTMLButtonElement).disabled).toBe(true);
+
+  window.dispatchEvent(new Event('pink-icon-submit.authentication-required'));
+  await screen.findByRole('heading', { name: '登录 PinK 图标工作台' });
+  await act(async () => { createResponse.resolve(jsonResponse(created)); });
+
+  await waitFor(() => expect(screen.getByRole('heading', { name: '登录 PinK 图标工作台' })).toBeTruthy());
+  expect(screen.queryByText('模型入口图标')).toBeNull();
+  expect(window.location.pathname).toBe('/');
 });

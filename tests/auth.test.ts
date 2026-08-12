@@ -59,11 +59,16 @@ test('login uses an HttpOnly session, requires authentication, and never seriali
   assert.doesNotMatch(tokenHash, new RegExp(cookie.split('=', 2)[1]!));
 });
 
-test('session cookie Secure is explicit and authenticated mutations reject a cross-origin browser request', async (t) => {
+test('session cookie Secure uses the configured public origin behind an HTTPS proxy', async (t) => {
   const environment = await createTestEnvironment(t);
   const auth = new AuthService(environment.database);
   await auth.provisionBootstrapUser({ username: 'secure@example.invalid', password: 'secure password' });
-  const app = await buildApp({ batches: environment.batches, auth, sessionCookieSecure: true });
+  const app = await buildApp({
+    batches: environment.batches,
+    auth,
+    sessionCookieSecure: true,
+    publicOrigin: 'https://pink.example.invalid',
+  });
   t.after(() => app.close());
 
   const login = await app.inject({
@@ -93,10 +98,60 @@ test('session cookie Secure is explicit and authenticated mutations reject a cro
   const sameOrigin = await app.inject({
     method: 'POST',
     url: '/api/auth/logout',
-    headers: { cookie, host: 'pink.local', origin: 'http://pink.local' },
+    headers: {
+      cookie,
+      host: '127.0.0.1:3000',
+      origin: 'https://pink.example.invalid',
+      'x-forwarded-host': 'attacker.example.invalid',
+      'x-forwarded-proto': 'http',
+    },
   });
   assert.equal(sameOrigin.statusCode, 204);
   assert.match(sameOrigin.headers['set-cookie'] as string, /; Secure/);
+});
+
+test('readiness is public, checks the database dependency, and keeps liveness independent', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const auth = new AuthService(environment.database);
+  let ready = true;
+  const app = await buildApp({
+    batches: environment.batches,
+    auth,
+    readiness: () => {
+      if (!ready) throw new Error('database unavailable');
+    },
+  });
+  t.after(() => app.close());
+
+  assert.equal((await app.inject({ method: 'GET', url: '/api/ready' })).statusCode, 200);
+  ready = false;
+  const unavailable = await app.inject({ method: 'GET', url: '/api/ready' });
+  assert.equal(unavailable.statusCode, 503);
+  assert.deepEqual(unavailable.json(), { status: 'not_ready' });
+  assert.equal((await app.inject({ method: 'GET', url: '/api/health' })).statusCode, 200);
+});
+
+test('unknown errors return a fixed message and correlation id instead of internal details', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const auth = new AuthService(environment.database);
+  await auth.provisionBootstrapUser({ username: 'errors@example.invalid', password: 'error test password' });
+  const app = await buildApp({ batches: environment.batches, auth });
+  t.after(() => app.close());
+  const login = await app.inject({
+    method: 'POST',
+    url: '/api/auth/login',
+    payload: { username: 'errors@example.invalid', password: 'error test password' },
+  });
+  const cookie = cookieFrom(login);
+  environment.batches.getCatalog = async () => { throw new Error('sensitive internal detail'); };
+
+  const response = await app.inject({ method: 'GET', url: '/api/catalog', headers: { cookie } });
+  assert.equal(response.statusCode, 500);
+  const payload = response.json() as { error: { code: string; message: string; errorId: string } };
+  assert.equal(payload.error.code, 'INTERNAL_ERROR');
+  assert.equal(payload.error.message, '服务暂时无法完成请求，请稍后重试。');
+  assert.match(payload.error.errorId, /^[0-9a-f-]{36}$/);
+  assert.doesNotMatch(response.body, /sensitive internal detail/);
 });
 
 test('owner scoping hides other accounts, enforces one active batch, and logout or expiry invalidates a session', async (t) => {
@@ -126,6 +181,7 @@ test('owner scoping hides other accounts, enforces one active batch, and logout 
     headers: { cookie: aliceCookie },
     payload: {
       action: 'add',
+      clientMutationId: 'mutation-alice-icon-0001',
       designName: 'alice-icon',
       description: 'Alice-owned icon.',
       svgBase64: Buffer.from(environment.validSvg).toString('base64'),
@@ -193,6 +249,7 @@ test('all batch routes use the same owner boundary and never reveal another acco
     headers: { cookie: ownerCookie },
     payload: {
       action: 'add',
+      clientMutationId: 'mutation-private-route-owner-0001',
       designName: 'private-route-matrix-icon',
       description: 'Valid payload so only ownership controls the result.',
       svgBase64: Buffer.from(environment.validSvg).toString('base64'),
@@ -203,7 +260,7 @@ test('all batch routes use the same owner boundary and never reveal another acco
   const attempts: Array<{ name: string; method: 'GET' | 'POST' | 'PUT' | 'DELETE'; url: string; payload?: unknown }> = [
     { name: 'detail', method: 'GET', url: `/api/batches/${batchId}` },
     { name: 'update metadata', method: 'PUT', url: `/api/batches/${batchId}`, payload: { title: 'Other', description: 'Must never reach DRAFT editing.' } },
-    { name: 'add item', method: 'POST', url: `/api/batches/${batchId}/items`, payload: { action: 'delete', targetName: 'existing', reason: 'Must never reach item validation.' } },
+    { name: 'add item', method: 'POST', url: `/api/batches/${batchId}/items`, payload: { action: 'delete', targetName: 'existing', reason: 'Must never reach item validation.', clientMutationId: 'mutation-private-route-other-0001' } },
     { name: 'update item', method: 'PUT', url: `/api/batches/${batchId}/items/${itemId}`, payload: { action: 'add', designName: 'other-icon', description: 'Must never reach item validation.' } },
     { name: 'delete item', method: 'DELETE', url: `/api/batches/${batchId}/items/${itemId}` },
     { name: 'validate', method: 'POST', url: `/api/batches/${batchId}/validate` },
@@ -245,4 +302,73 @@ test('an explicit bootstrap secret can activate the retained legacy account with
   inspection.close();
   assert.match(passwordHash, /^scrypt\$/);
   assert.doesNotMatch(passwordHash, /migration-only-password/);
+});
+
+test('login rate limiting uses normalized usernames, resets after success, and expires with its window', async (t) => {
+  const environment = await createTestEnvironment(t);
+  let currentTime = 1_000;
+  const auth = new AuthService(environment.database, {
+    loginFailureLimit: 2,
+    loginFailureWindowMs: 500,
+    now: () => currentTime,
+  });
+  await auth.provisionBootstrapUser({ username: 'limited@example.invalid', password: 'correct password' });
+
+  const invalid = { code: 'LOGIN_INVALID', message: '账号或密码不正确。' };
+  await assert.rejects(
+    auth.login({ username: 'LIMITED@example.invalid', password: 'wrong one' }),
+    (error: unknown) => {
+      assert.deepEqual({ code: (error as { code: string }).code, message: (error as Error).message }, invalid);
+      return true;
+    },
+  );
+  await assert.rejects(auth.login({ username: ' limited@example.invalid ', password: 'wrong two' }));
+  await assert.rejects(
+    auth.login({ username: 'limited@example.invalid', password: 'correct password' }),
+    (error: unknown) => {
+      assert.deepEqual({ code: (error as { code: string }).code, message: (error as Error).message }, invalid);
+      return true;
+    },
+  );
+
+  currentTime += 500;
+  const afterWindow = await auth.login({ username: 'limited@example.invalid', password: 'correct password' });
+  assert.equal(afterWindow.user.username, 'limited@example.invalid');
+
+  await assert.rejects(auth.login({ username: 'limited@example.invalid', password: 'wrong again' }));
+  const afterFailure = await auth.login({ username: 'limited@example.invalid', password: 'correct password' });
+  assert.equal(afterFailure.user.username, 'limited@example.invalid');
+  await assert.rejects(auth.login({ username: 'limited@example.invalid', password: 'wrong after reset' }));
+  const afterReset = await auth.login({ username: 'limited@example.invalid', password: 'correct password' });
+  assert.equal(afterReset.user.username, 'limited@example.invalid');
+
+  await assert.rejects(
+    auth.login({ username: 'missing@example.invalid', password: 'anything' }),
+    (error: unknown) => {
+      assert.deepEqual({ code: (error as { code: string }).code, message: (error as Error).message }, invalid);
+      return true;
+    },
+  );
+});
+
+test('login failure tracking remains bounded without evicting an active account limit', async (t) => {
+  const environment = await createTestEnvironment(t);
+  let currentTime = 1_000;
+  const auth = new AuthService(environment.database, {
+    loginFailureLimit: 2,
+    loginFailureMaximumEntries: 2,
+    loginFailureWindowMs: 500,
+    now: () => currentTime,
+  });
+  await auth.provisionBootstrapUser({ username: 'target@example.invalid', password: 'correct password' });
+  await assert.rejects(auth.login({ username: 'target@example.invalid', password: 'wrong one' }));
+  await assert.rejects(auth.login({ username: 'target@example.invalid', password: 'wrong two' }));
+  await assert.rejects(auth.login({ username: 'filler@example.invalid', password: 'wrong' }));
+  await assert.rejects(auth.login({ username: 'overflow@example.invalid', password: 'wrong' }));
+  assert.equal((auth as unknown as { loginFailures: Map<string, unknown> }).loginFailures.size, 2);
+  await assert.rejects(auth.login({ username: 'target@example.invalid', password: 'correct password' }));
+
+  currentTime += 500;
+  const login = await auth.login({ username: 'target@example.invalid', password: 'correct password' });
+  assert.equal(login.user.username, 'target@example.invalid');
 });

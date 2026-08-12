@@ -18,6 +18,7 @@ interface DraftCatalogIcon {
 
 interface DraftChange {
   clientId: string;
+  clientMutationId: string;
   serverId?: string;
   action: ItemAction;
   designName?: string;
@@ -53,6 +54,11 @@ let nextClientId = 1;
 
 function uniqueId(prefix: string): string {
   return `${prefix}-${nextClientId++}`;
+}
+
+function createClientMutationId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return `mutation-${Date.now()}-${Math.random().toString(36).slice(2).padEnd(8, '0')}`;
 }
 
 function routeFromLocation(): AppRoute {
@@ -113,6 +119,7 @@ function draftIcon(primaryName: string | undefined): DraftCatalogIcon | undefine
 function draftChangeFromItem(item: ApiItem): DraftChange {
   return {
     clientId: uniqueId('change'),
+    clientMutationId: createClientMutationId(),
     serverId: item.id,
     action: item.action,
     ...(item.designName ? { designName: item.designName } : {}),
@@ -130,6 +137,28 @@ function draftChangesFromBatch(batch: Pick<BatchDetails, 'items'>): DraftChange[
 
 function savedDraftChange(change: DraftChange, item: ApiItem): DraftChange {
   return { ...change, serverId: item.id, uploadedSourceFile: item.sourceFile };
+}
+
+function itemMatchesDraft(item: ApiItem, change: DraftChange): boolean {
+  const input = toItemInput(change);
+  return item.action === input.action
+    && (item.designName ?? undefined) === input.designName
+    && (item.targetName ?? undefined) === input.targetName
+    && (item.description ?? undefined) === input.description
+    && (item.reason ?? undefined) === input.reason
+    && (item.replacementName ?? undefined) === input.replacementName
+    && Boolean(item.sourceFile) === Boolean(change.svg);
+}
+
+function draftChangesMatch(left: DraftChange, right: DraftChange): boolean {
+  return JSON.stringify(toItemInput(left)) === JSON.stringify(toItemInput(right))
+    && left.svg?.id === right.svg?.id;
+}
+
+function batchMetadataMatches(batch: BatchDetails, metadata: { title: string; description: string; designUrl?: string }): boolean {
+  return batch.title === metadata.title
+    && batch.description === metadata.description
+    && (batch.designUrl ?? undefined) === metadata.designUrl;
 }
 
 function reconcileDraftChanges(batch: Pick<BatchDetails, 'items'>, currentChanges: DraftChange[]): DraftChange[] {
@@ -721,23 +750,19 @@ function DeliveryStatusCard({
 
 function ReviewDrawer({
   changes,
-  form,
   user,
   errors,
   confirmed,
   busy,
-  onChange,
   onConfirmedChange,
   onClose,
   onSubmit,
 }: {
   changes: DraftChange[];
-  form: { title: string; description: string; designUrl: string };
   user: AuthenticatedUser;
   errors: FieldErrors;
   confirmed: boolean;
   busy: boolean;
-  onChange: (patch: Partial<{ title: string; description: string; designUrl: string }>) => void;
   onConfirmedChange: (value: boolean) => void;
   onClose: () => void;
   onSubmit: () => void;
@@ -747,9 +772,6 @@ function ReviewDrawer({
       <section className="review-drawer" role="dialog" aria-modal="true" aria-labelledby="review-title">
         <div className="drawer-heading"><div><p className="eyebrow">提交前确认</p><h2 id="review-title">让开发准确理解这次设计</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div>
         <p className="review-note">提交人会自动使用登录账号 <strong>{user.username}</strong>。最终校验和后续开发审核会一并记录本次设计变更。</p>
-        <div className="form-field"><label htmlFor="batch-title">本次变更标题<RequiredMark /></label><input id="batch-title" disabled={busy} maxLength={limits.batchTitle} value={form.title} onChange={(event) => onChange({ title: event.target.value })} placeholder="例如：模型页图标视觉更新" /><FieldCounter value={form.title} maximum={limits.batchTitle} /><FieldError message={errors.title} /></div>
-        <div className="form-field"><label htmlFor="batch-description">整体需求说明<RequiredMark /></label><textarea id="batch-description" disabled={busy} maxLength={limits.batchDescription} value={form.description} onChange={(event) => onChange({ description: event.target.value })} placeholder="说明设计变更的背景、目的和影响范围。" /><FieldCounter value={form.description} maximum={limits.batchDescription} /><FieldError message={errors.description} /></div>
-        <div className="form-field"><label htmlFor="design-url">设计稿链接 <em>（选填）</em></label><input id="design-url" disabled={busy} type="url" value={form.designUrl} onChange={(event) => onChange({ designUrl: event.target.value })} placeholder="https://figma.com/..." /><FieldError message={errors.designUrl} /></div>
         <section className="review-list" aria-label="本次变更清单"><h3>本次变更清单</h3>{changes.map((change) => <div key={change.clientId}><strong>{({ add: '新增', replace: '替换', delete: '删除' })[change.action]}</strong><span>{change.action === 'add' ? change.designName : change.target?.primaryName}{change.svg ? ` · ${change.svg.file.name}` : ''}</span></div>)}</section>
         <label className="confirm-check"><input type="checkbox" disabled={busy} checked={confirmed} onChange={(event) => onConfirmedChange(event.target.checked)} /><span>我确认以上设计意图和 SVG 文件正确，并同意交由后续自动校验和开发审核。</span></label>
         <FieldError message={errors.confirmed} />
@@ -802,6 +824,13 @@ export function App() {
   const activeBatchIdRef = useRef<string | undefined>(activeBatchId);
   const lastReconciledWorkbenchPath = useRef<string | undefined>(undefined);
   const skipNextWorkbenchHydrationPath = useRef<string | undefined>(undefined);
+  const draftMutationInFlight = useRef(false);
+  const uncertainItemWrite = useRef<{
+    batchId: string;
+    change: DraftChange;
+    existingIds: Set<string>;
+    originalError: unknown;
+  } | undefined>(undefined);
 
   const resetWorkbenchTransientState = useCallback(() => {
     liveSvgDrafts.current.forEach(revokePreview);
@@ -830,6 +859,7 @@ export function App() {
     setReviewErrors({});
     setConfirmed(false);
     setRepeatedSubmissionConfirmation(false);
+    uncertainItemWrite.current = undefined;
   }, []);
 
   const setBrowserActiveBatch = useCallback((batchId: string | undefined) => {
@@ -1219,10 +1249,82 @@ export function App() {
 
   const updateBatchMetadata = (patch: Partial<typeof batchForm>) => {
     setBatchForm((current) => ({ ...current, ...patch }));
+    setReviewErrors((current) => ({ ...current, ...Object.fromEntries(Object.keys(patch).map((key) => [key, ''])) }));
   };
 
-  const addChange = () => {
+  const batchMetadata = () => ({
+    title: batchForm.title.trim(),
+    description: batchForm.description.trim(),
+    ...(batchForm.designUrl.trim() ? { designUrl: batchForm.designUrl.trim() } : {}),
+  });
+
+  const validateBatchMetadata = (): FieldErrors => {
     const errors: FieldErrors = {};
+    if (!batchForm.title.trim()) errors.title = '请填写本次变更标题。';
+    else if (fieldLengthIssue(batchForm.title, '本次变更标题', limits.batchTitle)) errors.title = fieldLengthIssue(batchForm.title, '本次变更标题', limits.batchTitle)!;
+    if (!batchForm.description.trim()) errors.description = '请填写整体需求说明。';
+    else if (fieldLengthIssue(batchForm.description, '整体需求说明', limits.batchDescription)) errors.description = fieldLengthIssue(batchForm.description, '整体需求说明', limits.batchDescription)!;
+    if (batchForm.designUrl.trim() && !isHttpUrl(batchForm.designUrl.trim())) errors.designUrl = '请填写有效的 HTTP(S) 设计稿链接。';
+    return errors;
+  };
+
+  const recoverCreatedBatch = async (metadata: ReturnType<typeof batchMetadata>, originalError: unknown): Promise<BatchDetails> => {
+    try {
+      const active = await api.getActiveBatch();
+      if (active && active.state === 'DRAFT' && batchMetadataMatches(active, metadata)) return active;
+    } catch {
+      // Preserve the create failure when the active-batch reconciliation request also fails.
+    }
+    throw originalError;
+  };
+
+  const ensureDraftBatch = async (metadata: ReturnType<typeof batchMetadata>): Promise<BatchDetails> => {
+    if (batch) return batch;
+    let created: BatchDetails;
+    try {
+      created = await api.createBatch(metadata);
+    } catch (error) {
+      created = await recoverCreatedBatch(metadata, error);
+    }
+    return created;
+  };
+
+  const reconcileItemWrite = async (
+    pending: NonNullable<typeof uncertainItemWrite.current>,
+  ): Promise<{ item: ApiItem; batch: BatchDetails } | undefined> => {
+    const restored = await api.getBatch(pending.batchId);
+    const candidates = restored.items.filter((item) => !pending.existingIds.has(item.id) && itemMatchesDraft(item, pending.change));
+    if (candidates.length === 1) return { item: candidates[0]!, batch: restored };
+    if (candidates.length > 1) throw new Error('服务端存在多项无法区分的相同变更，请交由开发处理。');
+    return undefined;
+  };
+
+  const persistNewChange = async (currentBatch: BatchDetails, change: DraftChange): Promise<{ item: ApiItem; batch: BatchDetails }> => {
+    const existingIds = new Set(currentBatch.items.map((item) => item.id));
+    try {
+      const item = await api.addItem(currentBatch.id, toItemInput(change), change.clientMutationId, change.svg?.file);
+      uncertainItemWrite.current = undefined;
+      return { item, batch: { ...currentBatch, items: [...currentBatch.items, item] } };
+    } catch (error) {
+      const pending = { batchId: currentBatch.id, change, existingIds, originalError: error };
+      uncertainItemWrite.current = pending;
+      try {
+        const reconciled = await reconcileItemWrite(pending);
+        if (reconciled) {
+          uncertainItemWrite.current = undefined;
+          return reconciled;
+        }
+      } catch {
+        // Keep the uncertain write so a manual retry reconciles before issuing another POST.
+      }
+      throw error;
+    }
+  };
+
+  const addChange = async () => {
+    if (draftMutationInFlight.current) return;
+    const errors: FieldErrors = {};
+    const metadataErrors = validateBatchMetadata();
     if (action !== 'delete' && !activeSvg) errors.svg = '请先拖入或选择 SVG 文件。';
     if (action === 'add') {
       const nameIssue = localNameIssue(addName);
@@ -1245,21 +1347,90 @@ export function App() {
       if (targetUse) errors.target = `${target.primaryName}${targetUseLabel(targetUse)}，不能在同一批次重复修改。`;
     }
     setChangeErrors(errors);
-    if (Object.keys(errors).length > 0) return;
+    setReviewErrors((current) => ({ ...current, ...metadataErrors }));
+    if (Object.keys(errors).length > 0 || Object.keys(metadataErrors).length > 0) {
+      setNotice(Object.keys(metadataErrors).length > 0 ? '请先填写并检查本次批次信息。' : undefined);
+      return;
+    }
     const change: DraftChange = {
       clientId: uniqueId('change'),
+      clientMutationId: createClientMutationId(),
       action,
       ...(action === 'add' ? { designName: addName.trim(), description: addDescription.trim() } : {}),
       ...(action === 'replace' ? { target, description: replaceDescription.trim() || undefined, svg: activeSvg } : {}),
       ...(action === 'delete' ? { target, reason: deleteReason.trim(), replacement } : {}),
       ...(action === 'add' ? { svg: activeSvg } : {}),
     };
-    setChanges((current) => [...current, change]);
-    if (activeSvg) removePendingSvg(activeSvg.id, true);
-    setTarget(undefined);
-    setAddName(''); setAddDescription(''); setReplaceDescription(''); setDeleteReason(''); setReplacement(undefined);
-    setChangeErrors({});
-    setNotice('已加入本次变更。其余 SVG 会继续保留在待处理队列。');
+    draftMutationInFlight.current = true;
+    setBusy(true);
+    const operationAuthGeneration = authGeneration.current;
+    let operationHydrationVersion = workbenchHydrationVersion.current;
+    try {
+      const currentBatch = await ensureDraftBatch(batchMetadata());
+      if (authGeneration.current !== operationAuthGeneration) return;
+      if (workbenchHydrationVersion.current !== operationHydrationVersion) {
+        if (!batch) {
+          setBrowserActiveBatch(currentBatch.id);
+          setBatch(currentBatch);
+          void refreshBatchSummaries();
+        }
+        return;
+      }
+      if (!batch) {
+        setBrowserActiveBatch(currentBatch.id);
+        operationHydrationVersion = workbenchHydrationVersion.current;
+        setBatch(currentBatch);
+      }
+      const pending = uncertainItemWrite.current;
+      let persisted: { item: ApiItem; batch: BatchDetails };
+      let persistedChange = change;
+      if (pending) {
+        try {
+        const reconciled = await reconcileItemWrite(pending);
+        if (!reconciled) {
+            if (!draftChangesMatch(pending.change, change)) {
+              throw pending.originalError instanceof Error ? pending.originalError : new Error('上一次图标写入尚未确认。');
+            }
+            persisted = await persistNewChange(currentBatch, pending.change);
+            persistedChange = pending.change;
+          } else {
+            uncertainItemWrite.current = undefined;
+            persisted = reconciled;
+            persistedChange = pending.change;
+          }
+        } catch (error) {
+          throw pending.originalError instanceof Error ? pending.originalError : error;
+        }
+      } else {
+        persisted = await persistNewChange(currentBatch, change);
+      }
+      if (authGeneration.current !== operationAuthGeneration) return;
+      if (workbenchHydrationVersion.current !== operationHydrationVersion) {
+        setBatch(persisted.batch);
+        void refreshBatchSummaries();
+        return;
+      }
+      const saved = savedDraftChange(persistedChange, persisted.item);
+      setBatch(persisted.batch);
+      setChanges((current) => [...current, saved]);
+      if (draftChangesMatch(persistedChange, change)) {
+        if (activeSvg) removePendingSvg(activeSvg.id, true);
+        setTarget(undefined);
+        setAddName(''); setAddDescription(''); setReplaceDescription(''); setDeleteReason(''); setReplacement(undefined);
+      }
+      setChangeErrors({});
+      setNotice(draftChangesMatch(persistedChange, change)
+        ? '已保存到当前草稿。其余 SVG 会继续保留在待处理队列。'
+        : '上一项变更已确认保存；当前编辑内容仍保留，可再次加入队列。');
+      void refreshBatchSummaries();
+    } catch (error) {
+      if (authGeneration.current === operationAuthGeneration && workbenchHydrationVersion.current === operationHydrationVersion) {
+        setNotice(error instanceof Error ? `草稿保存失败：${error.message}` : '草稿保存失败，请稍后重试。');
+      }
+    } finally {
+      draftMutationInFlight.current = false;
+      setBusy(false);
+    }
   };
 
   const removeChange = async (change: DraftChange) => {
@@ -1284,74 +1455,38 @@ export function App() {
   };
 
   const validateReview = (): boolean => {
-    const errors: FieldErrors = {};
-    if (!batchForm.title.trim()) errors.title = '请填写本次变更标题。';
-    else if (fieldLengthIssue(batchForm.title, '本次变更标题', limits.batchTitle)) errors.title = fieldLengthIssue(batchForm.title, '本次变更标题', limits.batchTitle)!;
-    if (!batchForm.description.trim()) errors.description = '请填写整体需求说明。';
-    else if (fieldLengthIssue(batchForm.description, '整体需求说明', limits.batchDescription)) errors.description = fieldLengthIssue(batchForm.description, '整体需求说明', limits.batchDescription)!;
-    if (batchForm.designUrl.trim() && !isHttpUrl(batchForm.designUrl.trim())) errors.designUrl = '请填写有效的 HTTP(S) 设计稿链接。';
+    const errors = validateBatchMetadata();
     if (!confirmed) errors.confirmed = '请确认本次变更内容。';
     setReviewErrors(errors);
     return Object.keys(errors).length === 0;
   };
 
-  const syncChanges = async (batchId: string): Promise<DraftChange[]> => {
-    const saved = [...changes];
-    for (let index = 0; index < saved.length; index += 1) {
-      const change = saved[index]!;
-      const item: ApiItem = change.serverId
-        ? await api.updateItem(batchId, change.serverId, toItemInput(change), change.uploadedSourceFile ? undefined : change.svg?.file)
-        : await api.addItem(batchId, toItemInput(change), change.svg?.file);
-      saved[index] = savedDraftChange(change, item);
-      setChanges([...saved]);
-    }
-    return saved;
-  };
-
   const submitReview = async () => {
-    if (!authenticatedUser || !validateReview()) return;
-    let mutationVersion = workbenchHydrationVersion.current + 1;
+    if (!authenticatedUser || !batch || changes.some((change) => !change.serverId) || !validateReview() || draftMutationInFlight.current) return;
+    draftMutationInFlight.current = true;
+    const mutationVersion = workbenchHydrationVersion.current + 1;
     workbenchHydrationVersion.current = mutationVersion;
     setReviewOpen(false);
     setBusy(true);
     setRepeatedSubmissionConfirmation(false);
     setNotice('已提交本次变更，正在等待最终校验。');
-    let currentBatch = batch;
     try {
-      const metadata = {
-        title: batchForm.title.trim(),
-        description: batchForm.description.trim(),
-        ...(batchForm.designUrl.trim() ? { designUrl: batchForm.designUrl.trim() } : {}),
-      };
-      if (!currentBatch) {
-        currentBatch = await api.createBatch(metadata);
-        if (workbenchHydrationVersion.current !== mutationVersion) return;
-        setBrowserActiveBatch(currentBatch.id);
-        mutationVersion = workbenchHydrationVersion.current;
-        setBatch(currentBatch);
-      } else {
-        currentBatch = await api.updateBatch(currentBatch.id, metadata);
-        if (workbenchHydrationVersion.current !== mutationVersion) return;
-        setBatch(currentBatch);
-      }
-      const saved = await syncChanges(currentBatch.id);
+      const currentBatch = await api.updateBatch(batch.id, batchMetadata());
       if (workbenchHydrationVersion.current !== mutationVersion) return;
-      setChanges(saved);
+      setBatch(currentBatch);
       const submitted = await api.submitBatch(currentBatch.id);
       if (workbenchHydrationVersion.current !== mutationVersion) return;
       setBatch(submitted);
       void refreshBatchSummaries();
     } catch (error) {
-      if (currentBatch) {
-        try {
-          const restored = await api.getBatch(currentBatch.id);
-          if (workbenchHydrationVersion.current !== mutationVersion) return;
-          setBatch(restored);
-          setChanges((current) => reconcileDraftChanges(restored, current));
-          setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
-        } catch {
-          // Preserve the original submission failure when reconciliation is temporarily unavailable.
-        }
+      try {
+        const restored = await api.getBatch(batch.id);
+        if (workbenchHydrationVersion.current !== mutationVersion) return;
+        setBatch(restored);
+        setChanges((current) => reconcileDraftChanges(restored, current));
+        setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
+      } catch {
+        // Preserve the original submission failure when reconciliation is temporarily unavailable.
       }
       if (error instanceof ApiError && error.code === 'REPEATED_SUBMISSION_CONFIRMATION_REQUIRED') {
         setRepeatedSubmissionConfirmation(true);
@@ -1360,6 +1495,7 @@ export function App() {
         setNotice(error instanceof Error ? `提交未完成：${error.message}` : '提交未完成，请稍后重试。');
       }
     } finally {
+      draftMutationInFlight.current = false;
       setBusy(false);
     }
   };
@@ -1476,7 +1612,34 @@ export function App() {
     }
   };
 
-  const returnHome = () => {
+  const returnHome = async () => {
+    if (draftMutationInFlight.current) return;
+    const operationAuthGeneration = authGeneration.current;
+    const operationHydrationVersion = workbenchHydrationVersion.current;
+    if (batch && viewingActiveBatch && batch.state === 'DRAFT') {
+      const errors = validateBatchMetadata();
+      setReviewErrors((current) => ({ ...current, ...errors }));
+      if (Object.keys(errors).length > 0) {
+        setNotice('请先检查本次批次信息，保存后再返回首页。');
+        return;
+      }
+      draftMutationInFlight.current = true;
+      setBusy(true);
+      try {
+        const saved = await api.updateBatch(batch.id, batchMetadata());
+        if (authGeneration.current !== operationAuthGeneration || workbenchHydrationVersion.current !== operationHydrationVersion) return;
+        setBatch(saved);
+      } catch (error) {
+        if (authGeneration.current === operationAuthGeneration && workbenchHydrationVersion.current === operationHydrationVersion) {
+          setNotice(error instanceof Error ? `草稿保存失败：${error.message}` : '草稿保存失败，请稍后重试。');
+        }
+        return;
+      } finally {
+        draftMutationInFlight.current = false;
+        setBusy(false);
+      }
+    }
+    if (authGeneration.current !== operationAuthGeneration || workbenchHydrationVersion.current !== operationHydrationVersion) return;
     navigate({ view: 'home' });
     void refreshBatchSummaries();
   };
@@ -1492,8 +1655,8 @@ export function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <button className="brand brand-button" type="button" onClick={returnHome} aria-label="返回首页"><img className="brand-logo" src="/pink-icon.svg" alt="" /><span>PinK 图标工作台</span></button>
-        <button className="profile-button" type="button" onClick={() => void logout()} aria-label="退出登录"><span className="avatar">{authenticatedUser.username.slice(0, 1).toUpperCase()}</span><span><strong>{authenticatedUser.username}</strong><small>退出登录</small></span></button>
+        <button className="brand brand-button" type="button" disabled={busy} onClick={() => void returnHome()} aria-label="返回首页"><img className="brand-logo" src="/pink-icon.svg" alt="" /><span>PinK 图标工作台</span></button>
+        <button className="profile-button" type="button" disabled={busy} onClick={() => void logout()} aria-label="退出登录"><span className="avatar">{authenticatedUser.username.slice(0, 1).toUpperCase()}</span><span><strong>{authenticatedUser.username}</strong><small>退出登录</small></span></button>
       </header>
       {view === 'home' ? <HomePage
         activeBatch={batch && activeBatchId === batch.id && isActiveBatch(batch) ? batch : undefined}
@@ -1522,6 +1685,14 @@ export function App() {
         /> : notice && <p className="notice" aria-live="polite">{notice}</p>}
 
         {batch && !viewingActiveBatch && <p className="notice" aria-live="polite">这是历史批次，仅供查看。</p>}
+
+        <section className="composer-card" aria-labelledby="batch-information-title">
+          <p className="eyebrow">当前批次</p>
+          <h2 id="batch-information-title">本次变更信息</h2>
+          <div className="form-field"><label htmlFor="batch-title">本次变更标题<RequiredMark /></label><input id="batch-title" disabled={!editable || busy} maxLength={limits.batchTitle} value={batchForm.title} onChange={(event) => updateBatchMetadata({ title: event.target.value })} placeholder="例如：模型页图标视觉更新" /><FieldCounter value={batchForm.title} maximum={limits.batchTitle} /><FieldError message={reviewErrors.title} /></div>
+          <div className="form-field"><label htmlFor="batch-description">整体需求说明<RequiredMark /></label><textarea id="batch-description" disabled={!editable || busy} maxLength={limits.batchDescription} value={batchForm.description} onChange={(event) => updateBatchMetadata({ description: event.target.value })} placeholder="说明设计变更的背景、目的和影响范围。" /><FieldCounter value={batchForm.description} maximum={limits.batchDescription} /><FieldError message={reviewErrors.description} /></div>
+          <div className="form-field"><label htmlFor="design-url">设计稿链接 <em>（选填）</em></label><input id="design-url" disabled={!editable || busy} type="url" value={batchForm.designUrl} onChange={(event) => updateBatchMetadata({ designUrl: event.target.value })} placeholder="https://figma.com/..." /><FieldError message={reviewErrors.designUrl} /></div>
+        </section>
 
         <section className="composer-card" aria-labelledby="composer-title">
           <p className="eyebrow">正在编辑一项变更</p>
@@ -1559,14 +1730,14 @@ export function App() {
           </>}
           {action !== 'delete' && <SvgQueue pending={pendingSvgs} activeSvgId={activeSvgId} disabled={!editable || busy} error={changeErrors.svg} onQueue={queueSvgs} onActivate={setActiveSvgId} onRemove={removePendingSvg} />}
           {action === 'replace' && target && activeSvg?.content === target.svg && <p className="inline-warning">新 SVG 与当前仓库文件内容完全一致；这次替换可能不会产生实际改动。</p>}
-          <div className="composer-actions"><span>操作先保留在当前浏览器草稿；尚未提交到图标仓库。</span><button className="button primary" type="button" disabled={!editable || busy} onClick={addChange}>加入{({ add: '新增', replace: '替换', delete: '删除' })[action]}队列</button></div>
+          <div className="composer-actions"><span>加入队列后会立即保存为账号草稿；确认提交前不会进入图标仓库。</span><button className="button primary" type="button" disabled={!editable || busy} onClick={() => void addChange()}>加入{({ add: '新增', replace: '替换', delete: '删除' })[action]}队列</button></div>
         </section>
 
         <section className="changes-card" aria-label="本次变更"><div><h2>本次变更 {changes.length} 项</h2><p>{changes.length === 0 ? '把一项操作加入队列后，会在这里同时显示所有待改动图标。' : '确认前可移除任何一项变更。'}</p></div><div className="change-list">{changes.map((change) => <ChangeCard key={change.clientId} change={change} disabled={!editable || busy} onRemove={() => void removeChange(change)} />)}</div><div className="changes-actions"><button className="button primary" type="button" disabled={!editable || busy || changes.length === 0} onClick={() => { setReviewErrors({}); setReviewOpen(true); }}>确认本次变更</button></div></section>
 
         {batch && batch.userStatus === 'needs_changes' && batch.validation?.valid === false && <DiagnosticList title="需要修正的问题" diagnostics={batch.validation.errors} tone="error" items={batch.items} />}
       </main>}
-      {reviewOpen && <ReviewDrawer changes={changes} form={batchForm} user={authenticatedUser} errors={reviewErrors} confirmed={confirmed} busy={busy} onChange={updateBatchMetadata} onConfirmedChange={setConfirmed} onClose={() => setReviewOpen(false)} onSubmit={() => void submitReview()} />}
+      {reviewOpen && <ReviewDrawer changes={changes} user={authenticatedUser} errors={reviewErrors} confirmed={confirmed} busy={busy} onConfirmedChange={setConfirmed} onClose={() => setReviewOpen(false)} onSubmit={() => void submitReview()} />}
     </div>
   );
 }

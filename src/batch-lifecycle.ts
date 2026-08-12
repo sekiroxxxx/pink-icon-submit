@@ -15,8 +15,18 @@ export interface BatchLifecycleSnapshot {
 
 const postPushRetryableErrorCodes = new Set([
   'GIT_COMMAND_FAILED',
+  'GIT_COMMAND_TIMEOUT',
   'GITHUB_API_REQUEST_FAILED',
   'GITHUB_API_RESPONSE_INVALID',
+  'GITHUB_API_TIMEOUT',
+  'WORKER_INTERRUPTED',
+]);
+
+const prePushRetryableErrorCodes = new Set([
+  'GIT_COMMAND_FAILED',
+  'GIT_COMMAND_TIMEOUT',
+  'ICON_BATCH_COMMAND_TIMEOUT',
+  'ICON_BATCH_DEPENDENCY_INSTALL_TIMEOUT',
   'WORKER_INTERRUPTED',
 ]);
 
@@ -94,7 +104,7 @@ export function canRetryBatch(batch: BatchLifecycleSnapshot): boolean {
   if (batch.state !== 'FAILED') return false;
   if (isFinalValidationFailure(batch)) return false;
   if (batch.delivery.checkpoint === 'NONE' || batch.delivery.checkpoint === 'COMMIT_PREPARED') {
-    return batch.errorCode === 'GIT_COMMAND_FAILED' || batch.errorCode === 'WORKER_INTERRUPTED';
+    return batch.errorCode !== null && prePushRetryableErrorCodes.has(batch.errorCode);
   }
   return canResumeDraftPullRequest(batch);
 }

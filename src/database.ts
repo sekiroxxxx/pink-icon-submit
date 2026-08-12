@@ -26,6 +26,9 @@ import type {
 } from './types.js';
 
 export const legacyBootstrapUserId = 'legacy-bootstrap';
+export const legacyBootstrapPendingPasswordHash = 'bootstrap-pending';
+export const disabledUserPasswordHash = 'disabled';
+export const currentSchemaVersion = 8;
 
 const createdCloneMarker: unique symbol = Symbol('created clone ownership');
 
@@ -105,6 +108,7 @@ interface ItemRow {
   reason: string | null;
   replacement_name: string | null;
   source_file: string | null;
+  client_mutation_id: string | null;
   created_at: string;
 }
 
@@ -394,13 +398,26 @@ export class BatchDatabase {
   constructor(databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
     this.db = new Database(databasePath);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('foreign_keys = ON');
-    this.migrate();
+    try {
+      this.assertSupportedSchemaVersion();
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('foreign_keys = ON');
+      this.migrate();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   close(): void {
     this.db.close();
+  }
+
+  assertReady(): void {
+    const result = this.db.prepare('SELECT 1 AS ready').get() as { ready: number };
+    if (result.ready !== 1) {
+      throw new Error('Database readiness query returned an unexpected result.');
+    }
   }
 
   createUser(input: { id: string; username: string; passwordHash: string }): AuthenticatedUser {
@@ -619,7 +636,7 @@ export class BatchDatabase {
     return update();
   }
 
-  insertItem(batchId: string, id: string, input: CreateItemInput, sourceFile: string | null): StoredItem {
+  insertItem(batchId: string, id: string, input: CreateItemInput, sourceFile: string | null, clientMutationId?: string): StoredItem {
     const insert = this.db.transaction(() => {
       const batch = this.db.prepare('SELECT state FROM batches WHERE id = ?').get(batchId) as Pick<BatchRow, 'state'> | undefined;
       if (!batch) {
@@ -632,8 +649,8 @@ export class BatchDatabase {
       const timestamp = this.nextContentRevision(batchId);
       this.db.prepare(`
         INSERT INTO items (
-          id, batch_id, action, design_name, target_name, description, reason, replacement_name, source_file, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, batch_id, action, design_name, target_name, description, reason, replacement_name, source_file, client_mutation_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         batchId,
@@ -644,6 +661,7 @@ export class BatchDatabase {
         input.reason ?? null,
         input.replacementName ?? null,
         sourceFile,
+        clientMutationId ?? null,
         timestamp,
       );
       this.clearValidationAfterDraftContentChange(batchId, timestamp);
@@ -881,20 +899,43 @@ export class BatchDatabase {
   }
 
   queueJob(batchId: string): StoredJob {
-    this.getBatch(batchId);
-    const timestamp = now();
-    this.db.prepare(`
-      INSERT INTO jobs (batch_id, state, attempt, created_at, updated_at)
-      VALUES (?, 'QUEUED', 1, ?, ?)
-      ON CONFLICT(batch_id) DO UPDATE SET
-        state = 'QUEUED',
-        attempt = jobs.attempt + 1,
-        error_code = NULL,
-        error_message = NULL,
-        updated_at = excluded.updated_at
-    `).run(batchId, timestamp, timestamp);
-    this.touchBatch(batchId, 'QUEUED');
-    return this.getJob(batchId)!;
+    const queue = this.db.transaction(() => {
+      const batch = this.getBatch(batchId);
+      const existingJob = this.getJob(batchId);
+      const initialSubmission = existingJob === null && (batch.state === 'DRAFT' || batch.state === 'READY');
+      const requeue = existingJob?.state === 'FAILED'
+        && (batch.state === 'DRAFT' || batch.state === 'READY' || batch.state === 'FAILED');
+      if (!initialSubmission && !requeue) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} cannot be queued from batch ${batch.state} and job ${existingJob?.state ?? 'missing'}.`, 409);
+      }
+
+      const timestamp = now();
+      const jobResult = initialSubmission
+        ? this.db.prepare(`
+            INSERT INTO jobs (batch_id, state, attempt, created_at, updated_at)
+            VALUES (?, 'QUEUED', 1, ?, ?)
+          `).run(batchId, timestamp, timestamp)
+        : this.db.prepare(`
+            UPDATE jobs
+            SET state = 'QUEUED', attempt = attempt + 1,
+                error_code = NULL, error_message = NULL, updated_at = ?
+            WHERE batch_id = ? AND state = 'FAILED'
+          `).run(timestamp, batchId);
+      if (jobResult.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} job changed before it could be queued.`, 409);
+      }
+
+      const batchResult = this.db.prepare(`
+        UPDATE batches
+        SET state = 'QUEUED', error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ? AND state = ?
+      `).run(timestamp, batchId, batch.state);
+      if (batchResult.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} changed before it could be queued.`, 409);
+      }
+      return this.getJob(batchId)!;
+    });
+    return queue();
   }
 
   claimNextJob(): StoredJob | null {
@@ -914,16 +955,49 @@ export class BatchDatabase {
   }
 
   completeJob(batchId: string, plan: unknown, baseCommit: string, localDiff: unknown): void {
-    const timestamp = now();
-    this.db.prepare(`
-      UPDATE jobs SET state = 'COMPLETED', error_code = NULL, error_message = NULL, updated_at = ? WHERE batch_id = ?
-    `).run(timestamp, batchId);
-    this.db.prepare(`
-      UPDATE batches
-      SET state = 'LOCAL_DIFF_READY', plan_json = ?, base_commit = ?, local_diff_json = ?,
-          error_code = NULL, error_message = NULL, updated_at = ?
-      WHERE id = ?
-    `).run(JSON.stringify(plan), baseCommit, JSON.stringify(localDiff), timestamp, batchId);
+    const complete = this.db.transaction(() => {
+      const timestamp = now();
+      const jobResult = this.db.prepare(`
+        UPDATE jobs
+        SET state = 'COMPLETED', error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE batch_id = ? AND state = 'RUNNING'
+      `).run(timestamp, batchId);
+      if (jobResult.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} does not have a running job to complete.`, 409);
+      }
+      const batchResult = this.db.prepare(`
+        UPDATE batches
+        SET state = 'LOCAL_DIFF_READY', plan_json = ?, base_commit = ?, local_diff_json = ?,
+            error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ? AND state = 'RUNNING'
+      `).run(JSON.stringify(plan), baseCommit, JSON.stringify(localDiff), timestamp, batchId);
+      if (batchResult.changes !== 1) {
+        throw new AppError('DELIVERY_STATE_CONFLICT', `Batch ${batchId} is not running and cannot complete.`, 409);
+      }
+    });
+    complete();
+  }
+
+  getItemByClientMutationId(batchId: string, clientMutationId: string): StoredItem | undefined {
+    const row = this.db.prepare(
+      'SELECT * FROM items WHERE batch_id = ? AND client_mutation_id = ?',
+    ).get(batchId, clientMutationId) as ItemRow | undefined;
+    return row ? toItem(row) : undefined;
+  }
+
+  replaceUserPasswordAndSessions(username: string, passwordHash: string): AuthenticatedUser | undefined {
+    const replace = this.db.transaction(() => {
+      const user = this.findUserByUsername(username);
+      if (!user) return undefined;
+      this.db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, user.id);
+      this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);
+      return { id: user.id, username: user.username };
+    });
+    return replace();
+  }
+
+  disableUserAndDeleteSessions(username: string): AuthenticatedUser | undefined {
+    return this.replaceUserPasswordAndSessions(username, disabledUserPasswordHash);
   }
 
   recordCommitPrepared(
@@ -1332,8 +1406,8 @@ export class BatchDatabase {
       `);
       this.db.prepare(`
         INSERT OR IGNORE INTO users (id, username, password_hash, created_at)
-        VALUES (?, 'legacy-bootstrap@internal.invalid', 'disabled', ?)
-      `).run(legacyBootstrapUserId, now());
+        VALUES (?, 'legacy-bootstrap@internal.invalid', ?, ?)
+      `).run(legacyBootstrapUserId, legacyBootstrapPendingPasswordHash, now());
       const columns = this.batchColumnNames();
       if (!columns.has('owner_id')) {
         this.db.exec('ALTER TABLE batches ADD COLUMN owner_id TEXT');
@@ -1347,6 +1421,36 @@ export class BatchDatabase {
         this.db.exec('ALTER TABLE batches ADD COLUMN clone_creation_nonce TEXT');
       }
     });
+    this.applyMigration(7, () => {
+      this.db.prepare(`
+        UPDATE users SET password_hash = ?
+        WHERE id = ? AND password_hash = ?
+      `).run(legacyBootstrapPendingPasswordHash, legacyBootstrapUserId, disabledUserPasswordHash);
+    });
+    this.applyMigration(8, () => {
+      const itemTable = this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'items'").get();
+      if (!itemTable) return;
+      const columns = this.itemColumnNames();
+      if (!columns.has('client_mutation_id')) {
+        this.db.exec('ALTER TABLE items ADD COLUMN client_mutation_id TEXT');
+      }
+      this.db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS items_batch_client_mutation_id
+        ON items(batch_id, client_mutation_id)
+        WHERE client_mutation_id IS NOT NULL;
+      `);
+    });
+  }
+
+  private assertSupportedSchemaVersion(): void {
+    const migrationTable = this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+    ).get();
+    if (!migrationTable) return;
+    const schema = this.db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number | null };
+    if (schema.version !== null && schema.version > currentSchemaVersion) {
+      throw new Error(`Database schema version ${schema.version} is newer than supported version ${currentSchemaVersion}.`);
+    }
   }
 
   private applyMigration(version: number, apply: () => void): void {
@@ -1363,6 +1467,11 @@ export class BatchDatabase {
 
   private batchColumnNames(): Set<string> {
     const columns = this.db.prepare('PRAGMA table_info(batches)').all() as Array<{ name: string }>;
+    return new Set(columns.map((column) => column.name));
+  }
+
+  private itemColumnNames(): Set<string> {
+    const columns = this.db.prepare('PRAGMA table_info(items)').all() as Array<{ name: string }>;
     return new Set(columns.map((column) => column.name));
   }
 }

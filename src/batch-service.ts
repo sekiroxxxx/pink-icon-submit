@@ -7,7 +7,7 @@ import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
 import { BatchStorage, type PublishedClone } from './storage.js';
 import { canRetryBatch, hasPostPushPullRequestRecoveryEvidence, isActiveBatch, isFinalValidationFailure, isPostPushCheckpoint, isRetryablePostPushInfrastructureFailure, lifecycleSnapshot } from './batch-lifecycle.js';
-import type { BatchDetails, BatchExecutionContext, BatchSummary, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
+import type { BatchDetails, BatchExecutionContext, BatchSummary, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
 
 const maximumBatchItems = 100;
 
@@ -109,7 +109,7 @@ export class BatchService {
       pushBranchPrefix: null,
     },
   ) {
-    this.catalog = new CatalogSnapshotCache(repository, iconBatch, catalogOptions);
+    this.catalog = new CatalogSnapshotCache(catalogOptions);
   }
 
   get uploadLimit(): number {
@@ -161,19 +161,26 @@ export class BatchService {
     });
   }
 
-  async addItem(batchId: string, input: CreateItemInput, svg: Buffer | undefined, ownerId?: string): Promise<StoredItem> {
+  async addItem(batchId: string, input: CreateItemInput, svg: Buffer | undefined, ownerId?: string, clientMutationId?: string): Promise<StoredItem> {
     this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
     return this.withBatchLock(batchId, async () => {
       this.assertOwner(batchId, ownerId);
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+      const normalized = await this.normalizeItemInput(batchId, input, svg);
+      if (clientMutationId) {
+        const existing = this.database.getItemByClientMutationId(batchId, clientMutationId);
+        if (existing) {
+          await this.assertMatchingMutation(existing, normalized, svg);
+          return existing;
+        }
+      }
       if (this.database.countItems(batchId) >= maximumBatchItems) {
         throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
       }
-      const normalized = await this.normalizeItemInput(batchId, input, svg);
       const itemId = createItemId();
       const sourceFile = svg ? await this.saveSvg(batchId, itemId, svg) : null;
-      return this.database.insertItem(batchId, itemId, normalized, sourceFile);
+      return this.database.insertItem(batchId, itemId, normalized, sourceFile, clientMutationId);
     });
   }
 
@@ -242,75 +249,95 @@ export class BatchService {
     return this.catalog.page(input);
   }
 
-  previewName(input: string): Promise<IconNamePreview> {
-    return this.catalog.previewName(requiredIconName(input, 'name'));
-  }
-
   async getCatalogIconSvg(name: string): Promise<Buffer> {
     return this.catalog.svg(requiredIconName(name, 'icon name'));
   }
 
-  submit(batchId: string, confirmRepeatedSubmission = false, ownerId?: string): BatchDetails {
+  async submit(batchId: string, confirmRepeatedSubmission = false, ownerId?: string): Promise<BatchDetails> {
     this.assertOwner(batchId, ownerId);
-    const batch = this.database.getBatch(batchId);
-    if (batch.state === 'DRAFT') {
-      this.assertLocallySubmittable(batchId);
-      if (this.database.requiresRepeatedSubmissionConfirmation(batchId) && !confirmRepeatedSubmission) {
-        throw new AppError('REPEATED_SUBMISSION_CONFIRMATION_REQUIRED', 'This batch has not changed since its final validation failed. Confirm before submitting it unchanged.', 409);
+    return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
+      const batch = this.database.getBatch(batchId);
+      if (batch.state === 'DRAFT') {
+        this.assertLocallySubmittable(batchId);
+        if (this.database.requiresRepeatedSubmissionConfirmation(batchId) && !confirmRepeatedSubmission) {
+          throw new AppError('REPEATED_SUBMISSION_CONFIRMATION_REQUIRED', 'This batch has not changed since its final validation failed. Confirm before submitting it unchanged.', 409);
+        }
+        this.database.queueJob(batchId);
+        return this.database.getDetails(batchId);
+      }
+      if (batch.state === 'READY' && validationIsValid(batch.validation)) {
+        this.database.queueJob(batchId);
+        return this.database.getDetails(batchId);
+      }
+      if (batch.state === 'READY') {
+        throw new AppError('BATCH_NOT_READY', 'The legacy READY batch no longer has a successful validation.', 409);
+      }
+      if (batch.state === 'FAILED') {
+        throw new AppError('BATCH_RETRY_REQUIRED', `Batch ${batchId} failed and must use its recovery action.`, 409);
+      }
+      throw new AppError('BATCH_NOT_SUBMITTABLE', `Batch ${batchId} is ${batch.state}.`, 409);
+    });
+  }
+
+  private async assertMatchingMutation(existing: StoredItem, input: CreateItemInput, svg: Buffer | undefined): Promise<void> {
+    const sameInput = existing.action === input.action
+      && existing.designName === input.designName
+      && existing.targetName === input.targetName
+      && existing.description === input.description
+      && existing.reason === input.reason
+      && existing.replacementName === input.replacementName;
+    const sameSvg = existing.sourceFile
+      ? svg !== undefined && (await this.storage.readSvg(existing.batchId, existing.sourceFile)).equals(svg)
+      : svg === undefined;
+    if (!sameInput || !sameSvg) {
+      throw new AppError('ITEM_MUTATION_CONFLICT', '同一写入标识不能用于不同的图标变更。', 409);
+    }
+  }
+
+  async returnToEdit(batchId: string, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
+    return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
+      const batch = this.database.getBatch(batchId);
+      if (!isFinalValidationFailure(lifecycleSnapshot(batch))) {
+        throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} cannot return to editing from its current delivery state.`, 409);
+      }
+      this.database.returnToDraftForEditing(batchId);
+      return this.database.getDetails(batchId);
+    });
+  }
+
+  async retry(batchId: string, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
+    return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
+      const batch = this.database.getBatch(batchId);
+      const failureCode = batch.error?.code ?? this.database.getDetails(batchId).job?.error?.code ?? null;
+      const retrySnapshot = { ...lifecycleSnapshot(batch), errorCode: failureCode };
+      if (batch.state !== 'FAILED') {
+        throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is ${batch.state}.`, 409);
+      }
+      if (isFinalValidationFailure(retrySnapshot)) {
+        throw new AppError('BATCH_RETURN_TO_EDIT_REQUIRED', 'A final validation failure must be corrected in the editor before delivery can be retried.', 409);
+      }
+      if (!['NONE', 'COMMIT_PREPARED', 'BRANCH_PUSHED', 'PR_CREATING'].includes(batch.delivery.checkpoint)) {
+        throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is already handed off.`, 409);
+      }
+      if (isPostPushCheckpoint(batch.delivery.checkpoint)) {
+        if (!isRetryablePostPushInfrastructureFailure(failureCode)) {
+          throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} cannot retry Draft PR creation after ${failureCode ?? 'an unknown failure'}.`, 409);
+        }
+        if (!hasPostPushPullRequestRecoveryEvidence(retrySnapshot)) {
+          throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is missing the persisted branch, commit, or base evidence required to recover its Draft PR.`, 409);
+        }
+      }
+      if (!canRetryBatch(retrySnapshot)) {
+        throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} cannot be retried from its current delivery state.`, 409);
       }
       this.database.queueJob(batchId);
       return this.database.getDetails(batchId);
-    }
-    if (batch.state === 'READY' && validationIsValid(batch.validation)) {
-      this.database.queueJob(batchId);
-      return this.database.getDetails(batchId);
-    }
-    if (batch.state === 'READY') {
-      throw new AppError('BATCH_NOT_READY', 'The legacy READY batch no longer has a successful validation.', 409);
-    }
-    if (batch.state === 'FAILED') {
-      throw new AppError('BATCH_RETRY_REQUIRED', `Batch ${batchId} failed and must use its recovery action.`, 409);
-    }
-    throw new AppError('BATCH_NOT_SUBMITTABLE', `Batch ${batchId} is ${batch.state}.`, 409);
-  }
-
-  returnToEdit(batchId: string, ownerId?: string): BatchDetails {
-    this.assertOwner(batchId, ownerId);
-    const batch = this.database.getBatch(batchId);
-    if (!isFinalValidationFailure(lifecycleSnapshot(batch))) {
-      throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} cannot return to editing from its current delivery state.`, 409);
-    }
-    this.database.returnToDraftForEditing(batchId);
-    return this.database.getDetails(batchId);
-  }
-
-  retry(batchId: string, ownerId?: string): BatchDetails {
-    this.assertOwner(batchId, ownerId);
-    const batch = this.database.getBatch(batchId);
-    const failureCode = batch.error?.code ?? this.database.getDetails(batchId).job?.error?.code ?? null;
-    const retrySnapshot = { ...lifecycleSnapshot(batch), errorCode: failureCode };
-    if (batch.state !== 'FAILED') {
-      throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is ${batch.state}.`, 409);
-    }
-    if (isFinalValidationFailure(retrySnapshot)) {
-      throw new AppError('BATCH_RETURN_TO_EDIT_REQUIRED', 'A final validation failure must be corrected in the editor before delivery can be retried.', 409);
-    }
-    if (!['NONE', 'COMMIT_PREPARED', 'BRANCH_PUSHED', 'PR_CREATING'].includes(batch.delivery.checkpoint)) {
-      throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is already handed off.`, 409);
-    }
-    if (isPostPushCheckpoint(batch.delivery.checkpoint)) {
-      if (!isRetryablePostPushInfrastructureFailure(failureCode)) {
-        throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} cannot retry Draft PR creation after ${failureCode ?? 'an unknown failure'}.`, 409);
-      }
-      if (!hasPostPushPullRequestRecoveryEvidence(retrySnapshot)) {
-        throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is missing the persisted branch, commit, or base evidence required to recover its Draft PR.`, 409);
-      }
-    }
-    if (!canRetryBatch(retrySnapshot)) {
-      throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} cannot be retried from its current delivery state.`, 409);
-    }
-    this.database.queueJob(batchId);
-    return this.database.getDetails(batchId);
+    });
   }
 
   getBatch(batchId: string, ownerId?: string): BatchDetails {

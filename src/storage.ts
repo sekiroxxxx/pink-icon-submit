@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { join, relative, resolve } from 'node:path';
 
 import { AppError } from './errors.js';
@@ -10,7 +11,7 @@ export class BatchStorage {
   constructor(private readonly rootDirectory: string) {}
 
   async saveSvg(batchId: string, itemId: string, content: Buffer): Promise<string> {
-    const relativePath = `uploads/${itemId}.svg`;
+    const relativePath = `uploads/${itemId}-${randomUUID()}.svg`;
     const outputPath = this.resolveBatchPath(batchId, relativePath);
     await mkdir(resolve(outputPath, '..'), { recursive: true });
     await writeFile(outputPath, content);
@@ -20,6 +21,10 @@ export class BatchStorage {
   async copySvg(sourceBatchId: string, sourceFile: string, targetBatchId: string, targetItemId: string): Promise<string> {
     const content = await readFile(this.resolveBatchPath(sourceBatchId, sourceFile));
     return this.saveSvg(targetBatchId, targetItemId, content);
+  }
+
+  async readSvg(batchId: string, sourceFile: string): Promise<Buffer> {
+    return readFile(this.resolveBatchPath(batchId, sourceFile));
   }
 
   /**

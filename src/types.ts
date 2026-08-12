@@ -163,6 +163,8 @@ export interface AppConfig {
   workerPollIntervalMs: number;
   /** Explicit cookie transport policy; never inferred from NODE_ENV. */
   sessionCookieSecure: boolean;
+  /** Canonical browser origin used for CSRF checks behind an HTTPS reverse proxy. */
+  publicOrigin?: string;
   maxUploadBytes: number;
   bootstrapUser?: BootstrapUserCredentials;
 }
@@ -263,16 +265,4 @@ export interface CatalogPage {
   pageSize: number;
   total: number;
   icons: CatalogPageIcon[];
-}
-
-export interface IconNamePreview {
-  schemaVersion: 1;
-  baseCommit: string;
-  input: string;
-  normalizedName: string;
-  valid: boolean;
-  collision: {
-    primaryName: string;
-    aliases: string[];
-  } | null;
 }
