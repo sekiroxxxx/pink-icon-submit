@@ -541,7 +541,7 @@ test('a final validation failure shows Chinese diagnostics and can return to edi
 
   await screen.findByRole('heading', { name: '需要修改' });
   expect(screen.getByText('本次变更 1 项')).toBeTruthy();
-  expect(screen.getByText('已上传：item-1.svg')).toBeTruthy();
+  expect(screen.getByText('SVG 已保存')).toBeTruthy();
   expect(screen.getByText('图标包含多种颜色')).toBeTruthy();
   expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-INVALID/return-to-edit', { method: 'POST' });
 });
@@ -569,7 +569,7 @@ test('a refreshed DRAFT batch restores server items as removable changes', async
   await openActiveWorkbench(user, '继续编辑');
 
   await screen.findByText('本次变更 1 项');
-  expect(screen.getByText('已上传：item-restore.svg')).toBeTruthy();
+  expect(screen.getByText('SVG 已保存')).toBeTruthy();
   expect((screen.getByRole('button', { name: '确认本次变更' }) as HTMLButtonElement).disabled).toBe(false);
   await user.click(screen.getByRole('button', { name: '移除 pink-restored-icon' }));
 
@@ -1125,6 +1125,36 @@ test('a historical DRAFT record is read-only and never becomes the browser activ
   expect((screen.getByRole('button', { name: '确认本次变更' }) as HTMLButtonElement).disabled).toBe(true);
 });
 
+test('a historical item without SVG content hides internal upload paths and uses a preview placeholder', async () => {
+  saveProfile();
+  const historical = batch({
+    id: 'ICON-HISTORY-NO-SVG',
+    title: '历史新增图标',
+    items: [{
+      id: 'item-history-no-svg',
+      batchId: 'ICON-HISTORY-NO-SVG',
+      action: 'add',
+      designName: 'pink-history-icon',
+      description: '历史记录不再保存可渲染 SVG 内容。',
+      sourceFile: 'uploads/item-history-no-svg-4b10a4c8.svg',
+    }],
+  });
+  const fetchMock = vi.fn((path: string) => {
+    if (path === `/api/batches/${historical.id}`) return Promise.resolve(jsonResponse(historical));
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  stubFetch(fetchMock, [summary({ id: historical.id, title: historical.title })]);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await user.click(await screen.findByRole('button', { name: '查看' }));
+
+  expect(await screen.findByText('历史记录暂不提供 SVG 预览')).toBeTruthy();
+  expect(screen.getByText('新增 · pink-history-icon')).toBeTruthy();
+  expect(screen.queryByText(/uploads\/item-history-no-svg/)).toBeNull();
+  expect(document.querySelector('.change-card.no-preview')).toBeTruthy();
+  expect(document.querySelector('.change-card img')).toBeNull();
+});
 test('leaving a workbench clears local SVG and catalog selection state before a legal new batch', async () => {
   saveProfile();
   const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
@@ -1206,7 +1236,7 @@ test('server active-batch recovery ignores a stale browser activity preference',
   render(<App />);
   await screen.findAllByRole('button', { name: '继续编辑' });
   await openActiveWorkbench(user, '继续编辑');
-  await screen.findByText('已上传：item-server-active.svg');
+  await screen.findByText('SVG 已保存');
   expect(fetchMock).not.toHaveBeenCalledWith('/api/batches/ICON-STALE-BROWSER-PREFERENCE', {});
 });
 
@@ -1312,7 +1342,7 @@ test('returning a final-validation failure restores saved metadata and server it
   render(<App />);
   await openActiveWorkbench(user, '返回修改');
   await screen.findByRole('heading', { name: '需要修改' });
-  expect(screen.getByText('已上传：item-return-edit.svg')).toBeTruthy();
+  expect(screen.getByText('SVG 已保存')).toBeTruthy();
   await user.click(screen.getByRole('button', { name: '确认本次变更' }));
   expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(draft.title);
   expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(draft.description);
@@ -1322,7 +1352,7 @@ test('returning a final-validation failure restores saved metadata and server it
   await user.click(screen.getByRole('button', { name: '返回首页' }));
   await screen.findByRole('heading', { name: '把图标设计交给开发审核' });
   await openActiveWorkbench(user, '继续编辑');
-  await screen.findByText('已上传：item-return-edit.svg');
+  await screen.findByText('SVG 已保存');
   await user.click(screen.getByRole('button', { name: '确认本次变更' }));
   expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(draft.title);
   expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(draft.description);
@@ -1346,7 +1376,7 @@ test('an active DRAFT restores its saved form and items after a home round trip'
 
   render(<App />);
   await openActiveWorkbench(user, '继续编辑');
-  await screen.findByText('已上传：item-draft-round-trip.svg');
+  await screen.findByText('SVG 已保存');
   await user.click(screen.getByRole('button', { name: '确认本次变更' }));
   expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(active.title);
   expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(active.description);
@@ -1356,7 +1386,7 @@ test('an active DRAFT restores its saved form and items after a home round trip'
   await user.click(screen.getByRole('button', { name: '返回首页' }));
   await screen.findByRole('heading', { name: '把图标设计交给开发审核' });
   await openActiveWorkbench(user, '继续编辑');
-  await screen.findByText('已上传：item-draft-round-trip.svg');
+  await screen.findByText('SVG 已保存');
   await user.click(screen.getByRole('button', { name: '确认本次变更' }));
   expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(active.title);
   expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(active.description);
@@ -1400,7 +1430,7 @@ test('a direct blank workbench route restores the active batch from this browser
   const user = userEvent.setup();
 
   render(<App />);
-  await screen.findByText('已上传：item-direct-active.svg');
+  await screen.findByText('SVG 已保存');
   await user.click(screen.getByRole('button', { name: '确认本次变更' }));
   expect((screen.getByLabelText(/^本次变更标题/) as HTMLInputElement).value).toBe(active.title);
   expect((screen.getByLabelText(/^整体需求说明/) as HTMLTextAreaElement).value).toBe(active.description);

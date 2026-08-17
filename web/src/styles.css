@@ -170,6 +170,7 @@ textarea { min-height: 76px; resize: vertical; }
 .change-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; margin-top: 14px; }
 .change-card { position: relative; display: grid; min-height: 70px; grid-template-columns: 48px 21px 48px 1fr; align-items: center; gap: 8px; border: 1px solid #f0d8df; border-radius: 10px; padding: 10px; background: #fffbfc; }
 .change-card.add, .change-card.delete { grid-template-columns: 48px 1fr; }
+.change-card.no-preview { grid-template-columns: minmax(0, 1fr); }
 .change-card > img, .change-card .change-preview { width: 48px; height: 48px; border: 1px solid #f0d8df; border-radius: 7px; padding: 6px; background: #fff; object-fit: contain; }
 .change-arrow { color: var(--brand-strong); font-weight: 900; text-align: center; }
 .change-card > span:not(.change-arrow):last-of-type { min-width: 0; }

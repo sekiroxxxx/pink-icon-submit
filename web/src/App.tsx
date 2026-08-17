@@ -174,10 +174,6 @@ function reconcileDraftChanges(batch: Pick<BatchDetails, 'items'>, currentChange
   return [...reconciled, ...restoredByServerId.values()];
 }
 
-function sourceFileLabel(sourceFile: string): string {
-  return sourceFile.split(/[\\/]/).at(-1) ?? sourceFile;
-}
-
 function localNameIssue(value: string): string | undefined {
   const trimmed = value.trim();
   if (!trimmed) return '请填写期望图标名称。';
@@ -471,21 +467,29 @@ function SvgQueue({ pending, activeSvgId, disabled, error, onQueue, onActivate, 
   );
 }
 
-function ChangeCard({ change, disabled, onRemove }: { change: DraftChange; disabled: boolean; onRemove: () => void }) {
+function ChangeCard({ change, disabled, historical = false, onRemove }: { change: DraftChange; disabled: boolean; historical?: boolean; onRemove: () => void }) {
   const label = { add: '新增', replace: '替换', delete: '删除' }[change.action];
-  const uploadedFile = change.svg?.file.name ?? (change.uploadedSourceFile ? sourceFileLabel(change.uploadedSourceFile) : undefined);
+  const historicalPreviewUnavailable = historical && !change.svg;
+  const currentIcon = !historicalPreviewUnavailable ? change.target?.svg : undefined;
+  const itemName = change.action === 'add' ? change.designName : change.target?.primaryName;
+  const description = historicalPreviewUnavailable
+    ? '历史记录暂不提供 SVG 预览'
+    : change.action === 'delete'
+      ? '将从图标仓库移除'
+      : change.svg
+        ? `已上传：${change.svg.file.name}`
+        : 'SVG 已保存';
   return (
-    <article className={`change-card ${change.action}`}>
-      {change.action === 'replace' && change.target?.svg && <img src={svgPreviewUrl(change.target.svg)} alt={`${change.target.primaryName} 当前图标`} />}
-      {change.action === 'replace' && <span className="change-arrow">→</span>}
+    <article className={`change-card ${change.action}${historicalPreviewUnavailable ? ' no-preview' : ''}`}>
+      {change.action === 'replace' && currentIcon && <img src={svgPreviewUrl(currentIcon)} alt={`${itemName} 当前图标`} />}
+      {change.action === 'replace' && currentIcon && change.svg && <span className="change-arrow">→</span>}
       {change.svg && <SvgPreview svg={change.svg} alt={`${change.svg.file.name} 预览`} className="change-preview" />}
-      {change.action === 'delete' && change.target?.svg && <img src={svgPreviewUrl(change.target.svg)} alt={`${change.target.primaryName} 当前图标`} />}
-      <span><strong>{label} · {change.action === 'add' ? change.designName : change.target?.primaryName}</strong><small>{change.action === 'delete' ? '将从图标仓库移除' : uploadedFile ? `已上传：${uploadedFile}` : 'SVG 将在提交时上传'}</small></span>
-      <button type="button" disabled={disabled} onClick={onRemove} aria-label={`移除 ${change.action === 'add' ? change.designName : change.target?.primaryName}`}>×</button>
+      {change.action === 'delete' && currentIcon && <img src={svgPreviewUrl(currentIcon)} alt={`${itemName} 当前图标`} />}
+      <span><strong>{label} · {itemName}</strong><small>{description}</small></span>
+      <button type="button" disabled={disabled} onClick={onRemove} aria-label={`移除 ${itemName}`}>×</button>
     </article>
   );
 }
-
 function DiagnosticList({ title, diagnostics, tone, items }: { title: string; diagnostics: Diagnostic[]; tone: 'error' | 'warning'; items: ApiItem[] }) {
   if (diagnostics.length === 0) return null;
   return (
@@ -1808,7 +1812,7 @@ export function App() {
           <div className="composer-actions"><span>加入队列后会立即保存为账号草稿；确认提交前不会进入图标仓库。</span><button className="button primary" type="button" disabled={!editable || busy} onClick={() => void addChange()}>加入{({ add: '新增', replace: '替换', delete: '删除' })[action]}队列</button></div>
         </section>
 
-        <section className="changes-card" aria-label="本次变更"><div><h2>本次变更 {changes.length} 项</h2><p>{changes.length === 0 ? '把一项操作加入队列后，会在这里同时显示所有待改动图标。' : '确认前可移除任何一项变更。'}</p></div><div className="change-list">{changes.map((change) => <ChangeCard key={change.clientId} change={change} disabled={!editable || busy} onRemove={() => void removeChange(change)} />)}</div><div className="changes-actions"><button className="button primary" type="button" disabled={!editable || busy || changes.length === 0} onClick={() => { setReviewErrors({}); setReviewOpen(true); }}>确认本次变更</button></div></section>
+        <section className="changes-card" aria-label="本次变更"><div><h2>本次变更 {changes.length} 项</h2><p>{changes.length === 0 ? '把一项操作加入队列后，会在这里同时显示所有待改动图标。' : '确认前可移除任何一项变更。'}</p></div><div className="change-list">{changes.map((change) => <ChangeCard key={change.clientId} change={change} disabled={!editable || busy} historical={!viewingActiveBatch} onRemove={() => void removeChange(change)} />)}</div><div className="changes-actions"><button className="button primary" type="button" disabled={!editable || busy || changes.length === 0} onClick={() => { setReviewErrors({}); setReviewOpen(true); }}>确认本次变更</button></div></section>
 
         {batch && batch.userStatus === 'needs_changes' && batch.validation?.valid === false && <DiagnosticList title="需要修正的问题" diagnostics={batch.validation.errors} tone="error" items={batch.items} />}
       </main>}
