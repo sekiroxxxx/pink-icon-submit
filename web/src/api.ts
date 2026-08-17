@@ -71,6 +71,9 @@ export interface BatchDetails extends BatchInput {
     handoffAt: string | null;
   };
   error: { code: string; message: string } | null;
+  job: {
+    state: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+  } | null;
   userStatus: UserBatchStatus;
   /** Whether the server has confirmed that this batch can be abandoned without Git delivery side effects. */
   canAbandon?: boolean;

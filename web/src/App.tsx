@@ -729,9 +729,23 @@ function DeliveryStatusCard({
   } else if (batch.state === 'VALIDATING' || (batch.state === 'RUNNING' && !batch.validation)) {
     headline = '正在最终校验';
     description = '正在按最新提交内容执行最终校验。';
-  } else if (batch.state === 'RUNNING' || ['COMMIT_PREPARED', 'BRANCH_PUSHED', 'PR_CREATING'].includes(batch.state)) {
-    headline = '正在交付';
-    description = '最终校验已通过，正在准备交付结果。';
+  } else if (batch.state === 'RUNNING') {
+    headline = batch.executionMode === 'remote' ? '正在生成交付 commit' : '正在准备交付结果';
+    description = batch.executionMode === 'remote'
+      ? '最终校验已通过，正在生成本次交付 commit。'
+      : '最终校验已通过，正在准备本次交付结果。';
+  } else if (batch.state === 'COMMIT_PREPARED') {
+    headline = '正在推送交付分支';
+    description = '已生成交付 commit，正在推送专用分支。';
+  } else if (batch.state === 'BRANCH_PUSHED' && batch.job?.state === 'RUNNING') {
+    headline = '分支已推送，正在创建 Draft PR';
+    description = '图标变更已推送，正在创建 Draft PR。';
+  } else if (batch.state === 'BRANCH_PUSHED') {
+    headline = '分支已推送';
+    description = '交付分支已推送；当前批次尚未创建 Draft PR。';
+  } else if (batch.state === 'PR_CREATING') {
+    headline = 'Draft PR 创建中';
+    description = '正在向 GitHub 创建 Draft PR；请勿重复提交。';
   } else if (batch.state === 'READY') {
     headline = '已提交';
     description = '正在等待继续交付。';

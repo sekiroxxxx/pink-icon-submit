@@ -51,6 +51,7 @@ function batch(overrides: Partial<BatchDetails> = {}): BatchDetails {
     localDiff: null,
     delivery: delivery(),
     error: null,
+    job: null,
     userStatus: 'draft',
     createdAt: '2026-08-10T00:00:00.000Z',
     ...overrides,
@@ -996,25 +997,24 @@ test('a restored local result never promises a Draft PR', async () => {
   expect(screen.queryByText('正在创建 Draft PR')).toBeNull();
 });
 
-test('a restored remote branch checkpoint reports delivery progress without exposing branch internals', async () => {
+test.each([
+  ['生成 commit', batch({ id: 'ICON-COMMITTING', executionMode: 'remote', state: 'RUNNING', validation: { valid: true, errors: [], warnings: [] }, job: { state: 'RUNNING' } }), '正在生成交付 commit', '最终校验已通过，正在生成本次交付 commit。'],
+  ['推送分支', batch({ id: 'ICON-PUSHING', executionMode: 'remote', state: 'COMMIT_PREPARED', delivery: delivery({ checkpoint: 'COMMIT_PREPARED', branch: 'bot/ICON-PUSHING', commitSha: 'a'.repeat(40) }), job: { state: 'RUNNING' } }), '正在推送交付分支', '已生成交付 commit，正在推送专用分支。'],
+  ['创建 Draft PR 前', batch({ id: 'ICON-BRANCH', executionMode: 'remote', state: 'BRANCH_PUSHED', delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: 'bot/ICON-BRANCH', commitSha: 'a'.repeat(40) }), job: { state: 'RUNNING' } }), '分支已推送，正在创建 Draft PR', '图标变更已推送，正在创建 Draft PR。'],
+  ['创建 Draft PR', batch({ id: 'ICON-PR-CREATING', executionMode: 'remote', state: 'PR_CREATING', delivery: delivery({ checkpoint: 'PR_CREATING', branch: 'bot/ICON-PR-CREATING', commitSha: 'a'.repeat(40) }), job: { state: 'RUNNING' } }), 'Draft PR 创建中', '正在向 GitHub 创建 Draft PR；请勿重复提交。'],
+  ['只交付分支', batch({ id: 'ICON-BRANCH-COMPLETE', executionMode: 'remote', state: 'BRANCH_PUSHED', delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: 'bot/ICON-BRANCH-COMPLETE', commitSha: 'a'.repeat(40) }), job: { state: 'COMPLETED' } }), '分支已推送', '交付分支已推送；当前批次尚未创建 Draft PR。'],
+])('a remote delivery checkpoint shows the specific user-facing stage: %s', async (_name, inProgress, headline, description) => {
   saveProfile();
-  const inProgress = batch({
-    id: 'ICON-BRANCH',
-    executionMode: 'remote',
-    state: 'BRANCH_PUSHED',
-    validation: { valid: true, errors: [], warnings: [] },
-    delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: 'bot/ICON-BRANCH', commitSha: 'a'.repeat(40) }),
-  });
   stubFetch(vi.fn(() => Promise.resolve(jsonResponse(inProgress))), [], inProgress);
   const user = userEvent.setup();
 
   render(<App />);
   await openActiveWorkbench(user, '查看处理中');
 
-  await screen.findByRole('heading', { name: '正在交付' });
-  expect(screen.queryByText(/bot\/ICON-BRANCH/)).toBeNull();
+  await screen.findByRole('heading', { name: headline });
+  expect(screen.getByText(description)).toBeTruthy();
+  expect(screen.queryByText(/bot\/ICON/)).toBeNull();
 });
-
 test('a restored PR-created batch shows the Draft PR handoff link', async () => {
   saveProfile();
   window.history.replaceState({}, '', '/workbench?batch=ICON-PR');
