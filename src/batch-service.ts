@@ -340,6 +340,15 @@ export class BatchService {
     });
   }
 
+  async abandon(batchId: string, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
+    return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
+      this.database.abandonBatch(batchId);
+      return this.database.getDetails(batchId);
+    });
+  }
+
   getBatch(batchId: string, ownerId?: string): BatchDetails {
     return ownerId === undefined ? this.database.getDetails(batchId) : this.database.getDetailsForOwner(batchId, ownerId);
   }

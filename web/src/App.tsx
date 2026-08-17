@@ -548,6 +548,7 @@ function statusLabel(status: UserBatchStatus): string {
     developer_attention: '需要开发处理',
     submitted_review: '已提交开发审核',
     local_complete: '本地预览已完成',
+    abandoned: '已放弃',
   }[status];
 }
 
@@ -662,6 +663,7 @@ function DeliveryStatusCard({
   onReturnToEdit,
   onRetry,
   onClone,
+  onAbandon,
   onConfirmRepeatedSubmission,
 }: {
   batch: BatchDetails;
@@ -672,6 +674,7 @@ function DeliveryStatusCard({
   onReturnToEdit: () => void;
   onRetry: () => void;
   onClone: () => void;
+  onAbandon: () => void;
   onConfirmRepeatedSubmission: () => void;
 }) {
   const finalValidationFailure = isFinalValidationFailure(batch);
@@ -688,7 +691,10 @@ function DeliveryStatusCard({
   let headline = '本次交付尚未提交';
   let description = '你可以继续编辑本次变更，然后确认提交。';
 
-  if (draftPr || batch.state === 'PR_CREATED') {
+  if (batch.state === 'ABANDONED') {
+    headline = '本次变更已放弃';
+    description = '未创建 commit、push 或 Draft PR。设计记录保留在历史中，仅供查看。';
+  } else if (draftPr || batch.state === 'PR_CREATED') {
     headline = 'Draft PR 已创建';
     description = '已交给开发审核和接管；平台不会再写入这次交付。';
   } else if (localResult) {
@@ -740,7 +746,8 @@ function DeliveryStatusCard({
       )}
       {finalValidationFailure && !readOnly && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onReturnToEdit}>返回编辑并修正</button></div>}
       {batch.state === 'FAILED' && canRetryDelivery(batch) && (!draftPullRequestRecoveryFailure || canResumeDraftPr) && !readOnly && <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onRetry}>{canResumeDraftPr ? '重新尝试创建 Draft PR' : '重新尝试交付'}</button></div>}
-      {cloneableTerminal && <div className="post-validation-actions"><button className="button secondary" type="button" disabled={busy} onClick={onClone}>基于此新建批次</button></div>}
+      {cloneableTerminal && !readOnly && <div className="post-validation-actions"><button className="button secondary" type="button" disabled={busy} onClick={onClone}>基于此新建批次</button></div>}
+      {batch.canAbandon === true && !readOnly && <div className="post-validation-actions"><button className="button secondary" type="button" disabled={busy} onClick={onAbandon}>放弃未交付批次</button></div>}
       {repeatedSubmissionConfirmation && batch.state === 'DRAFT' && !readOnly && (
         <div className="post-validation-actions"><button className="button primary" type="button" disabled={busy} onClick={onConfirmRepeatedSubmission}>仍要按原内容再次提交</button></div>
       )}
@@ -820,6 +827,7 @@ export function App() {
   const liveSvgDrafts = useRef(new Map<string, SvgDraft>());
   const previousView = useRef<AppView>(view);
   const workbenchHydrationVersion = useRef(0);
+  const pollingVersion = useRef(0);
   const authGeneration = useRef(0);
   const activeBatchIdRef = useRef<string | undefined>(activeBatchId);
   const lastReconciledWorkbenchPath = useRef<string | undefined>(undefined);
@@ -938,7 +946,7 @@ export function App() {
 
   const hydrateWorkbenchBatch = useCallback(async (
     batchId: string,
-    options: { notice?: string; busy?: boolean } = {},
+    options: { notice?: string | ((restored: BatchDetails) => string | undefined); busy?: boolean } = {},
   ): Promise<BatchDetails | undefined> => {
     const hydrationVersion = workbenchHydrationVersion.current + 1;
     workbenchHydrationVersion.current = hydrationVersion;
@@ -946,7 +954,7 @@ export function App() {
     try {
       const restored = await api.getBatch(batchId);
       if (workbenchHydrationVersion.current !== hydrationVersion) return undefined;
-      hydrateWorkbenchFromDetails(restored, options.notice);
+      hydrateWorkbenchFromDetails(restored, typeof options.notice === 'function' ? options.notice(restored) : options.notice);
       return restored;
     } catch (error) {
       if (workbenchHydrationVersion.current !== hydrationVersion) return undefined;
@@ -1109,7 +1117,9 @@ export function App() {
     const openingHistory = Boolean(requestedBatchId && activeBatchId !== requestedBatchId);
     void hydrateWorkbenchBatch(batchId, {
       busy: true,
-      notice: openingHistory ? '正在查看历史批次。' : '已恢复本次交付状态。',
+      notice: openingHistory
+        ? (restored) => (restored.state === 'ABANDONED' ? undefined : '正在查看历史批次。')
+        : '已恢复本次交付状态。',
     })
       .then((restored) => {
         if (cancelled || !restored) return;
@@ -1141,22 +1151,32 @@ export function App() {
   useEffect(() => {
     const requiresPolling = Boolean(batch && activeBatchId === batch.id && batchStatus(batch) === 'processing');
     if (!requiresPolling || !batch) return undefined;
+    const batchId = batch.id;
+    const pollingSession = pollingVersion.current + 1;
+    pollingVersion.current = pollingSession;
     const timer = window.setInterval(() => {
-      const pollVersion = workbenchHydrationVersion.current + 1;
-      workbenchHydrationVersion.current = pollVersion;
-      const batchId = batch.id;
+      const requestPollingVersion = pollingVersion.current + 1;
+      pollingVersion.current = requestPollingVersion;
+      const expectedHydrationVersion = workbenchHydrationVersion.current;
       void api.getBatch(batchId)
         .then((refreshed) => {
-          if (workbenchHydrationVersion.current !== pollVersion || activeBatchIdRef.current !== batchId) return;
+          if (pollingVersion.current !== requestPollingVersion
+            || workbenchHydrationVersion.current !== expectedHydrationVersion
+            || activeBatchIdRef.current !== batchId) return;
           setBatch(refreshed);
         })
         .catch((error: unknown) => {
-          if (workbenchHydrationVersion.current === pollVersion && activeBatchIdRef.current === batchId) {
+          if (pollingVersion.current === requestPollingVersion
+            && workbenchHydrationVersion.current === expectedHydrationVersion
+            && activeBatchIdRef.current === batchId) {
             setNotice(error instanceof Error ? error.message : '无法刷新批次状态。');
           }
         });
     }, 1_500);
-    return () => window.clearInterval(timer);
+    return () => {
+      if (pollingVersion.current === pollingSession) pollingVersion.current += 1;
+      window.clearInterval(timer);
+    };
   }, [activeBatchId, batch]);
 
   const selectAction = (nextAction: ItemAction) => {
@@ -1518,6 +1538,60 @@ export function App() {
     }
   };
 
+  const abandon = async () => {
+    if (!batch || !viewingActiveBatch || batch.canAbandon !== true) return;
+    if (!window.confirm('放弃本次未交付批次？\n\n系统将停止继续交付此批次。系统已确认本次尚未创建 commit、push 或 Draft PR；设计记录会保留在历史中。\n\n放弃后可以重新创建图标变更，此操作无法恢复。')) return;
+
+    const operationBatchId = batch.id;
+    const operationAuthGeneration = authGeneration.current;
+    const operationHydrationVersion = workbenchHydrationVersion.current + 1;
+    workbenchHydrationVersion.current = operationHydrationVersion;
+    pollingVersion.current += 1;
+    setBusy(true);
+
+    const isCurrentOperation = () => authGeneration.current === operationAuthGeneration
+      && activeBatchIdRef.current === operationBatchId
+      && workbenchHydrationVersion.current === operationHydrationVersion;
+
+    try {
+      const abandoned = await api.abandonBatch(operationBatchId);
+      if (!isCurrentOperation()) return;
+
+      // Complete while this operation still owns the current active batch; navigation invalidates stale polling afterwards.
+      setBusy(false);
+      lastReconciledWorkbenchPath.current = undefined;
+      resetWorkbenchTransientState();
+      setBrowserActiveBatch(undefined);
+      setBatch(abandoned);
+      setNotice('已放弃未交付批次，可以重新创建图标变更。');
+      navigate({ view: 'home' });
+      void refreshBatchSummaries();
+    } catch (error) {
+      if (!isCurrentOperation()) return;
+
+      if (error instanceof ApiError && error.code === 'BATCH_NOT_ABANDONABLE') {
+        try {
+          const refreshed = await api.getBatch(operationBatchId);
+          if (!isCurrentOperation()) return;
+          setBatch(refreshed);
+          setNotice('批次状态已变化，无法放弃未交付批次。');
+          void refreshBatchSummaries();
+        } catch (refreshError) {
+          if (isCurrentOperation()) {
+            setNotice(refreshError instanceof Error ? '无法刷新批次状态：' + refreshError.message : '无法刷新批次状态。');
+          }
+        }
+        return;
+      }
+
+      setNotice(error instanceof Error ? '无法放弃未交付批次：' + error.message : '无法放弃未交付批次。');
+    } finally {
+      if (authGeneration.current === operationAuthGeneration && activeBatchIdRef.current === operationBatchId) {
+        setBusy(false);
+      }
+    }
+  };
+
   const returnToEdit = async (): Promise<boolean> => {
     if (!batch || !viewingActiveBatch) return false;
     const mutationVersion = workbenchHydrationVersion.current + 1;
@@ -1681,10 +1755,11 @@ export function App() {
           onReturnToEdit={() => void returnToEdit()}
           onRetry={() => void retry()}
           onClone={() => void cloneBatch()}
+          onAbandon={() => void abandon()}
           onConfirmRepeatedSubmission={() => void confirmRepeatedSubmission()}
         /> : notice && <p className="notice" aria-live="polite">{notice}</p>}
 
-        {batch && !viewingActiveBatch && <p className="notice" aria-live="polite">这是历史批次，仅供查看。</p>}
+        {batch && !viewingActiveBatch && batch.state !== 'ABANDONED' && <p className="notice" aria-live="polite">这是历史批次，仅供查看。</p>}
 
         <section className="composer-card" aria-labelledby="batch-information-title">
           <p className="eyebrow">当前批次</p>

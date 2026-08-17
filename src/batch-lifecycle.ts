@@ -111,12 +111,14 @@ export function canRetryBatch(batch: BatchLifecycleSnapshot): boolean {
 }
 
 export function isActiveBatch(batch: BatchLifecycleSnapshot): boolean {
+  if (batch.state === 'ABANDONED') return false;
   if (batch.state === 'DRAFT') return true;
   if (batch.state !== 'FAILED' && batch.state !== 'PR_CREATED' && batch.state !== 'LOCAL_DIFF_READY') return true;
   return isFinalValidationFailure(batch) || canRetryBatch(batch);
 }
 
 export function userStatusForBatch(batch: BatchLifecycleSnapshot): UserBatchStatus {
+  if (batch.state === 'ABANDONED') return 'abandoned';
   if (batch.state === 'PR_CREATED') return 'submitted_review';
   if (batch.state === 'LOCAL_DIFF_READY') return 'local_complete';
   if (hasRetainedDesignerCorrectableValidation(batch)) return 'needs_changes';

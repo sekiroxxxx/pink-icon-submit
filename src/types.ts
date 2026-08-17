@@ -22,7 +22,8 @@ export type BatchState =
   | 'BRANCH_PUSHED'
   | 'PR_CREATING'
   | 'PR_CREATED'
-  | 'FAILED';
+  | 'FAILED'
+  | 'ABANDONED';
 
 export type JobState = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
 
@@ -118,6 +119,8 @@ export interface BatchDetails extends StoredBatch {
   items: StoredItem[];
   job: StoredJob | null;
   failureHistory: JobFailure[];
+  /** The server has confirmed this batch has no remote delivery evidence and can be abandoned safely. */
+  canAbandon: boolean;
 }
 
 export interface BatchSummary {
@@ -140,7 +143,8 @@ export type UserBatchStatus =
   | 'delivery_retryable'
   | 'developer_attention'
   | 'submitted_review'
-  | 'local_complete';
+  | 'local_complete'
+  | 'abandoned';
 
 export interface AppConfig {
   databasePath: string;

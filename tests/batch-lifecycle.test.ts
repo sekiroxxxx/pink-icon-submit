@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { canResumeDraftPullRequest, canRetryBatch, type BatchLifecycleSnapshot } from '../src/batch-lifecycle.js';
+import { canResumeDraftPullRequest, canRetryBatch, isActiveBatch, userStatusForBatch, type BatchLifecycleSnapshot } from '../src/batch-lifecycle.js';
 
 function failed(errorCode: string, checkpoint: BatchLifecycleSnapshot['delivery']['checkpoint']): BatchLifecycleSnapshot {
   return {
@@ -38,4 +38,18 @@ test('unknown and program failures do not become retryable merely because they f
     assert.equal(canRetryBatch(failed(code, 'NONE')), false, code);
     assert.equal(canRetryBatch(failed(code, 'BRANCH_PUSHED')), false, code);
   }
+});
+
+
+test('abandoned batches are terminal history, not active work', () => {
+  const batch: BatchLifecycleSnapshot = {
+    state: 'ABANDONED',
+    executionMode: null,
+    baseCommit: null,
+    validation: null,
+    errorCode: 'BATCH_ABANDONED',
+    delivery: { checkpoint: 'NONE', branch: null, commitSha: null, pullRequest: null },
+  };
+  assert.equal(isActiveBatch(batch), false);
+  assert.equal(userStatusForBatch(batch), 'abandoned');
 });

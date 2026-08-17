@@ -379,5 +379,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return await dependencies.batches.retry(batchId, authenticatedUser(request).id);
   });
 
+  app.post('/api/batches/:batchId/abandon', async (request) => {
+    const { batchId } = request.params as { batchId: string };
+    return await dependencies.batches.abandon(batchId, authenticatedUser(request).id);
+  });
+
   return app;
 }

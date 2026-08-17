@@ -51,7 +51,7 @@ export interface ValidationResult {
 export interface BatchDetails extends BatchInput {
   id: string;
   executionMode: 'local' | 'remote' | null;
-  state: 'DRAFT' | 'VALIDATING' | 'READY' | 'QUEUED' | 'RUNNING' | 'LOCAL_DIFF_READY' | 'COMMIT_PREPARED' | 'BRANCH_PUSHED' | 'PR_CREATING' | 'PR_CREATED' | 'FAILED';
+  state: 'DRAFT' | 'VALIDATING' | 'READY' | 'QUEUED' | 'RUNNING' | 'LOCAL_DIFF_READY' | 'COMMIT_PREPARED' | 'BRANCH_PUSHED' | 'PR_CREATING' | 'PR_CREATED' | 'FAILED' | 'ABANDONED';
   items: ApiItem[];
   validation: ValidationResult | null;
   warningsAcknowledged: boolean;
@@ -72,6 +72,8 @@ export interface BatchDetails extends BatchInput {
   };
   error: { code: string; message: string } | null;
   userStatus: UserBatchStatus;
+  /** Whether the server has confirmed that this batch can be abandoned without Git delivery side effects. */
+  canAbandon?: boolean;
   createdAt: string;
 }
 
@@ -95,7 +97,8 @@ export type UserBatchStatus =
   | 'delivery_retryable'
   | 'developer_attention'
   | 'submitted_review'
-  | 'local_complete';
+  | 'local_complete'
+  | 'abandoned';
 
 export interface CatalogPageIcon {
   primaryName: string;
@@ -207,6 +210,7 @@ export const api = {
   returnToEdit: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/return-to-edit`, { method: 'POST' }),
   cloneBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/clone`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
+  abandonBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/abandon`, { method: 'POST' }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
   getActiveBatch: () => request<BatchDetails | undefined>('/api/batches/active'),
   getBatches: () => request<BatchSummary[]>('/api/batches?limit=20'),

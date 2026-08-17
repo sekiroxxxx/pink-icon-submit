@@ -699,7 +699,7 @@ export class BatchDatabase {
     const batch = this.getBatch(id);
     const items = (this.db.prepare('SELECT * FROM items WHERE batch_id = ? ORDER BY created_at, id').all(id) as ItemRow[]).map(toItem);
     const job = this.getJob(id);
-    return { ...batch, items, job, failureHistory: this.getFailureHistory(id) };
+    return { ...batch, items, job, failureHistory: this.getFailureHistory(id), canAbandon: this.canAbandonBatch(batch, job) };
   }
 
   getDetailsForOwner(id: string, ownerId: string): BatchDetails {
@@ -938,6 +938,53 @@ export class BatchDatabase {
     return queue();
   }
 
+  abandonBatch(batchId: string): void {
+    const abandon = this.db.transaction(() => {
+      const batch = this.getBatch(batchId);
+      const job = this.getJob(batchId);
+      if (!this.canAbandonBatch(batch, job)) {
+        throw new AppError('BATCH_NOT_ABANDONABLE', `Batch ${batchId} cannot be safely abandoned from its current delivery state.`, 409);
+      }
+
+      const timestamp = now();
+      const code = 'BATCH_ABANDONED';
+      const message = 'The submitter abandoned this unsubmitted batch.';
+      if (job?.state === 'QUEUED') {
+        const jobResult = this.db.prepare(`
+          UPDATE jobs
+          SET state = 'FAILED', error_code = ?, error_message = ?, updated_at = ?
+          WHERE batch_id = ? AND state = 'QUEUED'
+        `).run(code, message, timestamp, batchId);
+        if (jobResult.changes !== 1) {
+          throw new AppError('BATCH_NOT_ABANDONABLE', `Batch ${batchId} started delivery before it could be abandoned.`, 409);
+        }
+        this.db.prepare(`
+          INSERT INTO job_failures (batch_id, attempt, error_code, error_message, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(batchId, job.attempt, code, message, timestamp);
+      }
+
+      const result = this.db.prepare(`
+        UPDATE batches
+        SET state = 'ABANDONED', error_code = ?, error_message = ?, updated_at = ?
+        WHERE id = ? AND state IN ('DRAFT', 'READY', 'FAILED', 'QUEUED')
+          AND delivery_checkpoint = 'NONE'
+          AND delivery_branch IS NULL
+          AND delivery_commit_sha IS NULL
+          AND pr_number IS NULL
+          AND pr_url IS NULL
+          AND pr_state IS NULL
+          AND pr_is_draft IS NULL
+          AND pr_created_at IS NULL
+          AND handoff_at IS NULL
+      `).run(code, message, timestamp, batchId);
+      if (result.changes !== 1) {
+        throw new AppError('BATCH_NOT_ABANDONABLE', `Batch ${batchId} changed before it could be abandoned.`, 409);
+      }
+    });
+    abandon();
+  }
+
   claimNextJob(): StoredJob | null {
     const claim = this.db.transaction(() => {
       const row = this.db.prepare(`
@@ -947,7 +994,13 @@ export class BatchDatabase {
         return null;
       }
       const timestamp = now();
-      this.db.prepare("UPDATE jobs SET state = 'RUNNING', updated_at = ? WHERE batch_id = ?").run(timestamp, row.batch_id);
+      const result = this.db.prepare(`
+        UPDATE jobs SET state = 'RUNNING', updated_at = ?
+        WHERE batch_id = ? AND state = 'QUEUED'
+      `).run(timestamp, row.batch_id);
+      if (result.changes !== 1) {
+        return null;
+      }
       this.touchBatch(row.batch_id, 'RUNNING');
       return this.getJob(row.batch_id);
     });
@@ -1233,6 +1286,23 @@ export class BatchDatabase {
   getJob(batchId: string): StoredJob | null {
     const row = this.db.prepare('SELECT * FROM jobs WHERE batch_id = ?').get(batchId) as JobRow | undefined;
     return row ? toJob(row) : null;
+  }
+
+  private canAbandonBatch(batch: StoredBatch, job: StoredJob | null): boolean {
+    const hasRemoteDeliveryEvidence = batch.delivery.checkpoint !== 'NONE'
+      || batch.delivery.branch !== null
+      || batch.delivery.commitSha !== null
+      || batch.delivery.pullRequest !== null
+      || batch.delivery.handoffAt !== null;
+    if (hasRemoteDeliveryEvidence) return false;
+
+    if (batch.state === 'QUEUED') {
+      return job?.state === 'QUEUED';
+    }
+    if (!['DRAFT', 'READY', 'FAILED'].includes(batch.state)) {
+      return false;
+    }
+    return job === null || job.state === 'FAILED';
   }
 
   private touchBatch(batchId: string, state: BatchState): void {

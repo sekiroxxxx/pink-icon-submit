@@ -914,3 +914,93 @@ test('submit waits for an in-flight SVG update on the same batch', async (t) => 
   assert.equal((await submit).state, 'QUEUED');
   assert.equal(environment.database.getItem(batchId, item.id).description, 'Updated description');
 });
+
+
+test('failed checkpoint NONE delivery can be abandoned and releases the owner active-batch slot', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const batchId = await createBatch(environment.batches);
+  environment.database.queueJob(batchId);
+  environment.database.claimNextJob();
+  environment.database.failJob(batchId, 'GIT_COMMAND_FAILED', 'The staging Git configuration rejected the clone.');
+
+  const abandoned = await environment.batches.abandon(batchId);
+  assert.equal(abandoned.state, 'ABANDONED');
+  assert.equal(abandoned.userStatus, 'abandoned');
+  assert.equal(abandoned.canAbandon, false);
+  assert.equal(abandoned.job?.state, 'FAILED');
+  assert.equal(environment.database.getActiveBatchForOwner('legacy-bootstrap'), null);
+  assert.equal((await environment.batches.createBatch({
+    title: 'Replacement batch',
+    description: 'The old unsubmitted batch no longer blocks this account.',
+    submitter: { name: 'Designer', email: 'designer@example.invalid' },
+  })).state, 'DRAFT');
+});
+
+test('an unclaimed queued job can be abandoned atomically and can never be claimed afterwards', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const batchId = await createBatch(environment.batches);
+  environment.database.queueJob(batchId);
+
+  const abandoned = await environment.batches.abandon(batchId);
+  assert.equal(abandoned.state, 'ABANDONED');
+  assert.equal(abandoned.job?.state, 'FAILED');
+  assert.equal(abandoned.job?.error?.code, 'BATCH_ABANDONED');
+  assert.equal(environment.database.claimNextJob(), null);
+  assert.deepEqual(abandoned.failureHistory.map((failure) => failure.code), ['BATCH_ABANDONED']);
+});
+
+test('a DRAFT batch that retains its FAILED job after return-to-edit can be abandoned safely', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const batchId = await createBatch(environment.batches);
+  environment.database.queueJob(batchId);
+  environment.database.claimNextJob();
+  environment.database.recordFinalValidation(batchId, {
+    valid: false,
+    requestSha256: 'a'.repeat(64),
+    errors: [{ code: 'SVG_INVALID_XML', message: 'The SVG needs correction.' }],
+    warnings: [],
+  }, 'b'.repeat(40));
+  environment.database.failJob(batchId, 'FINAL_VALIDATION_FAILED', 'The SVG needs correction.');
+
+  const returned = await environment.batches.returnToEdit(batchId);
+  assert.equal(returned.state, 'DRAFT');
+  assert.equal(returned.job?.state, 'FAILED');
+  assert.equal(returned.canAbandon, true);
+
+  const abandoned = await environment.batches.abandon(batchId);
+  assert.equal(abandoned.state, 'ABANDONED');
+  assert.equal(abandoned.job?.state, 'FAILED');
+});
+
+test('running, remote-delivery, handoff, and mismatched queued states cannot be abandoned', async (t) => {
+  const environment = await createTestEnvironment(t);
+
+  const running = await createBatch(environment.batches);
+  environment.database.queueJob(running);
+  environment.database.claimNextJob();
+  assert.equal(environment.batches.getBatch(running).canAbandon, false);
+  await assert.rejects(() => environment.batches.abandon(running), { code: 'BATCH_NOT_ABANDONABLE' });
+
+  const delivered = await createBatch(environment.batches);
+  environment.database.queueJob(delivered);
+  environment.database.claimNextJob();
+  environment.database.recordCommitPrepared(delivered, { items: [] }, 'a'.repeat(40), { changedFiles: [] }, 'bot/ICON-DELIVERED', 'b'.repeat(40));
+  environment.database.failJob(delivered, 'GIT_COMMAND_FAILED', 'Commit was prepared before delivery failed.');
+  assert.equal(environment.batches.getBatch(delivered).canAbandon, false);
+  await assert.rejects(() => environment.batches.abandon(delivered), { code: 'BATCH_NOT_ABANDONABLE' });
+
+  const handoff = await createBatch(environment.batches);
+  const inspection = new Database(environment.config.databasePath);
+  inspection.prepare('UPDATE batches SET handoff_at = ? WHERE id = ?').run(new Date().toISOString(), handoff);
+  inspection.close();
+  assert.equal(environment.batches.getBatch(handoff).canAbandon, false);
+  await assert.rejects(() => environment.batches.abandon(handoff), { code: 'BATCH_NOT_ABANDONABLE' });
+
+  const mismatched = await createBatch(environment.batches);
+  environment.database.queueJob(mismatched);
+  const mismatchInspection = new Database(environment.config.databasePath);
+  mismatchInspection.prepare("UPDATE batches SET state = 'DRAFT' WHERE id = ?").run(mismatched);
+  mismatchInspection.close();
+  assert.equal(environment.batches.getBatch(mismatched).canAbandon, false);
+  await assert.rejects(() => environment.batches.abandon(mismatched), { code: 'BATCH_NOT_ABANDONABLE' });
+});

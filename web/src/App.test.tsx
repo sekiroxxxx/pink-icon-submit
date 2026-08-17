@@ -605,6 +605,188 @@ test('an infrastructure failure offers a manual delivery retry without exposing 
   expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-RETRY/retry', { method: 'POST' });
 });
 
+test('abandonment releases the workbench even when an older processing poll resolves afterwards', async () => {
+  saveProfile();
+  const active = batch({
+    id: 'ICON-ABANDON-POLL',
+    executionMode: 'remote',
+    state: 'QUEUED',
+    userStatus: 'processing',
+    canAbandon: true,
+  });
+  const abandoned = batch({
+    ...active,
+    state: 'ABANDONED',
+    userStatus: 'abandoned',
+    canAbandon: false,
+    error: { code: 'BATCH_ABANDONED', message: 'The submitter abandoned this unsubmitted batch.' },
+  });
+  const stalePoll = deferred<Response>();
+  const abandonResponse = deferred<Response>();
+  const pollRegistered = deferred<void>();
+  const pollStarted = deferred<void>();
+  let poll: (() => void) | undefined;
+  let reads = 0;
+  vi.spyOn(window, 'setInterval').mockImplementation(((callback: TimerHandler, delay?: number) => {
+    if (delay === 1_500) {
+      poll = callback as () => void;
+      pollRegistered.resolve();
+    }
+    return 1 as unknown as number;
+  }) as typeof window.setInterval);
+  vi.spyOn(window, 'clearInterval').mockImplementation(() => undefined);
+  const fetchMock = vi.fn((path: string, options?: RequestInit) => {
+    if (path === '/api/batches/' + active.id) {
+      reads += 1;
+      if (reads === 1) return Promise.resolve(jsonResponse(active));
+      pollStarted.resolve();
+      return stalePoll.promise;
+    }
+    if (path === '/api/batches/' + active.id + '/abandon' && options?.method === 'POST') return abandonResponse.promise;
+    throw new Error('Unexpected request: ' + path);
+  });
+  stubFetch(fetchMock, [summary({ id: active.id, title: active.title, userStatus: 'processing' })], active);
+  vi.spyOn(window, 'confirm').mockReturnValue(true);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await pollRegistered.promise;
+  await openActiveWorkbench(user, '查看处理中');
+  await screen.findByRole('button', { name: '放弃未交付批次' });
+  await act(async () => {
+    poll!();
+    await pollStarted.promise;
+  });
+
+  await user.click(screen.getByRole('button', { name: '放弃未交付批次' }));
+  abandonResponse.resolve(jsonResponse(abandoned));
+  await screen.findByText('已放弃未交付批次，可以重新创建图标变更。');
+  expect(screen.getByRole('button', { name: '新建图标变更' })).toBeTruthy();
+  expect((screen.getByRole('button', { name: '返回首页' }) as HTMLButtonElement).disabled).toBe(false);
+
+  await act(async () => {
+    stalePoll.resolve(jsonResponse(active));
+    await Promise.resolve();
+  });
+  expect(window.location.pathname).toBe('/');
+  expect(screen.getByRole('button', { name: '新建图标变更' })).toBeTruthy();
+});
+
+test('a 409 abandonment response refreshes the current batch instead of leaving stale controls disabled', async () => {
+  saveProfile();
+  const queued = batch({
+    id: 'ICON-ABANDON-409',
+    executionMode: 'remote',
+    state: 'QUEUED',
+    userStatus: 'processing',
+    canAbandon: true,
+  });
+  const running = batch({
+    ...queued,
+    state: 'RUNNING',
+    userStatus: 'processing',
+    canAbandon: false,
+  });
+  let reads = 0;
+  const fetchMock = vi.fn((path: string, options?: RequestInit) => {
+    if (path === '/api/batches/' + queued.id) {
+      reads += 1;
+      return Promise.resolve(jsonResponse(reads === 1 ? queued : running));
+    }
+    if (path === '/api/batches/' + queued.id + '/abandon' && options?.method === 'POST') {
+      return Promise.resolve(jsonResponse({ error: { code: 'BATCH_NOT_ABANDONABLE', message: 'The worker already claimed this batch.' } }, 409));
+    }
+    throw new Error('Unexpected request: ' + path);
+  });
+  stubFetch(fetchMock, [summary({ id: queued.id, title: queued.title, userStatus: 'processing' })], queued);
+  vi.spyOn(window, 'confirm').mockReturnValue(true);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await openActiveWorkbench(user, '查看处理中');
+  await screen.findByRole('button', { name: '放弃未交付批次' });
+  await user.click(screen.getByRole('button', { name: '放弃未交付批次' }));
+
+  await screen.findByRole('heading', { name: '正在最终校验' });
+  expect(screen.getByText('批次状态已变化，无法放弃未交付批次。')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '放弃未交付批次' })).toBeNull();
+  expect((screen.getByRole('button', { name: '返回首页' }) as HTMLButtonElement).disabled).toBe(false);
+  expect(window.location.pathname).toBe('/workbench');
+  expect(fetchMock).toHaveBeenCalledWith('/api/batches/' + queued.id + '/abandon', { method: 'POST' });
+});
+
+test('the server-approved DRAFT plus failed-job compatibility state exposes abandonment', async () => {
+  saveProfile();
+  const draft = batch({
+    id: 'ICON-ABANDON-DRAFT',
+    executionMode: 'remote',
+    state: 'DRAFT',
+    userStatus: 'draft',
+    canAbandon: true,
+  });
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches/' + draft.id) return Promise.resolve(jsonResponse(draft));
+    throw new Error('Unexpected request: ' + path);
+  });
+  stubFetch(fetchMock, [], draft);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await openActiveWorkbench(user, '继续编辑');
+  expect(await screen.findByRole('button', { name: '放弃未交付批次' })).toBeTruthy();
+});
+
+test('delivery evidence does not expose abandonment controls', async () => {
+  saveProfile();
+  const pushed = batch({
+    id: 'ICON-ABANDON-PUSHED',
+    executionMode: 'remote',
+    state: 'FAILED',
+    userStatus: 'delivery_retryable',
+    delivery: delivery({ checkpoint: 'BRANCH_PUSHED', branch: 'bot/ICON-ABANDON-PUSHED', commitSha: 'a'.repeat(40) }),
+    error: { code: 'GIT_COMMAND_FAILED', message: 'Draft PR creation failed.' },
+    canAbandon: false,
+  });
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches/' + pushed.id) return Promise.resolve(jsonResponse(pushed));
+    throw new Error('Unexpected request: ' + path);
+  });
+  stubFetch(fetchMock, [], pushed);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await openActiveWorkbench(user, '恢复交付');
+  await screen.findByRole('heading', { name: '分支已推送，Draft PR 创建失败' });
+  expect(screen.queryByRole('button', { name: '放弃未交付批次' })).toBeNull();
+});
+
+test('abandoned history remains read-only without abandonment controls', async () => {
+  saveProfile();
+  const abandoned = batch({
+    id: 'ICON-ABANDONED-HISTORY',
+    executionMode: 'remote',
+    state: 'ABANDONED',
+    userStatus: 'abandoned',
+    canAbandon: false,
+    error: { code: 'BATCH_ABANDONED', message: 'The submitter abandoned this unsubmitted batch.' },
+  });
+  window.history.replaceState({}, '', '/workbench?batch=' + abandoned.id);
+  const fetchMock = vi.fn((path: string) => {
+    if (path === '/api/batches/' + abandoned.id) return Promise.resolve(jsonResponse(abandoned));
+    throw new Error('Unexpected request: ' + path);
+  });
+  stubFetch(fetchMock);
+
+  render(<App />);
+  await screen.findByRole('heading', { name: '本次变更已放弃' });
+  expect(screen.getByText('未创建 commit、push 或 Draft PR。设计记录保留在历史中，仅供查看。')).toBeTruthy();
+  expect(screen.queryByText('正在查看历史批次。')).toBeNull();
+  expect(screen.queryByText('这是历史批次，仅供查看。')).toBeNull();
+  expect(screen.queryByRole('button', { name: '放弃未交付批次' })).toBeNull();
+  expect(screen.queryByRole('button', { name: '继续编辑' })).toBeNull();
+  expect(screen.queryByRole('button', { name: /重新尝试/ })).toBeNull();
+});
+
 test('a refreshed pushed branch failure offers a Draft PR-only retry', async () => {
   saveProfile();
   const failed = batch({
@@ -852,6 +1034,7 @@ test('a restored PR-created batch shows the Draft PR handoff link', async () => 
 
   const link = await screen.findByRole('link', { name: '打开开发审核记录' });
   expect(link.getAttribute('href')).toBe('https://github.example.invalid/pull/42');
+  expect(screen.queryByRole('button', { name: '基于此新建批次' })).toBeNull();
   expect(fetchMock).toHaveBeenCalledWith('/api/batches/ICON-PR', {});
 });
 

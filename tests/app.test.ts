@@ -671,3 +671,63 @@ test('batch list returns user-only summaries with stable bounds, ordering, and r
     assert.equal((invalidLimit.json() as { error: { code: string } }).error.code, 'REQUEST_INVALID');
   }
 });
+
+
+test('authenticated users can abandon a safe unsubmitted batch and create a replacement', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const { app } = await buildAuthenticatedApp(environment);
+  t.after(() => app.close());
+
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Abandon through API',
+      description: 'A user can close an unsubmitted batch without losing history.',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  const batchId = (created.json() as { id: string }).id;
+  const abandoned = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/abandon` });
+  assert.equal(abandoned.statusCode, 200);
+  const abandonedBody = abandoned.json() as { state: string; userStatus: string; canAbandon: boolean };
+  assert.equal(abandonedBody.state, 'ABANDONED');
+  assert.equal(abandonedBody.userStatus, 'abandoned');
+  assert.equal(abandonedBody.canAbandon, false);
+
+  const replacement = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Replacement after abandon',
+      description: 'The abandoned batch no longer occupies this account.',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  assert.equal(replacement.statusCode, 201);
+});
+
+
+test('abandon returns 409 if the Worker has already claimed the queued batch', async (t) => {
+  const environment = await createTestEnvironment(t);
+  const { app } = await buildAuthenticatedApp(environment);
+  t.after(() => app.close());
+
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/batches',
+    payload: {
+      title: 'Worker claim races abandon',
+      description: 'The API must report the current delivery state rather than abandon it.',
+      submitter: { name: 'Designer', email: 'designer@example.invalid' },
+    },
+  });
+  const batchId = (created.json() as { id: string }).id;
+  environment.database.queueJob(batchId);
+  environment.database.claimNextJob();
+
+  const abandoned = await app.inject({ method: 'POST', url: `/api/batches/${batchId}/abandon` });
+  assert.equal(abandoned.statusCode, 409);
+  assert.equal((abandoned.json() as { error: { code: string } }).error.code, 'BATCH_NOT_ABANDONABLE');
+  assert.equal(environment.database.getBatch(batchId).state, 'RUNNING');
+});
