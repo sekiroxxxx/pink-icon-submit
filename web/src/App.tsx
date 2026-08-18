@@ -51,6 +51,25 @@ const limits = {
   itemText: 1_000,
   name: 100,
 };
+
+// Account drafts are persisted as soon as an icon change is added. The service requires
+// title and description at creation time, but designers provide the real delivery metadata
+// in the final confirmation drawer. These values are never treated as submitted metadata.
+const unsavedDraftMetadata = {
+  title: '未完成图标变更草稿',
+  description: '等待在提交前确认中补充整体需求说明。',
+};
+
+function isUnsavedDraftMetadata(batch: Pick<BatchDetails, 'title' | 'description' | 'designUrl'>): boolean {
+  return batch.title === unsavedDraftMetadata.title
+    && batch.description === unsavedDraftMetadata.description
+    && !batch.designUrl;
+}
+
+function batchFormFromDetails(batch: Pick<BatchDetails, 'title' | 'description' | 'designUrl'>) {
+  if (isUnsavedDraftMetadata(batch)) return { title: '', description: '', designUrl: '' };
+  return { title: batch.title, description: batch.description, designUrl: batch.designUrl ?? '' };
+}
 let nextClientId = 1;
 
 function uniqueId(prefix: string): string {
@@ -829,19 +848,23 @@ function DeliveryStatusCard({
 
 function ReviewDrawer({
   changes,
+  form,
   user,
   errors,
   confirmed,
   busy,
+  onChange,
   onConfirmedChange,
   onClose,
   onSubmit,
 }: {
   changes: DraftChange[];
+  form: { title: string; description: string; designUrl: string };
   user: AuthenticatedUser;
   errors: FieldErrors;
   confirmed: boolean;
   busy: boolean;
+  onChange: (patch: Partial<{ title: string; description: string; designUrl: string }>) => void;
   onConfirmedChange: (value: boolean) => void;
   onClose: () => void;
   onSubmit: () => void;
@@ -851,6 +874,9 @@ function ReviewDrawer({
       <section className="review-drawer" role="dialog" aria-modal="true" aria-labelledby="review-title">
         <div className="drawer-heading"><div><p className="eyebrow">提交前确认</p><h2 id="review-title">让开发准确理解这次设计</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div>
         <p className="review-note">提交人会自动使用登录账号 <strong>{user.username}</strong>。最终校验和后续开发审核会一并记录本次设计变更。</p>
+        <div className="form-field"><label htmlFor="batch-title">本次变更标题<RequiredMark /></label><input id="batch-title" disabled={busy} maxLength={limits.batchTitle} value={form.title} onChange={(event) => onChange({ title: event.target.value })} placeholder="例如：模型页图标视觉更新" /><FieldCounter value={form.title} maximum={limits.batchTitle} /><FieldError message={errors.title} /></div>
+        <div className="form-field"><label htmlFor="batch-description">整体需求说明<RequiredMark /></label><textarea id="batch-description" disabled={busy} maxLength={limits.batchDescription} value={form.description} onChange={(event) => onChange({ description: event.target.value })} placeholder="说明设计变更的背景、目的和影响范围。" /><FieldCounter value={form.description} maximum={limits.batchDescription} /><FieldError message={errors.description} /></div>
+        <div className="form-field"><label htmlFor="design-url">设计稿链接 <em>（选填）</em></label><input id="design-url" disabled={busy} type="url" value={form.designUrl} onChange={(event) => onChange({ designUrl: event.target.value })} placeholder="https://figma.com/..." /><FieldError message={errors.designUrl} /></div>
         <section className="review-list" aria-label="本次变更清单"><h3>本次变更清单</h3>{changes.map((change) => <div key={change.clientId}><strong>{({ add: '新增', replace: '替换', delete: '删除' })[change.action]}</strong><span>{change.action === 'add' ? change.designName : change.target?.primaryName}{change.svg ? ` · ${change.svg.file.name}` : ''}</span></div>)}</section>
         <label className="confirm-check"><input type="checkbox" disabled={busy} checked={confirmed} onChange={(event) => onConfirmedChange(event.target.checked)} /><span>我确认以上设计意图和 SVG 文件正确，并同意交由后续自动校验和开发审核。</span></label>
         <FieldError message={errors.confirmed} />
@@ -1012,7 +1038,7 @@ export function App() {
     resetWorkbenchTransientState();
     setBatch(restored);
     setChanges(draftChangesFromBatch(restored));
-    setBatchForm({ title: restored.title, description: restored.description, designUrl: restored.designUrl ?? '' });
+    setBatchForm(batchFormFromDetails(restored));
     setNotice(nextNotice);
   }, [resetWorkbenchTransientState]);
 
@@ -1416,7 +1442,6 @@ export function App() {
   const addChange = async () => {
     if (draftMutationInFlight.current) return;
     const errors: FieldErrors = {};
-    const metadataErrors = validateBatchMetadata();
     if (action !== 'delete' && !activeSvg) errors.svg = '请先拖入或选择 SVG 文件。';
     if (action === 'add') {
       const nameIssue = localNameIssue(addName);
@@ -1439,11 +1464,7 @@ export function App() {
       if (targetUse) errors.target = `${target.primaryName}${targetUseLabel(targetUse)}，不能在同一批次重复修改。`;
     }
     setChangeErrors(errors);
-    setReviewErrors((current) => ({ ...current, ...metadataErrors }));
-    if (Object.keys(errors).length > 0 || Object.keys(metadataErrors).length > 0) {
-      setNotice(Object.keys(metadataErrors).length > 0 ? '请先填写并检查本次批次信息。' : undefined);
-      return;
-    }
+    if (Object.keys(errors).length > 0) return;
     const change: DraftChange = {
       clientId: uniqueId('change'),
       clientMutationId: createClientMutationId(),
@@ -1459,7 +1480,7 @@ export function App() {
     const operationOwnerId = authenticatedUser?.id;
     let operationHydrationVersion = workbenchHydrationVersion.current;
     try {
-      const currentBatch = await ensureDraftBatch(batchMetadata());
+      const currentBatch = await ensureDraftBatch(unsavedDraftMetadata);
       if (authGeneration.current !== operationAuthGeneration) return;
       if (workbenchHydrationVersion.current !== operationHydrationVersion) {
         if (!batch) {
@@ -1763,34 +1784,7 @@ export function App() {
     }
   };
 
-  const returnHome = async () => {
-    if (draftMutationInFlight.current) return;
-    const operationAuthGeneration = authGeneration.current;
-    const operationHydrationVersion = workbenchHydrationVersion.current;
-    if (batch && viewingActiveBatch && batch.state === 'DRAFT') {
-      const errors = validateBatchMetadata();
-      setReviewErrors((current) => ({ ...current, ...errors }));
-      if (Object.keys(errors).length > 0) {
-        setNotice('请先检查本次批次信息，保存后再返回首页。');
-        return;
-      }
-      draftMutationInFlight.current = true;
-      setBusy(true);
-      try {
-        const saved = await api.updateBatch(batch.id, batchMetadata());
-        if (authGeneration.current !== operationAuthGeneration || workbenchHydrationVersion.current !== operationHydrationVersion) return;
-        setBatch(saved);
-      } catch (error) {
-        if (authGeneration.current === operationAuthGeneration && workbenchHydrationVersion.current === operationHydrationVersion) {
-          setNotice(error instanceof Error ? `草稿保存失败：${error.message}` : '草稿保存失败，请稍后重试。');
-        }
-        return;
-      } finally {
-        draftMutationInFlight.current = false;
-        setBusy(false);
-      }
-    }
-    if (authGeneration.current !== operationAuthGeneration || workbenchHydrationVersion.current !== operationHydrationVersion) return;
+  const returnHome = () => {
     navigate({ view: 'home' });
     void refreshBatchSummaries();
   };
@@ -1838,14 +1832,6 @@ export function App() {
 
         {batch && !viewingActiveBatch && batch.state !== 'ABANDONED' && <p className="notice" aria-live="polite">这是历史批次，仅供查看。</p>}
 
-        <section className="composer-card" aria-labelledby="batch-information-title">
-          <p className="eyebrow">当前批次</p>
-          <h2 id="batch-information-title">本次变更信息</h2>
-          <div className="form-field"><label htmlFor="batch-title">本次变更标题<RequiredMark /></label><input id="batch-title" disabled={!editable || busy} maxLength={limits.batchTitle} value={batchForm.title} onChange={(event) => updateBatchMetadata({ title: event.target.value })} placeholder="例如：模型页图标视觉更新" /><FieldCounter value={batchForm.title} maximum={limits.batchTitle} /><FieldError message={reviewErrors.title} /></div>
-          <div className="form-field"><label htmlFor="batch-description">整体需求说明<RequiredMark /></label><textarea id="batch-description" disabled={!editable || busy} maxLength={limits.batchDescription} value={batchForm.description} onChange={(event) => updateBatchMetadata({ description: event.target.value })} placeholder="说明设计变更的背景、目的和影响范围。" /><FieldCounter value={batchForm.description} maximum={limits.batchDescription} /><FieldError message={reviewErrors.description} /></div>
-          <div className="form-field"><label htmlFor="design-url">设计稿链接 <em>（选填）</em></label><input id="design-url" disabled={!editable || busy} type="url" value={batchForm.designUrl} onChange={(event) => updateBatchMetadata({ designUrl: event.target.value })} placeholder="https://figma.com/..." /><FieldError message={reviewErrors.designUrl} /></div>
-        </section>
-
         <section className="composer-card" aria-labelledby="composer-title">
           <p className="eyebrow">正在编辑一项变更</p>
           <h2 id="composer-title">{({ add: '新增一个图标', replace: '替换已有图标', delete: '删除已有图标' })[action]}</h2>
@@ -1889,7 +1875,7 @@ export function App() {
 
         {batch && batch.userStatus === 'needs_changes' && batch.validation?.valid === false && <DiagnosticList title="需要修正的问题" diagnostics={batch.validation.errors} tone="error" items={batch.items} />}
       </main>}
-      {reviewOpen && <ReviewDrawer changes={changes} user={authenticatedUser} errors={reviewErrors} confirmed={confirmed} busy={busy} onConfirmedChange={setConfirmed} onClose={() => setReviewOpen(false)} onSubmit={() => void submitReview()} />}
+      {reviewOpen && <ReviewDrawer changes={changes} form={batchForm} user={authenticatedUser} errors={reviewErrors} confirmed={confirmed} busy={busy} onChange={updateBatchMetadata} onConfirmedChange={setConfirmed} onClose={() => setReviewOpen(false)} onSubmit={() => void submitReview()} />}
     </div>
   );
 }
