@@ -213,7 +213,12 @@ export const api = {
   returnToEdit: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/return-to-edit`, { method: 'POST' }),
   cloneBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/clone`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
-  abandonBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/abandon`, { method: 'POST' }),
+  // Keep the POST media type explicit so the server parses this empty command consistently.
+  abandonBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/abandon`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
   getActiveBatch: () => request<BatchDetails | undefined>('/api/batches/active'),
   getBatches: () => request<BatchSummary[]>('/api/batches?limit=20'),

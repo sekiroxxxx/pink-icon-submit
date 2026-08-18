@@ -727,7 +727,11 @@ test('a 409 abandonment response refreshes the current batch instead of leaving 
   expect(screen.queryByRole('button', { name: '放弃未交付批次' })).toBeNull();
   expect((screen.getByRole('button', { name: '返回首页' }) as HTMLButtonElement).disabled).toBe(false);
   expect(window.location.pathname).toBe('/workbench');
-  expect(fetchMock).toHaveBeenCalledWith('/api/batches/' + queued.id + '/abandon', { method: 'POST' });
+  expect(fetchMock).toHaveBeenCalledWith('/api/batches/' + queued.id + '/abandon', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  });
 });
 
 test('the server-approved DRAFT plus failed-job compatibility state exposes abandonment', async () => {
