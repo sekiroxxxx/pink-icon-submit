@@ -112,7 +112,6 @@ function summary(overrides: Partial<BatchSummary> = {}): BatchSummary {
 }
 
 async function addOneSvgChange(user: ReturnType<typeof userEvent.setup>): Promise<void> {
-  await fillBatchMetadata(user);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('new-icon.svg'));
   await screen.findByRole('button', { name: '选择 new-icon.svg' });
@@ -130,8 +129,8 @@ async function fillBatchMetadata(user: ReturnType<typeof userEvent.setup>, desig
 }
 
 async function openReview(user: ReturnType<typeof userEvent.setup>, designUrl?: string): Promise<void> {
-  if (designUrl) await user.type(screen.getByLabelText(/^设计稿链接/), designUrl);
   await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await fillBatchMetadata(user, designUrl);
   await user.click(screen.getByRole('checkbox'));
 }
 
@@ -402,7 +401,6 @@ test('a replace target becomes unavailable after it is added to the same batch',
 
   render(<App />);
   await openNewWorkbench(user);
-  await fillBatchMetadata(user);
   await user.click(screen.getByRole('tab', { name: '替换图标' }));
   await user.click(screen.getByRole('button', { name: '选择图标' }));
   await screen.findByText('existing');
@@ -424,7 +422,6 @@ test('multiple SVG files stay in the local queue until each is paired with a cha
 
   render(<App />);
   await openNewWorkbench(user);
-  await fillBatchMetadata(user);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, [svgFile('one.svg'), svgFile('two.svg')]);
   await screen.findByRole('button', { name: '选择 one.svg' });
@@ -447,7 +444,6 @@ test('delete only needs a catalog target and a design reason before it enters th
 
   render(<App />);
   await openNewWorkbench(user);
-  await fillBatchMetadata(user);
   await user.click(screen.getByRole('tab', { name: '删除图标' }));
   await user.click(screen.getByRole('button', { name: '选择图标' }));
   await screen.findByText('existing');
@@ -458,43 +454,45 @@ test('delete only needs a catalog target and a design reason before it enters th
   expect(screen.getByText('本次变更 1 项')).toBeTruthy();
 });
 
-test('the first queued item requires batch fields but design link is optional', async () => {
+test('a queued draft is saved before final metadata, and the confirmation drawer requires title and description', async () => {
   saveProfile();
-  const fetchMock = vi.fn();
-  stubFetch(fetchMock);
+  const handler = draftApiHandler();
+  stubFetch(handler);
   const user = userEvent.setup();
 
   render(<App />);
   await openNewWorkbench(user);
-  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
-  await user.upload(fileInput, svgFile('new-icon.svg'));
-  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
-  await user.type(screen.getByLabelText(/^用途说明/), '用于测试新增图标的设计稿。');
-  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+  await addOneSvgChange(user);
+  await screen.findByText('本次变更 1 项');
+  expect(screen.queryByLabelText(/^本次变更标题/)).toBeNull();
+
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
+  await user.click(screen.getByRole('checkbox'));
+  await user.click(screen.getByRole('button', { name: '确认提交' }));
 
   expect(screen.getByText('请填写本次变更标题。')).toBeTruthy();
   expect(screen.getByText('请填写整体需求说明。')).toBeTruthy();
   expect(screen.queryByText('请填写有效的 HTTP(S) 设计稿链接。')).toBeNull();
-  expect(fetchMock).not.toHaveBeenCalled();
+  const createCall = handler.mock.calls.find(([path, options]) => path === '/api/batches' && options?.method === 'POST');
+  expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({ title: '未完成图标变更草稿', description: '等待在提交前确认中补充整体需求说明。' });
 });
 
-test('the first queued item rejects a malformed optional design link before it creates a batch', async () => {
+test('a malformed optional design link is rejected in the confirmation drawer without submitting the draft', async () => {
   saveProfile();
-  const fetchMock = vi.fn();
-  stubFetch(fetchMock);
+  const handler = draftApiHandler();
+  stubFetch(handler);
   const user = userEvent.setup();
 
   render(<App />);
   await openNewWorkbench(user);
+  await addOneSvgChange(user);
+  await user.click(screen.getByRole('button', { name: '确认本次变更' }));
   await fillBatchMetadata(user, 'https:www.123.com');
-  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
-  await user.upload(fileInput, svgFile('new-icon.svg'));
-  await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
-  await user.type(screen.getByLabelText(/^用途说明/), '用于测试新增图标的设计稿。');
-  await user.click(screen.getByRole('button', { name: '加入新增队列' }));
+  await user.click(screen.getByRole('checkbox'));
+  await user.click(screen.getByRole('button', { name: '确认提交' }));
 
   expect(screen.getByText('请填写有效的 HTTP(S) 设计稿链接。')).toBeTruthy();
-  expect(fetchMock).not.toHaveBeenCalled();
+  expect(handler.mock.calls.some(([path]) => String(path).endsWith('/submit'))).toBe(false);
 });
 
 test('confirmation closes review, queues a DRAFT batch, and makes no preview or interactive validation request', async () => {
@@ -528,7 +526,7 @@ test('confirmation closes review, queues a DRAFT batch, and makes no preview or 
     `/api/batches/${draft.id}/submit`,
   ]);
   const createOptions = fetchMock.mock.calls[0]?.[1] as RequestInit;
-  expect(JSON.parse(createOptions.body as string)).toMatchObject({ title: '模型入口图标', description: '新增模型入口图标。' });
+  expect(JSON.parse(createOptions.body as string)).toMatchObject({ title: '未完成图标变更草稿', description: '等待在提交前确认中补充整体需求说明。' });
   expect(JSON.parse(createOptions.body as string)).not.toHaveProperty('designUrl');
   expect(fetchMock.mock.calls.some(([path]) => String(path).includes('/validate') || String(path).includes('/names/preview'))).toBe(false);
 });
@@ -727,7 +725,11 @@ test('a 409 abandonment response refreshes the current batch instead of leaving 
   expect(screen.queryByRole('button', { name: '放弃未交付批次' })).toBeNull();
   expect((screen.getByRole('button', { name: '返回首页' }) as HTMLButtonElement).disabled).toBe(false);
   expect(window.location.pathname).toBe('/workbench');
-  expect(fetchMock).toHaveBeenCalledWith('/api/batches/' + queued.id + '/abandon', { method: 'POST' });
+  expect(fetchMock).toHaveBeenCalledWith('/api/batches/' + queued.id + '/abandon', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  });
 });
 
 test('the server-approved DRAFT plus failed-job compatibility state exposes abandonment', async () => {
@@ -1667,14 +1669,11 @@ test('the first queued item is a server draft and survives home navigation, remo
   expect(server.current()?.state).toBe('DRAFT');
   expect(server.counts()).toMatchObject({ create: 1, add: 1, submit: 0 });
 
-  const title = screen.getByLabelText(/^本次变更标题/);
-  await user.clear(title);
-  await user.type(title, '返回首页前保存的新标题');
   const pendingInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(pendingInput, svgFile('not-added.svg'));
   await screen.findByRole('button', { name: '选择 not-added.svg' });
   await user.click(screen.getByRole('button', { name: '返回首页' }));
-  expect(server.current()?.title).toBe('返回首页前保存的新标题');
+  expect(server.current()?.title).toBe('未完成图标变更草稿');
   await openActiveWorkbench(user, '继续编辑');
   expect(await screen.findByText('本次变更 1 项')).toBeTruthy();
   expect(screen.queryByRole('button', { name: '选择 not-added.svg' })).toBeNull();
@@ -1733,8 +1732,6 @@ test('leaving during the first create still exposes the new active draft on home
   const user = userEvent.setup();
   render(<App />);
   await openNewWorkbench(user);
-  await user.type(screen.getByLabelText(/^本次变更标题/), created.title);
-  await user.type(screen.getByLabelText(/^整体需求说明/), created.description);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('new-icon.svg'));
   await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
@@ -1773,7 +1770,7 @@ test('a failed first item upload keeps one empty server draft and all editor inp
   expect(new Set(server.itemMutationIds()).size).toBe(1);
 });
 
-test('a metadata save failure keeps the designer in the workbench with the server draft unchanged', async () => {
+test('a final metadata save failure keeps the designer in the workbench with the draft unchanged', async () => {
   const server = statefulDraftServer({ failMetadataSave: true });
   const user = userEvent.setup();
   render(<App />);
@@ -1781,15 +1778,12 @@ test('a metadata save failure keeps the designer in the workbench with the serve
   await addOneSvgChange(user);
   await screen.findByText('本次变更 1 项');
 
-  const title = screen.getByLabelText(/^本次变更标题/);
-  await user.clear(title);
-  await user.type(title, '修改后的批次标题');
-  await user.click(screen.getByRole('button', { name: '返回首页' }));
+  await openReview(user);
+  await user.click(screen.getByRole('button', { name: '确认提交' }));
 
-  expect(await screen.findByText('草稿保存失败：Metadata save failed.')).toBeTruthy();
-  expect(screen.getByRole('heading', { name: '完成设计，交给开发' })).toBeTruthy();
+  expect(await screen.findByText('提交未完成：Metadata save failed.')).toBeTruthy();
   expect(window.location.pathname).toBe('/workbench');
-  expect(server.current()?.title).toBe('模型入口图标');
+  expect(server.current()?.title).toBe('未完成图标变更草稿');
 });
 
 test('double-clicking add and confirming review create one batch, one item, and one submission', async () => {
@@ -1797,7 +1791,6 @@ test('double-clicking add and confirming review create one batch, one item, and 
   const user = userEvent.setup();
   render(<App />);
   await openNewWorkbench(user);
-  await fillBatchMetadata(user);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('new-icon.svg'));
   await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
@@ -1823,7 +1816,6 @@ test('an in-flight draft response cannot restore the previous account after auth
   const user = userEvent.setup();
   render(<App />);
   await openNewWorkbench(user);
-  await fillBatchMetadata(user);
   const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
   await user.upload(fileInput, svgFile('new-icon.svg'));
   await user.type(screen.getByLabelText(/^期望图标名称/), 'pink-new-icon');
