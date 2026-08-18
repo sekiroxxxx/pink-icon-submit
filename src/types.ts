@@ -2,6 +2,15 @@ export type ItemAction = 'add' | 'replace' | 'delete';
 
 export type ExecutionMode = 'local' | 'remote';
 
+export type RemoteDeliveryPhase = 'branch' | 'pull_request';
+
+export type DeliveryCheckpoint =
+  | 'NONE'
+  | 'COMMIT_PREPARED'
+  | 'BRANCH_PUSHED'
+  | 'PR_CREATING'
+  | 'PR_CREATED';
+
 export type BatchState =
   | 'DRAFT'
   | 'VALIDATING'
@@ -9,7 +18,12 @@ export type BatchState =
   | 'QUEUED'
   | 'RUNNING'
   | 'LOCAL_DIFF_READY'
-  | 'FAILED';
+  | 'COMMIT_PREPARED'
+  | 'BRANCH_PUSHED'
+  | 'PR_CREATING'
+  | 'PR_CREATED'
+  | 'FAILED'
+  | 'ABANDONED';
 
 export type JobState = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
 
@@ -18,10 +32,21 @@ export interface Submitter {
   email: string;
 }
 
+/** The only user record exposed to the browser. Password and session data are never serialized. */
+export interface AuthenticatedUser {
+  id: string;
+  username: string;
+}
+
+export interface BootstrapUserCredentials {
+  username: string;
+  password: string;
+}
+
 export interface CreateBatchInput {
   title: string;
   description: string;
-  designUrl: string;
+  designUrl?: string;
   submitter: Submitter;
 }
 
@@ -38,6 +63,10 @@ export interface StoredBatch extends CreateBatchInput {
   id: string;
   catalogBaseline: CatalogBaseline | null;
   targetRepository: TargetRepository | null;
+  executionMode: ExecutionMode | null;
+  pushRepository: string | null;
+  pushBranchPrefix: string | null;
+  delivery: RemoteDeliveryState;
   state: BatchState;
   validation: unknown | null;
   warningsAcknowledged: boolean;
@@ -45,6 +74,11 @@ export interface StoredBatch extends CreateBatchInput {
   baseCommit: string | null;
   localDiff: unknown | null;
   error: { code: string; message: string } | null;
+  /**
+   * A server-derived, user-facing lifecycle classification.  Clients consume
+   * this instead of trying to reproduce delivery/checkpoint error rules.
+   */
+  userStatus: UserBatchStatus;
   createdAt: string;
   updatedAt: string;
 }
@@ -65,10 +99,52 @@ export interface StoredJob {
   updatedAt: string;
 }
 
+export interface WorkerFailureDiagnostic {
+  operation?: string;
+  command?: string;
+  exitCode?: number;
+  stderr?: string;
+}
+
+export interface JobFailure extends WorkerFailureDiagnostic {
+  id: number;
+  batchId: string;
+  attempt: number;
+  code: string;
+  message: string;
+  createdAt: string;
+}
+
 export interface BatchDetails extends StoredBatch {
   items: StoredItem[];
   job: StoredJob | null;
+  failureHistory: JobFailure[];
+  /** The server has confirmed this batch has no remote delivery evidence and can be abandoned safely. */
+  canAbandon: boolean;
 }
+
+export interface BatchSummary {
+  id: string;
+  title: string;
+  userStatus: UserBatchStatus;
+  createdAt: string;
+  itemCounts: {
+    total: number;
+    add: number;
+    replace: number;
+    delete: number;
+  };
+}
+
+export type UserBatchStatus =
+  | 'draft'
+  | 'processing'
+  | 'needs_changes'
+  | 'delivery_retryable'
+  | 'developer_attention'
+  | 'submitted_review'
+  | 'local_complete'
+  | 'abandoned';
 
 export interface AppConfig {
   databasePath: string;
@@ -78,9 +154,8 @@ export interface AppConfig {
   executionMode: ExecutionMode;
   stage1SourcePath?: string;
   localTargetRef?: string;
-  upstreamRemote: string;
-  upstreamBranch: string;
   targetRepository: TargetRepository;
+  remoteDelivery?: RemoteDeliveryConfig;
   catalogPackageName: string;
   catalogTag: string;
   catalogRegistryUrl: string;
@@ -88,8 +163,14 @@ export interface AppConfig {
   catalogSourceRepository: string;
   catalogCacheRoot: string;
   catalogRefreshIntervalMs: number;
+  workerEnabled: boolean;
   workerPollIntervalMs: number;
+  /** Explicit cookie transport policy; never inferred from NODE_ENV. */
+  sessionCookieSecure: boolean;
+  /** Canonical browser origin used for CSRF checks behind an HTTPS reverse proxy. */
+  publicOrigin?: string;
   maxUploadBytes: number;
+  bootstrapUser?: BootstrapUserCredentials;
 }
 
 export interface IconBatchResult {
@@ -127,6 +208,41 @@ export interface TargetRepository {
   branch: 'main';
 }
 
+export interface RemoteDeliveryConfig {
+  targetRemote: string;
+  pushRepository: string;
+  pushRemote: string;
+  pushBranchPrefix: 'bot/';
+  deliveryPhase: RemoteDeliveryPhase;
+  githubToken: string;
+  committer: CommitterIdentity;
+}
+
+export interface CommitterIdentity {
+  name: string;
+  email: string;
+}
+
+export interface BatchExecutionContext {
+  executionMode: ExecutionMode;
+  pushRepository: string | null;
+  pushBranchPrefix: string | null;
+}
+
+export interface RemoteDeliveryState {
+  checkpoint: DeliveryCheckpoint;
+  branch: string | null;
+  commitSha: string | null;
+  pullRequest: {
+    number: number;
+    url: string;
+    state: string;
+    isDraft: boolean;
+    createdAt: string | null;
+  } | null;
+  handoffAt: string | null;
+}
+
 export interface NpmCatalogIcon extends CatalogPageIcon {
   sourceName: string;
   codepoint: number;
@@ -153,16 +269,4 @@ export interface CatalogPage {
   pageSize: number;
   total: number;
   icons: CatalogPageIcon[];
-}
-
-export interface IconNamePreview {
-  schemaVersion: 1;
-  baseCommit: string;
-  input: string;
-  normalizedName: string;
-  valid: boolean;
-  collision: {
-    primaryName: string;
-    aliases: string[];
-  } | null;
 }

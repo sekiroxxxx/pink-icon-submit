@@ -1,4 +1,4 @@
-import { AppError, isAppError } from './errors.js';
+import { AppError, failureDiagnosticFromError, isAppError } from './errors.js';
 import { BatchService } from './batch-service.js';
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -40,6 +40,7 @@ export class LocalDiffWorker {
     try {
       const stage1Input = await this.batches.prepareStage1Request(job.batchId);
       const result = await this.batches.repository.withBaseWorktree(async (worktreePath) => {
+        await this.batches.finalValidate(job.batchId, worktreePath, stage1Input);
         const planned = await this.batches.iconBatch.plan(worktreePath, stage1Input.requestPath, stage1Input);
         if (planned.exitCode !== 0) {
           throw new AppError('REPLAN_VALIDATION_FAILED', 'The batch is no longer valid against the latest target branch.', 409, planned.payload);
@@ -75,7 +76,7 @@ export class LocalDiffWorker {
       return { processed: true, batchId: job.batchId };
     } catch (error) {
       if (isAppError(error)) {
-        this.batches.database.failJob(job.batchId, error.code, error.message);
+        this.batches.database.failJob(job.batchId, error.code, error.message, failureDiagnosticFromError(error));
       } else {
         this.batches.database.failJob(job.batchId, 'WORKER_UNEXPECTED', error instanceof Error ? error.message : String(error));
       }

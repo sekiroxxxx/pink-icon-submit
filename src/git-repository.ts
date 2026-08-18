@@ -1,22 +1,46 @@
-import { spawn } from 'node:child_process';
-import { mkdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
-import { AppError } from './errors.js';
+import { AppError, sanitizeDiagnosticText } from './errors.js';
+import { runSubprocess, subprocessEnvironment, SubprocessTimeoutError } from './subprocess.js';
 import type { ExecutionMode } from './types.js';
+
+export interface GitCommitIdentity {
+  name: string;
+  email: string;
+}
+
+export interface GitHubTokenAuthentication {
+  username: string;
+  token: string;
+}
 
 export interface GitRepositoryOptions {
   mode: ExecutionMode;
-  upstreamRemote?: string;
-  upstreamBranch?: string;
+  targetRemote?: string;
+  targetBranch?: string;
+  remoteAuthentication?: GitHubTokenAuthentication;
   localTargetRef?: string;
+  commandTimeoutMs?: number;
+}
+
+interface OwnedTemporaryWorktree {
+  root: string;
+  worktreePath: string;
+}
+
+function gitOperation(args: string[]): string {
+  const command = args.find((argument) => [
+    'fetch', 'rev-parse', 'remote', 'ls-remote', 'add', 'diff', 'commit', 'push', 'worktree', 'status',
+  ].includes(argument));
+  return `git ${command ?? 'command'}`;
 }
 
 export class GitRepository {
   constructor(
     private readonly repositoryPath: string,
-    private readonly temporaryRoot: string,
+    _temporaryRoot: string,
     private readonly options: GitRepositoryOptions,
   ) {}
 
@@ -31,24 +55,88 @@ export class GitRepository {
       }
       return this.git(['-C', this.repositoryPath, 'rev-parse', this.options.localTargetRef]).then((output) => output.trim());
     }
-    if (!this.options.upstreamRemote || !this.options.upstreamBranch) {
-      throw new AppError('GIT_CONFIGURATION_INVALID', 'Remote execution requires an upstream remote and branch.', 500);
+    if (!this.options.targetRemote || !this.options.targetBranch) {
+      throw new AppError('GIT_CONFIGURATION_INVALID', 'Remote execution requires a target remote and branch.', 500);
     }
-    await this.git(['-C', this.repositoryPath, 'fetch', this.options.upstreamRemote]);
-    return this.git(['-C', this.repositoryPath, 'rev-parse', `${this.options.upstreamRemote}/${this.options.upstreamBranch}`]).then((output) => output.trim());
+    await this.withAuthentication(this.options.remoteAuthentication, (environment) => this.git([
+      '-C', this.repositoryPath,
+      'fetch', this.options.targetRemote!,
+    ], environment));
+    return this.git(['-C', this.repositoryPath, 'rev-parse', `${this.options.targetRemote}/${this.options.targetBranch}`]).then((output) => output.trim());
+  }
+
+  remoteUrl(remote: string): Promise<string> {
+    return this.git(['-C', this.repositoryPath, 'remote', 'get-url', remote]).then((output) => output.trim());
+  }
+
+  async remoteBranchHead(remote: string, branch: string, authentication?: GitHubTokenAuthentication): Promise<string | null> {
+    const output = await this.withAuthentication(authentication, (environment) => this.git([
+      '-C', this.repositoryPath,
+      'ls-remote', '--heads', remote, `refs/heads/${branch}`,
+    ], environment));
+    const match = /^([0-9a-f]{40})\s+refs\/heads\//m.exec(output);
+    return match ? match[1] : null;
+  }
+
+  async commitPlannedChanges(
+    worktreePath: string,
+    expectedFiles: string[],
+    identity: GitCommitIdentity,
+    subject: string,
+    body: string,
+  ): Promise<string> {
+    if (expectedFiles.length === 0) {
+      throw new AppError('DIFF_EMPTY', 'Refusing to commit an empty planned diff.', 502);
+    }
+    await this.git(['-C', worktreePath, 'add', '--all', '--', ...expectedFiles]);
+    const stagedFiles = (await this.git(['-C', worktreePath, 'diff', '--cached', '--name-only', '-z']))
+      .split('\0')
+      .filter(Boolean)
+      .sort();
+    const expected = [...new Set(expectedFiles)].sort();
+    if (stagedFiles.length !== expected.length || stagedFiles.some((file, index) => file !== expected[index])) {
+      throw new AppError('COMMIT_ALLOWLIST_VIOLATION', 'Staged files do not match plan.allowedFiles.', 502, {
+        expectedFiles: expected,
+        stagedFiles,
+      });
+    }
+    await this.git([
+      '-C', worktreePath,
+      '-c', `user.name=${identity.name}`,
+      '-c', `user.email=${identity.email}`,
+      'commit', '--no-verify', '--no-gpg-sign', '-m', subject, '-m', body,
+    ]);
+    return this.head(worktreePath);
+  }
+
+  async pushCommit(
+    remote: string,
+    branch: string,
+    commitSha: string,
+    authentication?: GitHubTokenAuthentication,
+  ): Promise<void> {
+    await this.withAuthentication(authentication, (environment) => this.git([
+      '-C', this.repositoryPath,
+      'push', '--porcelain', remote, `${commitSha}:refs/heads/${branch}`,
+    ], environment));
   }
 
   async withWorktreeAt<T>(commit: string, callback: (worktreePath: string) => Promise<T>): Promise<T> {
-    await mkdir(this.temporaryRoot, { recursive: true });
-    const worktreePath = join(this.temporaryRoot, `worktree-${randomUUID()}`);
-    await this.git(['-C', this.repositoryPath, 'worktree', 'add', '--detach', worktreePath, commit]);
+    const temporaryWorktree = await this.createOwnedTemporaryWorktree();
+    let added = false;
     try {
-      return await callback(worktreePath);
+      await this.git(['-C', this.repositoryPath, 'worktree', 'add', '--detach', temporaryWorktree.worktreePath, commit]);
+      added = true;
+      return await callback(temporaryWorktree.worktreePath);
     } finally {
-      try {
-        await this.git(['-C', this.repositoryPath, 'worktree', 'remove', '--force', worktreePath]);
-      } finally {
-        await rm(worktreePath, { recursive: true, force: true });
+      if (added) {
+        try {
+          await this.git(['-C', this.repositoryPath, 'worktree', 'remove', '--force', temporaryWorktree.worktreePath]);
+        } finally {
+          await this.cleanupOwnedTemporaryWorktree(temporaryWorktree);
+        }
+      } else {
+        await this.cleanupOwnedTemporaryWorktree(temporaryWorktree);
       }
     }
   }
@@ -76,22 +164,94 @@ export class GitRepository {
     return this.git(['-C', worktreePath, 'rev-parse', 'HEAD']).then((stdout) => stdout.trim());
   }
 
-  private async git(args: string[]): Promise<string> {
-    const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve, reject) => {
-      const processHandle = spawn('git', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-      let stdout = '';
-      let stderr = '';
-      processHandle.stdout.setEncoding('utf8');
-      processHandle.stderr.setEncoding('utf8');
-      processHandle.stdout.on('data', (chunk: string) => { stdout += chunk; });
-      processHandle.stderr.on('data', (chunk: string) => { stderr += chunk; });
-      processHandle.once('error', reject);
-      processHandle.once('close', (exitCode) => resolve({ exitCode: exitCode ?? 1, stdout, stderr }));
-    });
+  private async createOwnedTemporaryWorktree(): Promise<OwnedTemporaryWorktree> {
+    const root = await this.createOwnedTemporaryRoot();
+    return { root, worktreePath: this.ownedTemporaryChild(root, join(root, 'w')) };
+  }
+
+  private async cleanupOwnedTemporaryWorktree(temporaryWorktree: OwnedTemporaryWorktree): Promise<void> {
+    const worktreePath = this.ownedTemporaryChild(temporaryWorktree.root, temporaryWorktree.worktreePath);
+    await rm(worktreePath, { recursive: true, force: true });
+    await this.cleanupOwnedTemporaryRoot(temporaryWorktree.root);
+  }
+
+  private createOwnedTemporaryRoot(): Promise<string> {
+    return mkdtemp(join(tmpdir(), 'pink-git-'));
+  }
+
+  private async cleanupOwnedTemporaryRoot(root: string): Promise<void> {
+    const resolvedRoot = resolve(root);
+    if (basename(resolvedRoot).startsWith('pink-git-') === false || this.isOutsidePath(resolve(tmpdir()), resolvedRoot)) {
+      throw new AppError('GIT_TEMPORARY_PATH_INVALID', 'Refusing to remove an unowned temporary Git directory.', 500);
+    }
+    await rm(resolvedRoot, { recursive: true, force: true });
+  }
+
+  private ownedTemporaryChild(root: string, candidate: string): string {
+    const resolvedRoot = resolve(root);
+    const resolvedCandidate = resolve(candidate);
+    if (this.isOutsidePath(resolvedRoot, resolvedCandidate)) {
+      throw new AppError('GIT_TEMPORARY_PATH_INVALID', 'Temporary Git worktree path is outside its owned root.', 500);
+    }
+    return resolvedCandidate;
+  }
+
+  private isOutsidePath(root: string, candidate: string): boolean {
+    const pathRelative = relative(root, candidate);
+    return pathRelative === ''
+      || pathRelative === '..'
+      || pathRelative.startsWith(`..${sep}`)
+      || isAbsolute(pathRelative);
+  }
+
+  private async withAuthentication<T>(authentication: GitHubTokenAuthentication | undefined, callback: (environment: NodeJS.ProcessEnv | undefined) => Promise<T>): Promise<T> {
+    if (!authentication) {
+      return callback(undefined);
+    }
+    const askPassDirectory = await this.createOwnedTemporaryRoot();
+    const askPassScript = join(askPassDirectory, 'askpass.cjs');
+    const askPassCommand = join(askPassDirectory, process.platform === 'win32' ? 'askpass.cmd' : 'askpass.sh');
+    try {
+      await writeFile(askPassScript, "const prompt = process.argv.slice(2).join(' ');\nprocess.stdout.write(/username/i.test(prompt) ? (process.env.PINK_ICON_GIT_ASKPASS_USERNAME ?? '') : (process.env.PINK_ICON_GIT_ASKPASS_TOKEN ?? ''));\n", 'utf8');
+      if (process.platform === 'win32') {
+        await writeFile(askPassCommand, `@echo off\r\n"${process.execPath}" "${askPassScript}" %*\r\n`, 'utf8');
+      } else {
+        await writeFile(askPassCommand, `#!/bin/sh\n"${process.execPath}" "${askPassScript}" "$@"\n`, { encoding: 'utf8', mode: 0o700 });
+        await chmod(askPassCommand, 0o700);
+      }
+      return await callback({
+        ...subprocessEnvironment(),
+        GIT_ASKPASS: askPassCommand,
+        GIT_TERMINAL_PROMPT: '0',
+        PINK_ICON_GIT_ASKPASS_USERNAME: authentication.username,
+        PINK_ICON_GIT_ASKPASS_TOKEN: authentication.token,
+      });
+    } finally {
+      await this.cleanupOwnedTemporaryRoot(askPassDirectory);
+    }
+  }
+
+  private async git(args: string[], environment?: NodeJS.ProcessEnv): Promise<string> {
+    const timeoutMs = this.options.commandTimeoutMs ?? 120_000;
+    let result;
+    try {
+      result = await runSubprocess('git', args, { environment, timeoutMs });
+    } catch (error) {
+      if (error instanceof SubprocessTimeoutError) {
+        throw new AppError('GIT_COMMAND_TIMEOUT', 'Git command exceeded its deadline.', 504, {
+          operation: gitOperation(args),
+          command: sanitizeDiagnosticText(['git', ...args].join(' '), 1_000),
+          stderr: `Timed out after ${error.timeoutMs}ms.`,
+        });
+      }
+      throw error;
+    }
     if (result.exitCode !== 0) {
-      throw new AppError('GIT_COMMAND_FAILED', `git ${args.join(' ')} failed.`, 502, {
+      throw new AppError('GIT_COMMAND_FAILED', 'Git command failed.', 502, {
+        operation: gitOperation(args),
+        command: sanitizeDiagnosticText(['git', ...args].join(' '), 1_000),
         exitCode: result.exitCode,
-        stderr: result.stderr,
+        stderr: sanitizeDiagnosticText(result.stderr),
       });
     }
     return result.stdout;

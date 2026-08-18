@@ -33,10 +33,15 @@ if (command === 'catalog') {
   emit({ schemaVersion: 1, baseCommit: head(), icons: [{ primaryName: 'existing', sourceName: 'existing', aliases: ['existing-alias'], codepoint: 50000, sourceFile: 'src/icons/existing.svg', metadataPresent: false }], retiredCodepoints: [] });
 } else if (command === 'validate') {
   const request = JSON.parse(readFileSync(inputPath, 'utf8'));
+  const finalValidationFailure = request.items.some((item) => item.designName === 'final-validation-failure');
+  if (finalValidationFailure) {
+    emit({ schemaVersion: 1, batchId: request.batchId, requestSha256: 'a'.repeat(64), baseCommit: head(), valid: false, summary: { errorCount: 1, warningCount: 0 }, errors: [{ code: 'SVG_MULTIPLE_COLORS', message: 'Fixture final validation failure.', itemId: request.items.find((item) => item.designName === 'final-validation-failure').id }], warnings: [] }, 2);
+  } else {
   const warnings = request.items.some((item) => item.designName === 'warning-icon')
     ? [{ code: 'SVG_STROKE_PRESENT', message: 'Stroke usage requires manual review.', itemId: request.items.find((item) => item.designName === 'warning-icon').id }]
     : [];
   emit({ schemaVersion: 1, batchId: request.batchId, requestSha256: 'a'.repeat(64), baseCommit: head(), valid: true, summary: { errorCount: 0, warningCount: warnings.length }, errors: [], warnings });
+  }
 } else if (command === 'name-preview') {
   const input = inputPath;
   const normalizedName = input
@@ -94,6 +99,11 @@ export interface TestEnvironment {
   batches: BatchService;
   validSvg: string;
   registryRequests: { metadata: number; tarball: number };
+  pushRepositoryPath?: string;
+}
+
+export interface TestEnvironmentOptions {
+  executionMode?: 'local' | 'remote';
 }
 
 async function createNpmCatalogFixture(t: TestContext, root: string): Promise<{ registryUrl: string; registryRequests: { metadata: number; tarball: number } }> {
@@ -152,10 +162,12 @@ async function createNpmCatalogFixture(t: TestContext, root: string): Promise<{ 
   return { registryUrl: `http://127.0.0.1:${address.port}`, registryRequests };
 }
 
-export async function createTestEnvironment(t: TestContext): Promise<TestEnvironment> {
+export async function createTestEnvironment(t: TestContext, options: TestEnvironmentOptions = {}): Promise<TestEnvironment> {
+  const executionMode = options.executionMode ?? 'local';
   const root = await mkdtemp(join(tmpdir(), 'pink-icon-submit-'));
   const upstream = join(root, 'upstream');
   const checkout = join(root, 'checkout');
+  const pushRepositoryPath = join(root, 'push.git');
   const data = join(root, 'data');
   const npmCatalog = await createNpmCatalogFixture(t, root);
   await mkdir(join(upstream, 'src/icons'), { recursive: true });
@@ -188,6 +200,10 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
   execFileSync('git', ['-C', upstream, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'initial']);
   execFileSync('git', ['clone', '-q', upstream, checkout]);
   execFileSync('git', ['-C', checkout, 'remote', 'rename', 'origin', 'upstream']);
+  if (executionMode === 'remote') {
+    execFileSync('git', ['clone', '-q', '--bare', upstream, pushRepositoryPath]);
+    execFileSync('git', ['-C', checkout, 'remote', 'add', 'origin', pushRepositoryPath]);
+  }
   execFileSync('git', ['-C', checkout, 'config', 'core.autocrlf', 'false']);
 
   const config: AppConfig = {
@@ -195,18 +211,29 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     storageRoot: join(data, 'batches'),
     temporaryRoot: join(data, 'worktrees'),
     repositoryPath: checkout,
-    executionMode: 'local',
-    localTargetRef: 'main',
-    upstreamRemote: 'upstream',
-    upstreamBranch: 'main',
+    executionMode,
+    ...(executionMode === 'local' ? { localTargetRef: 'main' } : {}),
     targetRepository: { repository: 'sekiroxxxx/sekiroxxxx-pink-codicons-automation-test', branch: 'main' },
+    ...(executionMode === 'remote' ? {
+      remoteDelivery: {
+        targetRemote: 'upstream',
+        pushRepository: 'sud-icon-bot/sekiroxxxx-pink-codicons-automation-test',
+        pushRemote: 'origin',
+        pushBranchPrefix: 'bot/' as const,
+        deliveryPhase: 'pull_request',
+        githubToken: 'test-only-token',
+        committer: { name: 'Test Bot', email: 'test-bot@example.invalid' },
+      },
+    } : {}),
     catalogPackageName: '@pink/codicons',
     catalogTag: 'beta',
     catalogRegistryUrl: npmCatalog.registryUrl,
     catalogSourceRepository: 'sud-global/pink-codicons',
     catalogCacheRoot: join(data, 'catalog-cache'),
     catalogRefreshIntervalMs: 60_000,
+    workerEnabled: false,
     workerPollIntervalMs: 10,
+    sessionCookieSecure: false,
     maxUploadBytes: 1024 * 1024,
   };
   const database = new BatchDatabase(config.databasePath);
@@ -219,14 +246,25 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     new BatchStorage(config.storageRoot),
     new GitRepository(config.repositoryPath, config.temporaryRoot, {
       mode: config.executionMode,
-      localTargetRef: config.localTargetRef,
-      upstreamRemote: config.upstreamRemote,
-      upstreamBranch: config.upstreamBranch,
+      ...(config.localTargetRef ? { localTargetRef: config.localTargetRef } : {}),
+      ...(config.remoteDelivery ? {
+        targetRemote: config.remoteDelivery.targetRemote,
+        targetBranch: config.targetRepository.branch,
+        remoteAuthentication: {
+          username: config.remoteDelivery.pushRepository.split('/')[0],
+          token: config.remoteDelivery.githubToken,
+        },
+      } : {}),
     }),
     new IconBatchCli(),
     config.maxUploadBytes,
     catalogOptionsFromConfig(config),
     config.targetRepository,
+    {
+      executionMode: config.executionMode,
+      pushRepository: config.remoteDelivery?.pushRepository ?? null,
+      pushBranchPrefix: config.remoteDelivery?.pushBranchPrefix ?? null,
+    },
   );
   return {
     config,
@@ -234,5 +272,6 @@ export async function createTestEnvironment(t: TestContext): Promise<TestEnviron
     batches,
     validSvg,
     registryRequests: npmCatalog.registryRequests,
+    ...(executionMode === 'remote' ? { pushRepositoryPath } : {}),
   };
 }

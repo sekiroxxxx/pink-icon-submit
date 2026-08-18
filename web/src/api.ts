@@ -6,12 +6,19 @@ export interface Submitter {
   email: string;
 }
 
+export interface AuthenticatedUser {
+  id: string;
+  username: string;
+}
+
 export interface BatchInput {
   title: string;
   description: string;
-  designUrl: string;
+  designUrl?: string;
   submitter: Submitter;
 }
+
+export type CreateBatchInput = Omit<BatchInput, 'submitter'>;
 
 export interface ItemInput {
   action: ItemAction;
@@ -32,6 +39,7 @@ export interface Diagnostic {
   code: string;
   message: string;
   itemId?: string;
+  path?: string;
 }
 
 export interface ValidationResult {
@@ -42,25 +50,58 @@ export interface ValidationResult {
 
 export interface BatchDetails extends BatchInput {
   id: string;
-  state: 'DRAFT' | 'VALIDATING' | 'READY' | 'QUEUED' | 'RUNNING' | 'LOCAL_DIFF_READY' | 'FAILED';
+  executionMode: 'local' | 'remote' | null;
+  state: 'DRAFT' | 'VALIDATING' | 'READY' | 'QUEUED' | 'RUNNING' | 'LOCAL_DIFF_READY' | 'COMMIT_PREPARED' | 'BRANCH_PUSHED' | 'PR_CREATING' | 'PR_CREATED' | 'FAILED' | 'ABANDONED';
   items: ApiItem[];
   validation: ValidationResult | null;
   warningsAcknowledged: boolean;
+  baseCommit: string | null;
   localDiff: { changedFiles: string[]; patch: string } | null;
+  delivery: {
+    checkpoint: 'NONE' | 'COMMIT_PREPARED' | 'BRANCH_PUSHED' | 'PR_CREATING' | 'PR_CREATED';
+    branch: string | null;
+    commitSha: string | null;
+    pullRequest: {
+      number: number;
+      url: string;
+      state: string;
+      isDraft: boolean;
+      createdAt: string | null;
+    } | null;
+    handoffAt: string | null;
+  };
   error: { code: string; message: string } | null;
+  job: {
+    state: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+  } | null;
+  userStatus: UserBatchStatus;
+  /** Whether the server has confirmed that this batch can be abandoned without Git delivery side effects. */
+  canAbandon?: boolean;
+  createdAt: string;
 }
 
-export interface NamePreview {
-  schemaVersion: 1;
-  baseCommit: string;
-  input: string;
-  normalizedName: string;
-  valid: boolean;
-  collision: {
-    primaryName: string;
-    aliases: string[];
-  } | null;
+export interface BatchSummary {
+  id: string;
+  title: string;
+  userStatus: UserBatchStatus;
+  createdAt: string;
+  itemCounts: {
+    total: number;
+    add: number;
+    replace: number;
+    delete: number;
+  };
 }
+
+export type UserBatchStatus =
+  | 'draft'
+  | 'processing'
+  | 'needs_changes'
+  | 'delivery_retryable'
+  | 'developer_attention'
+  | 'submitted_review'
+  | 'local_complete'
+  | 'abandoned';
 
 export interface CatalogPageIcon {
   primaryName: string;
@@ -94,7 +135,7 @@ export interface CatalogPageQuery {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, public readonly code?: string) {
+  constructor(message: string, public readonly code?: string, public readonly status?: number) {
     super(message);
   }
 }
@@ -103,7 +144,10 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, options);
   if (!response.ok) {
     const body = await response.json().catch(() => null) as { error?: { message?: string; code?: string } } | null;
-    throw new ApiError(body?.error?.message ?? `请求失败 (${response.status})`, body?.error?.code);
+    if (response.status === 401 || response.status === 403) {
+      window.dispatchEvent(new Event('pink-icon-submit.authentication-required'));
+    }
+    throw new ApiError(body?.error?.message ?? `请求失败 (${response.status})`, body?.error?.code, response.status);
   }
   if (response.status === 204) {
     return undefined as T;
@@ -111,21 +155,29 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function itemRequest(item: ItemInput, svg?: File): RequestInit {
+function itemRequest(item: ItemInput, clientMutationId?: string, svg?: File): RequestInit {
+  const payload = clientMutationId ? { ...item, clientMutationId } : item;
   if (svg) {
     const body = new FormData();
-    body.set('item', JSON.stringify(item));
+    body.set('item', JSON.stringify(payload));
     body.set('svg', svg);
     return { method: 'POST', body };
   }
   return {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(item),
+    body: JSON.stringify(payload),
   };
 }
 
 export const api = {
+  login: (input: { username: string; password: string }) => request<{ user: AuthenticatedUser }>('/api/auth/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  }),
+  logout: () => request<void>('/api/auth/logout', { method: 'POST' }),
+  me: () => request<{ user: AuthenticatedUser }>('/api/auth/me'),
   getCatalogPage: (query: CatalogPageQuery) => {
     const parameters = new URLSearchParams();
     if (query.query) parameters.set('query', query.query);
@@ -134,20 +186,35 @@ export const api = {
     if (query.pageSize) parameters.set('pageSize', String(query.pageSize));
     return request<CatalogPage>(`/api/catalog/page?${parameters.toString()}`);
   },
-  previewName: (name: string) => request<NamePreview>(`/api/names/preview?${new URLSearchParams({ name }).toString()}`),
-  createBatch: (input: BatchInput) => request<BatchDetails>('/api/batches', {
+  createBatch: (input: CreateBatchInput) => request<BatchDetails>('/api/batches', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(input),
   }),
-  addItem: (batchId: string, item: ItemInput, svg?: File) => request<ApiItem>(`/api/batches/${encodeURIComponent(batchId)}/items`, itemRequest(item, svg)),
+  updateBatch: (batchId: string, input: Pick<BatchInput, 'title' | 'description' | 'designUrl'>) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  }),
+  addItem: (batchId: string, item: ItemInput, clientMutationId: string, svg?: File) => request<ApiItem>(`/api/batches/${encodeURIComponent(batchId)}/items`, itemRequest(item, clientMutationId, svg)),
   updateItem: (batchId: string, itemId: string, item: ItemInput, svg?: File) => {
-    const options = itemRequest(item, svg);
+    const options = itemRequest(item, undefined, svg);
     return request<ApiItem>(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}`, { ...options, method: 'PUT' });
   },
   deleteItem: (batchId: string, itemId: string) => request<void>(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}`, { method: 'DELETE' }),
   validateBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/validate`, { method: 'POST' }),
-  submitBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/submit`, { method: 'POST' }),
+  submitBatch: (batchId: string, confirmRepeatedSubmission = false) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/submit`, {
+    method: 'POST',
+    ...(confirmRepeatedSubmission ? {
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ confirmRepeatedSubmission: true }),
+    } : {}),
+  }),
+  returnToEdit: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/return-to-edit`, { method: 'POST' }),
+  cloneBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/clone`, { method: 'POST' }),
   retryBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST' }),
+  abandonBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}/abandon`, { method: 'POST' }),
   getBatch: (batchId: string) => request<BatchDetails>(`/api/batches/${encodeURIComponent(batchId)}`),
+  getActiveBatch: () => request<BatchDetails | undefined>('/api/batches/active'),
+  getBatches: () => request<BatchSummary[]>('/api/batches?limit=20'),
 };

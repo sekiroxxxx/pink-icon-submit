@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 
-import { BatchDatabase } from './database.js';
+import { BatchDatabase, type CreatedClone } from './database.js';
 import { CatalogSnapshotCache } from './catalog-snapshot.js';
 import { AppError } from './errors.js';
 import { GitRepository } from './git-repository.js';
 import { IconBatchCli } from './icon-batch-cli.js';
-import { BatchStorage } from './storage.js';
-import type { BatchDetails, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, IconNamePreview, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
+import { BatchStorage, type PublishedClone } from './storage.js';
+import { canRetryBatch, hasPostPushPullRequestRecoveryEvidence, isActiveBatch, isFinalValidationFailure, isPostPushCheckpoint, isRetryablePostPushInfrastructureFailure, lifecycleSnapshot } from './batch-lifecycle.js';
+import type { BatchDetails, BatchExecutionContext, BatchSummary, CatalogPage, CatalogPageInput, CreateBatchInput, CreateItemInput, NpmPackageCatalogOptions, StoredItem, TargetRepository } from './types.js';
 
 const maximumBatchItems = 100;
 
@@ -65,6 +66,31 @@ function baseCommitFrom(value: unknown): string | null {
   return isObject(value) && typeof value.baseCommit === 'string' ? value.baseCommit : null;
 }
 
+function batchMetadataFrom(value: unknown): Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'> {
+  const submitted: Record<string, unknown> = isObject(value) ? value : {};
+  const rawDesignUrl = submitted.designUrl;
+  let designUrl: string | undefined;
+  if (rawDesignUrl !== undefined && rawDesignUrl !== null && !(typeof rawDesignUrl === 'string' && rawDesignUrl.trim() === '')) {
+    designUrl = requiredText(rawDesignUrl, 'designUrl', 2_000);
+    if (!/^https?:\/\//i.test(designUrl)) {
+      throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
+    }
+    try {
+      const parsed = new URL(designUrl);
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('unsupported scheme');
+      }
+    } catch {
+      throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
+    }
+  }
+  return {
+    title: requiredText(submitted.title, 'title', 200),
+    description: requiredText(submitted.description, 'description', 5_000),
+    ...(designUrl ? { designUrl } : {}),
+  };
+}
+
 export class BatchService {
   private readonly batchLocks = new Map<string, Promise<void>>();
   private readonly catalog: CatalogSnapshotCache;
@@ -77,21 +103,25 @@ export class BatchService {
     private readonly maxUploadBytes: number,
     catalogOptions: NpmPackageCatalogOptions,
     private readonly targetRepository: TargetRepository,
+    private readonly executionContext: BatchExecutionContext = {
+      executionMode: 'local',
+      pushRepository: null,
+      pushBranchPrefix: null,
+    },
   ) {
-    this.catalog = new CatalogSnapshotCache(repository, iconBatch, catalogOptions);
+    this.catalog = new CatalogSnapshotCache(catalogOptions);
   }
 
   get uploadLimit(): number {
     return this.maxUploadBytes;
   }
 
-  async createBatch(input: CreateBatchInput): Promise<BatchDetails> {
+  async createBatch(input: CreateBatchInput, ownerId?: string): Promise<BatchDetails> {
     const submitted: Record<string, unknown> = isObject(input) ? input : {};
     const submitter = isObject(submitted.submitter) ? submitted.submitter : {};
+    const metadata = batchMetadataFrom(submitted);
     const normalized: CreateBatchInput = {
-      title: requiredText(submitted.title, 'title', 200),
-      description: requiredText(submitted.description, 'description', 5_000),
-      designUrl: requiredText(submitted.designUrl, 'designUrl', 2_000),
+      ...metadata,
       submitter: {
         name: requiredText(submitter.name, 'submitter.name', 100),
         email: requiredText(submitter.email, 'submitter.email', 320),
@@ -100,39 +130,77 @@ export class BatchService {
     if (!/^\S+@\S+\.\S+$/.test(normalized.submitter.email)) {
       throw new AppError('REQUEST_INVALID', 'submitter.email must be a valid email address.');
     }
-    try {
-      const designUrl = new URL(normalized.designUrl);
-      if (!['http:', 'https:'].includes(designUrl.protocol)) {
-        throw new Error('unsupported scheme');
-      }
-    } catch {
-      throw new AppError('REQUEST_INVALID', 'designUrl must be an HTTP(S) URL.');
-    }
     const catalogBaseline = await this.catalog.baseline();
-    const batch = this.database.createBatch(createBatchId(), normalized, catalogBaseline, this.targetRepository);
+    const batch = this.database.createBatch(
+      createBatchId(),
+      normalized,
+      catalogBaseline,
+      this.targetRepository,
+      this.executionContext,
+      ownerId,
+      ownerId !== undefined,
+    );
     return this.database.getDetails(batch.id);
   }
 
-  async addItem(batchId: string, input: CreateItemInput, svg: Buffer | undefined): Promise<StoredItem> {
+  async updateBatch(batchId: string, input: Pick<CreateBatchInput, 'title' | 'description' | 'designUrl'>, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
     return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
-      if (this.database.countItems(batchId) >= maximumBatchItems) {
-        throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
+      const normalized = batchMetadataFrom(input);
+      const current = this.database.getBatch(batchId);
+      if (current.title === normalized.title
+        && current.description === normalized.description
+        && current.designUrl === normalized.designUrl) {
+        return this.database.getDetails(batchId);
       }
-      const normalized = await this.normalizeItemInput(batchId, input, svg);
-      const itemId = createItemId();
-      const sourceFile = svg ? await this.saveSvg(batchId, itemId, svg) : null;
-      return this.database.insertItem(batchId, itemId, normalized, sourceFile);
+      this.database.updateBatchMetadata(batchId, normalized);
+      return this.database.getDetails(batchId);
     });
   }
 
-  async updateItem(batchId: string, itemId: string, input: CreateItemInput, svg: Buffer | undefined): Promise<StoredItem> {
+  async addItem(batchId: string, input: CreateItemInput, svg: Buffer | undefined, ownerId?: string, clientMutationId?: string): Promise<StoredItem> {
+    this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
     return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
+      this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+      const normalized = await this.normalizeItemInput(batchId, input, svg);
+      if (clientMutationId) {
+        const existing = this.database.getItemByClientMutationId(batchId, clientMutationId);
+        if (existing) {
+          await this.assertMatchingMutation(existing, normalized, svg);
+          return existing;
+        }
+      }
+      if (this.database.countItems(batchId) >= maximumBatchItems) {
+        throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
+      }
+      const itemId = createItemId();
+      const sourceFile = svg ? await this.saveSvg(batchId, itemId, svg) : null;
+      return this.database.insertItem(batchId, itemId, normalized, sourceFile, clientMutationId);
+    });
+  }
+
+  async updateItem(batchId: string, itemId: string, input: CreateItemInput, svg: Buffer | undefined, ownerId?: string): Promise<StoredItem> {
+    this.assertOwner(batchId, ownerId);
+    this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
+    return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
       const existing = this.database.getItem(batchId, itemId);
       const normalized = await this.normalizeItemInput(batchId, input, svg, existing.sourceFile, itemId);
+      if (!svg
+        && existing.action === normalized.action
+        && existing.designName === normalized.designName
+        && existing.targetName === normalized.targetName
+        && existing.description === normalized.description
+        && existing.reason === normalized.reason
+        && existing.replacementName === normalized.replacementName) {
+        return existing;
+      }
       const sourceFile = normalized.action === 'delete'
         ? null
         : svg
@@ -142,17 +210,21 @@ export class BatchService {
     });
   }
 
-  async deleteItem(batchId: string, itemId: string): Promise<void> {
+  async deleteItem(batchId: string, itemId: string, ownerId?: string): Promise<void> {
+    this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
     return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
       this.assertDraft(batchId, 'BATCH_NOT_EDITABLE', 'edited');
       this.database.deleteItem(batchId, itemId);
     });
   }
 
-  async validateBatch(batchId: string): Promise<BatchDetails> {
+  async validateBatch(batchId: string, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
     this.assertDraft(batchId, 'BATCH_NOT_VALIDATABLE', 'validated');
     return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
       this.database.beginValidation(batchId);
       try {
         const stage1Input = await this.prepareStage1Request(batchId);
@@ -177,44 +249,246 @@ export class BatchService {
     return this.catalog.page(input);
   }
 
-  previewName(input: string): Promise<IconNamePreview> {
-    return this.catalog.previewName(requiredIconName(input, 'name'));
-  }
-
   async getCatalogIconSvg(name: string): Promise<Buffer> {
     return this.catalog.svg(requiredIconName(name, 'icon name'));
   }
 
-  submit(batchId: string): BatchDetails {
-    const batch = this.database.getBatch(batchId);
-    if (!validationIsValid(batch.validation)) {
-      throw new AppError('BATCH_NOT_READY', 'Validate the batch successfully before submission.', 409);
-    }
-    if (!['READY', 'FAILED'].includes(batch.state)) {
+  async submit(batchId: string, confirmRepeatedSubmission = false, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
+    return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
+      const batch = this.database.getBatch(batchId);
+      if (batch.state === 'DRAFT') {
+        this.assertLocallySubmittable(batchId);
+        if (this.database.requiresRepeatedSubmissionConfirmation(batchId) && !confirmRepeatedSubmission) {
+          throw new AppError('REPEATED_SUBMISSION_CONFIRMATION_REQUIRED', 'This batch has not changed since its final validation failed. Confirm before submitting it unchanged.', 409);
+        }
+        this.database.queueJob(batchId);
+        return this.database.getDetails(batchId);
+      }
+      if (batch.state === 'READY' && validationIsValid(batch.validation)) {
+        this.database.queueJob(batchId);
+        return this.database.getDetails(batchId);
+      }
+      if (batch.state === 'READY') {
+        throw new AppError('BATCH_NOT_READY', 'The legacy READY batch no longer has a successful validation.', 409);
+      }
+      if (batch.state === 'FAILED') {
+        throw new AppError('BATCH_RETRY_REQUIRED', `Batch ${batchId} failed and must use its recovery action.`, 409);
+      }
       throw new AppError('BATCH_NOT_SUBMITTABLE', `Batch ${batchId} is ${batch.state}.`, 409);
-    }
-    this.database.queueJob(batchId);
-    return this.database.getDetails(batchId);
+    });
   }
 
-  retry(batchId: string): BatchDetails {
-    const batch = this.database.getBatch(batchId);
-    if (batch.state !== 'FAILED') {
-      throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is ${batch.state}.`, 409);
+  private async assertMatchingMutation(existing: StoredItem, input: CreateItemInput, svg: Buffer | undefined): Promise<void> {
+    const sameInput = existing.action === input.action
+      && existing.designName === input.designName
+      && existing.targetName === input.targetName
+      && existing.description === input.description
+      && existing.reason === input.reason
+      && existing.replacementName === input.replacementName;
+    const sameSvg = existing.sourceFile
+      ? svg !== undefined && (await this.storage.readSvg(existing.batchId, existing.sourceFile)).equals(svg)
+      : svg === undefined;
+    if (!sameInput || !sameSvg) {
+      throw new AppError('ITEM_MUTATION_CONFLICT', '同一写入标识不能用于不同的图标变更。', 409);
     }
-    if (!validationIsValid(batch.validation)) {
-      throw new AppError('BATCH_NOT_READY', 'The batch requires a successful validation before retry.', 409);
-    }
-    this.database.queueJob(batchId);
-    return this.database.getDetails(batchId);
   }
 
-  getBatch(batchId: string): BatchDetails {
-    return this.database.getDetails(batchId);
+  async returnToEdit(batchId: string, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
+    return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
+      const batch = this.database.getBatch(batchId);
+      if (!isFinalValidationFailure(lifecycleSnapshot(batch))) {
+        throw new AppError('BATCH_NOT_EDITABLE', `Batch ${batchId} cannot return to editing from its current delivery state.`, 409);
+      }
+      this.database.returnToDraftForEditing(batchId);
+      return this.database.getDetails(batchId);
+    });
+  }
+
+  async retry(batchId: string, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
+    return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
+      const batch = this.database.getBatch(batchId);
+      const failureCode = batch.error?.code ?? this.database.getDetails(batchId).job?.error?.code ?? null;
+      const retrySnapshot = { ...lifecycleSnapshot(batch), errorCode: failureCode };
+      if (batch.state !== 'FAILED') {
+        throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is ${batch.state}.`, 409);
+      }
+      if (isFinalValidationFailure(retrySnapshot)) {
+        throw new AppError('BATCH_RETURN_TO_EDIT_REQUIRED', 'A final validation failure must be corrected in the editor before delivery can be retried.', 409);
+      }
+      if (!['NONE', 'COMMIT_PREPARED', 'BRANCH_PUSHED', 'PR_CREATING'].includes(batch.delivery.checkpoint)) {
+        throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is already handed off.`, 409);
+      }
+      if (isPostPushCheckpoint(batch.delivery.checkpoint)) {
+        if (!isRetryablePostPushInfrastructureFailure(failureCode)) {
+          throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} cannot retry Draft PR creation after ${failureCode ?? 'an unknown failure'}.`, 409);
+        }
+        if (!hasPostPushPullRequestRecoveryEvidence(retrySnapshot)) {
+          throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} is missing the persisted branch, commit, or base evidence required to recover its Draft PR.`, 409);
+        }
+      }
+      if (!canRetryBatch(retrySnapshot)) {
+        throw new AppError('BATCH_NOT_RETRYABLE', `Batch ${batchId} cannot be retried from its current delivery state.`, 409);
+      }
+      this.database.queueJob(batchId);
+      return this.database.getDetails(batchId);
+    });
+  }
+
+  async abandon(batchId: string, ownerId?: string): Promise<BatchDetails> {
+    this.assertOwner(batchId, ownerId);
+    return this.withBatchLock(batchId, async () => {
+      this.assertOwner(batchId, ownerId);
+      this.database.abandonBatch(batchId);
+      return this.database.getDetails(batchId);
+    });
+  }
+
+  getBatch(batchId: string, ownerId?: string): BatchDetails {
+    return ownerId === undefined ? this.database.getDetails(batchId) : this.database.getDetailsForOwner(batchId, ownerId);
+  }
+
+  listBatches(limit: number, ownerId?: string): BatchSummary[] {
+    return this.database.listBatchSummaries(limit, ownerId);
+  }
+
+  getActiveBatch(ownerId: string): BatchDetails | null {
+    return this.database.getActiveBatchForOwner(ownerId);
+  }
+
+  async cloneBatch(batchId: string, ownerId?: string): Promise<BatchDetails> {
+    const source = this.getBatch(batchId, ownerId);
+    if (isActiveBatch(lifecycleSnapshot(source))) {
+      throw new AppError('BATCH_NOT_CLONEABLE', `Batch ${batchId} is still active and cannot be cloned.`, 409);
+    }
+    if (!source.catalogBaseline || !source.targetRepository) {
+      throw new AppError('BATCH_PROTOCOL_CONTEXT_MISSING', `Batch ${batchId} predates the Stage 1 v2 protocol and must be recreated manually.`, 409);
+    }
+
+    const clonedId = createBatchId();
+    const cloneOwnerId = ownerId ?? this.database.getBatchOwnerId(source.id);
+    const clonedItems = source.items.map((item) => {
+      const id = createItemId();
+      return {
+        id,
+        input: {
+          action: item.action,
+          ...(item.designName ? { designName: item.designName } : {}),
+          ...(item.targetName ? { targetName: item.targetName } : {}),
+          ...(item.description ? { description: item.description } : {}),
+          ...(item.reason ? { reason: item.reason } : {}),
+          ...(item.replacementName ? { replacementName: item.replacementName } : {}),
+        },
+        sourceFile: item.sourceFile ? `uploads/${id}.svg` : null,
+        originalSourceFile: item.sourceFile,
+      };
+    });
+    const staged = await this.storage.stageCloneSvgs(source.id, clonedItems.flatMap((item) => item.originalSourceFile
+      ? [{ sourceFile: item.originalSourceFile, targetItemId: item.id }]
+      : []));
+    let created: CreatedClone | undefined;
+    let published: PublishedClone | undefined;
+    try {
+      const cloneCreationNonce = randomUUID();
+      created = this.database.createClonedBatch(
+        clonedId,
+        {
+          title: source.title,
+          description: source.description,
+          ...(source.designUrl ? { designUrl: source.designUrl } : {}),
+          submitter: source.submitter,
+        },
+        source.catalogBaseline,
+        source.targetRepository,
+        {
+          executionMode: source.executionMode ?? this.executionContext.executionMode,
+          pushRepository: source.pushRepository,
+          pushBranchPrefix: source.pushBranchPrefix,
+        },
+        cloneOwnerId,
+        clonedItems.map(({ id, input, sourceFile }) => ({ id, input, sourceFile })),
+        cloneCreationNonce,
+        ownerId !== undefined,
+      );
+      published = await this.storage.publishStagedClone(staged, clonedId);
+      this.database.completeClonePublication(created);
+    } catch (error) {
+      await this.discardFailedClone(created, staged, published, error);
+      throw error;
+    }
+    return this.database.getDetails(clonedId);
+  }
+
+  private async discardFailedClone(
+    created: CreatedClone | undefined,
+    staged: { directory: string },
+    published: PublishedClone | undefined,
+    originalError: unknown,
+  ): Promise<void> {
+    const cleanupErrors: unknown[] = [];
+    if (created) {
+      try {
+        this.database.discardCreatedClone(created);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    const cleanupTasks = [() => this.storage.discardCloneStaging(staged)];
+    if (published) {
+      cleanupTasks.push(() => this.storage.discardPublishedClone(published));
+    }
+    for (const cleanup of cleanupTasks) {
+      try {
+        await cleanup();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([originalError, ...cleanupErrors], 'Clone failed and its owned resources could not be fully cleaned up.');
+    }
+  }
+
+  private assertLocallySubmittable(batchId: string): void {
+    const details = this.database.getDetails(batchId);
+    if (details.items.length === 0) {
+      throw new AppError('BATCH_EMPTY', 'A batch needs at least one item before delivery.', 409);
+    }
+    if (details.items.length > maximumBatchItems) {
+      throw new AppError('BATCH_ITEM_LIMIT', `A batch may contain at most ${maximumBatchItems} items.`, 409);
+    }
+    for (const item of details.items) {
+      const invalid = item.action === 'add'
+        ? !item.designName || !item.description || !item.sourceFile
+        : item.action === 'replace'
+          ? !item.targetName || !item.sourceFile
+          : !item.targetName || !item.reason || item.sourceFile !== null;
+      if (invalid) {
+        throw new AppError('BATCH_ITEM_INVALID', `Batch ${batchId} has an incomplete ${item.action} item.`, 409);
+      }
+    }
   }
 
   async writeRequest(batchId: string): Promise<string> {
     return (await this.prepareStage1Request(batchId)).requestPath;
+  }
+
+  async finalValidate(
+    batchId: string,
+    worktreePath: string,
+    stage1Input: { requestPath: string; catalogTarball: string; targetRepository: string },
+  ): Promise<void> {
+    const result = await this.iconBatch.validate(worktreePath, stage1Input.requestPath, stage1Input);
+    const validation = result.payload;
+    this.database.recordFinalValidation(batchId, validation, baseCommitFrom(validation));
+    if (!validationIsValid(validation)) {
+      throw new AppError('FINAL_VALIDATION_FAILED', 'The batch failed final Stage 1 validation before delivery.', 409, validation);
+    }
   }
 
   async prepareStage1Request(batchId: string): Promise<{ requestPath: string; catalogTarball: string; targetRepository: string }> {
@@ -249,6 +523,12 @@ export class BatchService {
     const batch = this.database.getBatch(batchId);
     if (batch.state !== 'DRAFT') {
       throw new AppError(code, `Batch ${batchId} is ${batch.state} and cannot be ${action}.`, 409);
+    }
+  }
+
+  private assertOwner(batchId: string, ownerId: string | undefined): void {
+    if (ownerId !== undefined) {
+      this.database.getBatchForOwner(batchId, ownerId);
     }
   }
 
