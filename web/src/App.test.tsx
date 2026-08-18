@@ -3,6 +3,16 @@ import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import { afterEach, expect, test, vi } from 'vitest';
 
+const { getSvgPreviewMock, putSvgPreviewMock } = vi.hoisted(() => ({
+  getSvgPreviewMock: vi.fn().mockResolvedValue(undefined),
+  putSvgPreviewMock: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('./svg-preview-cache', () => ({
+  getSvgPreview: getSvgPreviewMock,
+  putSvgPreview: putSvgPreviewMock,
+}));
+
 import { App } from './App';
 import type { ApiItem, BatchDetails, BatchSummary, ItemInput } from './api';
 
@@ -254,6 +264,10 @@ afterEach(() => {
   window.history.replaceState({}, '', '/');
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  getSvgPreviewMock.mockReset();
+  putSvgPreviewMock.mockReset();
+  getSvgPreviewMock.mockResolvedValue(undefined);
+  putSvgPreviewMock.mockResolvedValue(undefined);
   vi.useRealTimers();
 });
 
@@ -1149,12 +1163,66 @@ test('a historical item without SVG content hides internal upload paths and uses
   render(<App />);
   await user.click(await screen.findByRole('button', { name: '查看' }));
 
-  expect(await screen.findByText('历史记录暂不提供 SVG 预览')).toBeTruthy();
+  expect(await screen.findByText('SVG 预览不可用')).toBeTruthy();
   expect(screen.getByText('新增 · pink-history-icon')).toBeTruthy();
   expect(screen.queryByText(/uploads\/item-history-no-svg/)).toBeNull();
   expect(document.querySelector('.change-card.no-preview')).toBeTruthy();
   expect(document.querySelector('.change-card img')).toBeNull();
 });
+test('a historical item uses this browser cache for its SVG preview', async () => {
+  saveProfile();
+  const historical = batch({
+    id: 'ICON-HISTORY-CACHED-SVG',
+    title: '带本地预览的历史图标',
+    items: [{
+      id: 'item-history-cached-svg',
+      batchId: 'ICON-HISTORY-CACHED-SVG',
+      action: 'add',
+      designName: 'pink-cached-history-icon',
+      description: '本机缓存的 SVG 预览。',
+      sourceFile: 'uploads/private.svg',
+    }],
+  });
+  getSvgPreviewMock.mockResolvedValue(new Blob(['<svg xmlns="http://www.w3.org/2000/svg" />'], { type: 'image/svg+xml' }));
+  const originalUrl = URL;
+  vi.stubGlobal('URL', Object.assign(class extends originalUrl {}, {
+    createObjectURL: vi.fn(() => 'blob:cached-history-svg'),
+    revokeObjectURL: vi.fn(),
+  }));
+  stubFetch(vi.fn((path: string) => {
+    if (path === `/api/batches/${historical.id}`) return Promise.resolve(jsonResponse(historical));
+    throw new Error(`Unexpected request: ${path}`);
+  }), [summary({ id: historical.id, title: historical.title })]);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await user.click(await screen.findByRole('button', { name: '查看' }));
+
+  expect(await screen.findByAltText('pink-cached-history-icon SVG 预览')).toBeTruthy();
+  expect(getSvgPreviewMock).toHaveBeenCalledWith('user-designer', historical.id, 'item-history-cached-svg');
+  expect(screen.queryByText('SVG 预览不可用')).toBeNull();
+  expect(screen.queryByText(/uploads\/private/)).toBeNull();
+});
+
+test('an uploaded SVG cache failure does not block saving the draft item', async () => {
+  saveProfile();
+  putSvgPreviewMock.mockRejectedValueOnce(new Error('Storage quota exceeded.'));
+  stubFetch(draftApiHandler());
+  const user = userEvent.setup();
+
+  render(<App />);
+  await openNewWorkbench(user);
+  await addOneSvgChange(user);
+
+  await screen.findByText('已保存到当前草稿。其余 SVG 会继续保留在待处理队列。');
+  await waitFor(() => expect(putSvgPreviewMock).toHaveBeenCalledWith(
+    'user-designer',
+    'ICON-DRAFT',
+    'item-1',
+    expect.any(File),
+  ));
+});
+
 test('leaving a workbench clears local SVG and catalog selection state before a legal new batch', async () => {
   saveProfile();
   const fetchMock = vi.fn().mockResolvedValue(jsonResponse({

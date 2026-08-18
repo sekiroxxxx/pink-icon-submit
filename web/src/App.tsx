@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 
 import { api, ApiError, type ApiItem, type AuthenticatedUser, type BatchDetails, type BatchSummary, type CatalogGroup, type CatalogPageIcon, type Diagnostic, type ItemAction, type ItemInput, type UserBatchStatus } from './api';
 import { displayDiagnostic } from './diagnostics';
+import { getSvgPreview, putSvgPreview } from './svg-preview-cache';
 
 interface SvgDraft {
   id: string;
@@ -307,6 +308,36 @@ function SvgPreview({ svg, alt, className }: { svg: SvgDraft; alt: string; class
   return <img className={className} src={svg.previewUrl} alt={alt} />;
 }
 
+function useCachedSvgPreview(ownerId: string | undefined, batchId: string | undefined, itemId: string | undefined, enabled: boolean): string | undefined {
+  const [previewUrl, setPreviewUrl] = useState<string>();
+
+  useEffect(() => {
+    let disposed = false;
+    let objectUrl: string | undefined;
+    setPreviewUrl(undefined);
+    if (!enabled || !ownerId || !batchId || !itemId || typeof URL.createObjectURL !== 'function') return undefined;
+
+    void getSvgPreview(ownerId, batchId, itemId)
+      .then((svg) => {
+        if (!svg || disposed) return;
+        try {
+          objectUrl = URL.createObjectURL(svg);
+          if (!disposed) setPreviewUrl(objectUrl);
+        } catch {
+          // Browser preview creation is best-effort, like the cache read itself.
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      disposed = true;
+      if (objectUrl && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(objectUrl);
+    };
+  }, [batchId, enabled, itemId, ownerId]);
+
+  return previewUrl;
+}
+
 function CatalogBrowser({
   catalog,
   loading,
@@ -467,23 +498,46 @@ function SvgQueue({ pending, activeSvgId, disabled, error, onQueue, onActivate, 
   );
 }
 
-function ChangeCard({ change, disabled, historical = false, onRemove }: { change: DraftChange; disabled: boolean; historical?: boolean; onRemove: () => void }) {
+function ChangeCard({
+  change,
+  disabled,
+  historical = false,
+  previewOwnerId,
+  previewBatchId,
+  onRemove,
+}: {
+  change: DraftChange;
+  disabled: boolean;
+  historical?: boolean;
+  previewOwnerId?: string;
+  previewBatchId?: string;
+  onRemove: () => void;
+}) {
+  const cachedPreviewUrl = useCachedSvgPreview(
+    previewOwnerId,
+    previewBatchId,
+    change.serverId,
+    historical && change.action !== 'delete' && !change.svg,
+  );
   const label = { add: '新增', replace: '替换', delete: '删除' }[change.action];
-  const historicalPreviewUnavailable = historical && !change.svg;
+  const historicalPreviewUnavailable = historical && change.action !== 'delete' && !change.svg && !cachedPreviewUrl;
   const currentIcon = !historicalPreviewUnavailable ? change.target?.svg : undefined;
   const itemName = change.action === 'add' ? change.designName : change.target?.primaryName;
-  const description = historicalPreviewUnavailable
-    ? '历史记录暂不提供 SVG 预览'
-    : change.action === 'delete'
-      ? '将从图标仓库移除'
-      : change.svg
-        ? `已上传：${change.svg.file.name}`
-        : 'SVG 已保存';
+  const description = historical && change.action === 'delete'
+    ? '该变更不包含 SVG 文件'
+    : historicalPreviewUnavailable
+      ? 'SVG 预览不可用'
+      : change.action === 'delete'
+        ? '将从图标仓库移除'
+        : change.svg
+          ? `已上传：${change.svg.file.name}`
+          : 'SVG 已保存';
   return (
     <article className={`change-card ${change.action}${historicalPreviewUnavailable ? ' no-preview' : ''}`}>
       {change.action === 'replace' && currentIcon && <img src={svgPreviewUrl(currentIcon)} alt={`${itemName} 当前图标`} />}
       {change.action === 'replace' && currentIcon && change.svg && <span className="change-arrow">→</span>}
       {change.svg && <SvgPreview svg={change.svg} alt={`${change.svg.file.name} 预览`} className="change-preview" />}
+      {!change.svg && cachedPreviewUrl && <img className="change-preview" src={cachedPreviewUrl} alt={`${itemName} SVG 预览`} />}
       {change.action === 'delete' && currentIcon && <img src={svgPreviewUrl(currentIcon)} alt={`${itemName} 当前图标`} />}
       <span><strong>{label} · {itemName}</strong><small>{description}</small></span>
       <button type="button" disabled={disabled} onClick={onRemove} aria-label={`移除 ${itemName}`}>×</button>
@@ -1402,6 +1456,7 @@ export function App() {
     draftMutationInFlight.current = true;
     setBusy(true);
     const operationAuthGeneration = authGeneration.current;
+    const operationOwnerId = authenticatedUser?.id;
     let operationHydrationVersion = workbenchHydrationVersion.current;
     try {
       const currentBatch = await ensureDraftBatch(batchMetadata());
@@ -1441,6 +1496,10 @@ export function App() {
         }
       } else {
         persisted = await persistNewChange(currentBatch, change);
+      }
+      if (persistedChange.svg && operationOwnerId && authGeneration.current === operationAuthGeneration) {
+        // The server item ID is known only after the add/reconciliation succeeds. Cache failure must not affect delivery.
+        void putSvgPreview(operationOwnerId, persisted.batch.id, persisted.item.id, persistedChange.svg.file).catch(() => undefined);
       }
       if (authGeneration.current !== operationAuthGeneration) return;
       if (workbenchHydrationVersion.current !== operationHydrationVersion) {
@@ -1826,7 +1885,7 @@ export function App() {
           <div className="composer-actions"><span>加入队列后会立即保存为账号草稿；确认提交前不会进入图标仓库。</span><button className="button primary" type="button" disabled={!editable || busy} onClick={() => void addChange()}>加入{({ add: '新增', replace: '替换', delete: '删除' })[action]}队列</button></div>
         </section>
 
-        <section className="changes-card" aria-label="本次变更"><div><h2>本次变更 {changes.length} 项</h2><p>{changes.length === 0 ? '把一项操作加入队列后，会在这里同时显示所有待改动图标。' : '确认前可移除任何一项变更。'}</p></div><div className="change-list">{changes.map((change) => <ChangeCard key={change.clientId} change={change} disabled={!editable || busy} historical={!viewingActiveBatch} onRemove={() => void removeChange(change)} />)}</div><div className="changes-actions"><button className="button primary" type="button" disabled={!editable || busy || changes.length === 0} onClick={() => { setReviewErrors({}); setReviewOpen(true); }}>确认本次变更</button></div></section>
+        <section className="changes-card" aria-label="本次变更"><div><h2>本次变更 {changes.length} 项</h2><p>{changes.length === 0 ? '把一项操作加入队列后，会在这里同时显示所有待改动图标。' : '确认前可移除任何一项变更。'}</p></div><div className="change-list">{changes.map((change) => <ChangeCard key={change.clientId} change={change} disabled={!editable || busy} historical={!viewingActiveBatch} previewOwnerId={authenticatedUser?.id} previewBatchId={batch?.id} onRemove={() => void removeChange(change)} />)}</div><div className="changes-actions"><button className="button primary" type="button" disabled={!editable || busy || changes.length === 0} onClick={() => { setReviewErrors({}); setReviewOpen(true); }}>确认本次变更</button></div></section>
 
         {batch && batch.userStatus === 'needs_changes' && batch.validation?.valid === false && <DiagnosticList title="需要修正的问题" diagnostics={batch.validation.errors} tone="error" items={batch.items} />}
       </main>}
